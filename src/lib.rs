@@ -73,8 +73,8 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::RwLockReadGuard as StdReadGuard;
 use std::sync::RwLockWriteGuard as StdWriteGuard;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering}, Arc,
-    RwLock as StdRwLock,
+    Arc, RwLock as StdRwLock,
+    atomic::{AtomicUsize, Ordering},
 };
 
 type StdShardMap<K, V, S> = hashbrown::HashMap<K, V, S>;
