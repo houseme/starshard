@@ -29,8 +29,8 @@
 //!     use starshard::AsyncShardedHashMap;
 //!
 //!     let map: AsyncShardedHashMap<String, i32, fxhash::FxBuildHasher> = AsyncShardedHashMap::new(64);
-//!     map.insert_async("key1".to_string(), 42).await;
-//!     assert_eq!(map.get_async(&"key1".to_string()).await, Some(42));
+//!     map.insert("key1".to_string(), 42).await;
+//!     assert_eq!(map.get(&"key1".to_string()).await, Some(42));
 //! }
 //! ```
 //!
@@ -45,7 +45,7 @@
 //!     struct ObjectMeta { size: u64, etag: String }
 //!
 //!     let cache: AsyncShardedHashMap<String, ObjectMeta, fxhash::FxBuildHasher> = AsyncShardedHashMap::new(128);
-//!     cache.insert_async("bucket/obj1".to_string(), ObjectMeta { size: 1024, etag: "abc".to_string() }).await;
+//!     cache.insert("bucket/obj1".to_string(), ObjectMeta { size: 1024, etag: "abc".to_string() }).await;
 //! }
 //! ```
 //!
@@ -319,7 +319,7 @@ where
     }
 
     /// Insert a key-value pair; returns the old value if present.
-    pub async fn insert_async(&self, key: K, value: V) -> Option<V> {
+    pub async fn insert(&self, key: K, value: V) -> Option<V> {
         let index = self.shard_index(&key);
         let shard = self.get_shard(index).await;
         let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
@@ -331,7 +331,7 @@ where
     }
 
     /// Get a cloned value by key; prefers non-blocking `try_read` first.
-    pub async fn get_async(&self, key: &K) -> Option<V> {
+    pub async fn get(&self, key: &K) -> Option<V> {
         let index = self.shard_index(key);
         let shard = self.get_shard(index).await;
         if let Ok(guard) = shard.try_read() {
@@ -342,7 +342,7 @@ where
     }
 
     /// Remove a key; returns the old value if present.
-    pub async fn remove_async(&self, key: &K) -> Option<V> {
+    pub async fn remove(&self, key: &K) -> Option<V> {
         let index = self.shard_index(key);
         let shard = self.get_shard(index).await;
         let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
@@ -354,17 +354,17 @@ where
     }
 
     /// O(1) cached length.
-    pub async fn len_async(&self) -> usize {
+    pub async fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
     /// Whether the map is empty.
-    pub async fn is_empty_async(&self) -> bool {
-        self.len_async().await == 0
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 
     /// Clear all shards and reset length.
-    pub async fn clear_async(&self) {
+    pub async fn clear(&self) {
         let shards = self.shards.read().await;
         for shard in shards.iter().flatten() {
             let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
@@ -377,7 +377,7 @@ where
     /// - Snapshot Arc list of initialized shards.
     /// - Clone per-shard HashMap snapshots under short-lived locks.
     /// - Parallel flatten when `rayon` is enabled, otherwise sequential.
-    pub async fn iter_async(&self) -> Vec<(K, V)> {
+    pub async fn iter(&self) -> Vec<(K, V)> {
         // 1) Snapshot Arc list of initialized shards.
         let shard_arcs: Vec<AsyncShard<K, V, S>> = {
             let shards_guard = self.shards.read().await;
@@ -476,11 +476,11 @@ mod tests {
     #[tokio::test]
     async fn test_async_insert_get_remove() {
         let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        assert!(map.insert_async("key1".to_string(), 42).await.is_none());
-        assert_eq!(map.get_async(&"key1".to_string()).await, Some(42));
-        assert_eq!(map.len_async().await, 1);
-        assert_eq!(map.remove_async(&"key1".to_string()).await, Some(42));
-        assert!(map.is_empty_async().await);
+        assert!(map.insert("key1".to_string(), 42).await.is_none());
+        assert_eq!(map.get(&"key1".to_string()).await, Some(42));
+        assert_eq!(map.len().await, 1);
+        assert_eq!(map.remove(&"key1".to_string()).await, Some(42));
+        assert!(map.is_empty().await);
     }
 
     #[cfg(feature = "async")]
@@ -491,22 +491,22 @@ mod tests {
         for i in 0..100 {
             let map_clone = map.clone();
             handles.push(tokio::spawn(async move {
-                map_clone.insert_async(format!("key{}", i), i).await;
+                map_clone.insert(format!("key{}", i), i).await;
             }));
         }
         for h in handles {
             h.await.unwrap();
         }
-        assert_eq!(map.len_async().await, 100);
+        assert_eq!(map.len().await, 100);
     }
 
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn test_async_iter() {
         let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        map.insert_async("a".to_string(), 1).await;
-        map.insert_async("b".to_string(), 2).await;
-        let mut items = map.iter_async().await;
+        map.insert("a".to_string(), 1).await;
+        map.insert("b".to_string(), 2).await;
+        let mut items = map.iter().await;
         items.sort_by_key(|(k, _)| k.clone());
         assert_eq!(items, vec![("a".to_string(), 1), ("b".to_string(), 2)]);
     }
@@ -515,8 +515,8 @@ mod tests {
     #[tokio::test]
     async fn test_async_clear() {
         let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        map.insert_async("key".to_string(), 42).await;
-        map.clear_async().await;
-        assert!(map.is_empty_async().await);
+        map.insert("key".to_string(), 42).await;
+        map.clear().await;
+        assert!(map.is_empty().await);
     }
 }
