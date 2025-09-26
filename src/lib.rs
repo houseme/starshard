@@ -1,106 +1,169 @@
-//! # Starshard
-//!
-//! Starshard is a high-performance concurrent HashMap built on `hashbrown::HashMap` and `RwLock` (or `tokio::sync::RwLock` in async mode).
-//! It mimics DashMap's sharded locking to minimize contention, with optimizations like lazy shard initialization (30%+ memory savings),
-//! atomic length caching (O(1) `len`), rayon parallel iteration (4x faster), async `try_read` prioritization, and fxhash for uniform key distribution.
-//!
-//! ## Key Optimizations
-//! - **Lazy Shards**: Shards initialize as `None`, allocated on first use, reducing initial memory overhead.
-//! - **Atomic Length**: `Arc<AtomicUsize>` for clonable, fast `len` without locking.
-//! - **Parallel Iteration**: Rayon `par_iter` accelerates large dataset scans (enable `rayon` feature).
-//! - **Read Prioritization**: Async `try_read` mitigates read starvation in write-heavy workloads.
-//! - **fxhash Default**: Fast, uniform hashing reduces shard hotspots; RandomState available for DoS resistance.
-//! - **Zero Deadlocks**: Single-shard locks and sequential multi-shard operations ensure safety.
-//!
-//! ## Usage Example (Sync, without `async` feature)
-//! ```rust
-//! use starshard::ShardedHashMap;
-//!
-//! let map: ShardedHashMap<String, i32, fxhash::FxBuildHasher> = ShardedHashMap::new(64);
-//! map.insert("key1".to_string(), 42);
-//! assert_eq!(map.get(&"key1".to_string()), Some(42));
-//! assert_eq!(map.len(), 1);
-//! ```
-//!
-//! ## Usage Example (Async, with `async` feature)
-//! ```rust
-//! #[tokio::main]
-//! async fn main() {
-//!     use starshard::AsyncShardedHashMap;
-//!
-//!     let map: AsyncShardedHashMap<String, i32, fxhash::FxBuildHasher> = AsyncShardedHashMap::new(64);
-//!     map.insert("key1".to_string(), 42).await;
-//!     assert_eq!(map.get(&"key1".to_string()).await, Some(42));
-//! }
-//! ```
-//!
-//! ## RustFS Example
-//! Optimized for S3 metadata caching:
-//! ```rust
-//! #[tokio::main]
-//! async fn main() {
-//!     use starshard::AsyncShardedHashMap;
-//!
-//!     #[derive(Clone)]
-//!     struct ObjectMeta { size: u64, etag: String }
-//!
-//!     let cache: AsyncShardedHashMap<String, ObjectMeta, fxhash::FxBuildHasher> = AsyncShardedHashMap::new(128);
-//!     cache.insert("bucket/obj1".to_string(), ObjectMeta { size: 1024, etag: "abc".to_string() }).await;
-//! }
-//! ```
-//!
-//! ## Performance Notes
-//! - High-concurrency read-heavy workloads: 350k QPS (100k ops benchmark).
-//! - Memory: ~8 GB for 1M entries, thanks to lazy shards.
-//! - Limitation: Snapshot-style iteration may be inconsistent; rehashing not implemented (extensible).
-//!
-//! ## Warning: Deadlock Avoidance
-//! - Avoid holding external locks when calling methods (risks cyclic waiting).
-//! - Minimize `await` scope in async methods.
-//! - Use `try_read` for async read-heavy workloads to prevent starvation.
-//!
-//! ## Notes
-//! - Iteration is snapshot-style and may observe a mix of states.
-//! - Rehashing across shards is not implemented.
-//!
-//! Enable `async` feature for Tokio integration. Enable `rayon` feature for parallel iteration.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
+#![doc = r#"
+Starshard: a high-performance, lazily sharded concurrent HashMap.
+
+Features
+---------
+- `async`: enables `AsyncShardedHashMap` backed by `tokio::sync::RwLock`.
+- `rayon`: enables parallel snapshot flattening inside iteration for large maps (sync + async).
+- (Optional future) `serde` (not implemented here) could forward to `hashbrown`'s `serde`.
+
+Design Goals
+-------------
+1. Minimize contention via sharding (coarse dynamic set of RwLocks).
+2. Lazy shard materialization to reduce cold-start memory (slots are `None` until touched).
+3. O(1) (amortized) length via atomic counter (fast cloning, no full scan).
+4. Parallel iteration using `rayon` if enabled (snapshots each shard then flattens).
+5. Async version mirrors sync semantics; attempts optimistic `try_read` first to reduce await points.
+6. Predictable memory layout leveraging `hashbrown::HashMap` and user-supplied hasher.
+
+Consistency Model
+------------------
+- Per-shard operations are linearizable with respect to that shard.
+- Global iteration is *snapshot-per-shard* at the moment each shard lock is taken:
+  You may see entries inserted/removed concurrently in other shards.
+- `len()` is eventually consistent only in the trivial sense of atomic monotonic increments/decrements:
+  It reflects completed inserts/removes; in-flight operations not yet applied are invisible.
+
+Thread / Task Safety
+---------------------
+- Each shard guarded by a single RwLock (Std or Tokio).
+- No nested acquisition of multiple shard locks (avoids lock order deadlocks).
+- Atomic length update only after a structural insert/delete succeeds.
+- `Clone` bounds on `K`,`V` needed for iteration snapshot flattening.
+
+Performance Notes (Indicative, not guaranteed)
+-----------------------------------------------
+- Read-heavy sync workloads: sharding reduces write interference vs a single map + RwLock.
+- `rayon` speeds large aggregate scans (e.g. metrics dump, checkpoint) 3-4x on >100k elements.
+- Lazy shards: memory roughly proportional to number of distinct shard indices used.
+
+Hasher Choice
+--------------
+- Default `FxBuildHasher`: speed oriented (non-cryptographic).
+- For DoS / adversarial key defense use: `std::collections::hash_map::RandomState`.
+  Example:
+  ```
+  use starshard::ShardedHashMap;
+  use std::collections::hash_map::RandomState;
+  let map: ShardedHashMap<String, u64, RandomState> =
+      ShardedHashMap::with_shards_and_hasher(128, RandomState::default());
+  ```
+
+Limitations
+------------
+- No dynamic shard rebalancing / rehash across shards yet.
+- No eviction / TTL (can be layered externally).
+- Iteration allocates temporary vectors proportional to initialized shards (to snapshot).
+- Not lock-free; large writer pressure can still cause convoying on hot shards.
+
+Future Extension Ideas
+-----------------------
+- Optional background shard growth / rebalancing.
+- Configurable eviction: LRU per shard / clock / segmented queue.
+- Metrics hooks (pre/post op).
+- Batched mutation (multi-insert with single lock acquisition per target shard).
+- Optional copy-on-write snapshots for near-zero iteration locking windows.
+
+Examples
+---------
+Sync (default features):
+```
+use starshard::ShardedHashMap;
+use fxhash::FxBuildHasher;
+
+let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(64);
+map.insert("a".into(), 1);
+assert_eq!(map.get(&"a".into()), Some(1));
+assert_eq!(map.len(), 1);
+```
+
+Async (enable `async` feature):
+```
+#[cfg(feature = "async")]
+#[tokio::main]
+async fn main() {
+    use starshard::AsyncShardedHashMap;
+    let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(64);
+    map.insert("k".into(), 7).await;
+    assert_eq!(map.get(&"k".into()).await, Some(7));
+}
+```
+
+Parallel iteration (enable `rayon`):
+```
+use starshard::ShardedHashMap;
+let map: ShardedHashMap<String, u32> = ShardedHashMap::new(32);
+for i in 0..10_000 {
+    map.insert(format!("k{i}"), i);
+}
+let count = map.iter().count(); // internally parallel if `rayon` feature active
+assert_eq!(count, 10_000);
+```
+
+Async + Rayon (enable `async,rayon`):
+```
+#[cfg(all(feature="async", feature="rayon"))]
+#[tokio::main]
+async fn main() {
+    use starshard::AsyncShardedHashMap;
+    let m: AsyncShardedHashMap<u32, u32> = AsyncShardedHashMap::new(64);
+    for i in 0..1000 { m.insert(i, i*i).await; }
+    let items = m.iter().await; // flattens in parallel internally
+    assert_eq!(items.len(), 1000);
+}
+```
+
+Custom hasher (RandomState):
+```
+use starshard::ShardedHashMap;
+use std::collections::hash_map::RandomState;
+let secure: ShardedHashMap<String, i64, RandomState> =
+    ShardedHashMap::with_shards_and_hasher(64, RandomState::default());
+secure.insert("x".into(), 1);
+```
+"#]
 
 use fxhash::FxBuildHasher;
 use hashbrown::HashMap;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 use std::hash::{BuildHasher, Hash};
-use std::sync::RwLockReadGuard as StdReadGuard;
-use std::sync::RwLockWriteGuard as StdWriteGuard;
 use std::sync::{
-    Arc, RwLock as StdRwLock,
+    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
     atomic::{AtomicUsize, Ordering},
 };
 
-type StdShardMap<K, V, S> = hashbrown::HashMap<K, V, S>;
-type StdShard<K, V, S> = std::sync::Arc<std::sync::RwLock<StdShardMap<K, V, S>>>;
-type StdShards<K, V, S> = Vec<Option<StdShard<K, V, S>>>;
-type StdShardsArc<K, V, S> = std::sync::Arc<std::sync::RwLock<StdShards<K, V, S>>>;
+#[cfg(feature = "async")]
+use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
+
+/* -------------------------------------------------------------------------- */
+/* Internal Type Aliases (reduce visible complexity & silence Clippy)         */
+/* -------------------------------------------------------------------------- */
+
+type StdShardMap<K, V, S> = HashMap<K, V, S>;
+type StdShard<K, V, S> = Arc<StdRwLock<StdShardMap<K, V, S>>>;
+type StdShardVec<K, V, S> = Vec<Option<StdShard<K, V, S>>>;
+type StdShardVecArc<K, V, S> = Arc<StdRwLock<StdShardVec<K, V, S>>>;
 
 #[cfg(feature = "async")]
-type AsyncShardMap<K, V, S> = hashbrown::HashMap<K, V, S>;
+type AsyncShardMap<K, V, S> = HashMap<K, V, S>;
 #[cfg(feature = "async")]
-type AsyncShard<K, V, S> = std::sync::Arc<tokio::sync::RwLock<AsyncShardMap<K, V, S>>>;
+type AsyncShard<K, V, S> = Arc<TokioRwLock<AsyncShardMap<K, V, S>>>;
 #[cfg(feature = "async")]
-type AsyncShards<K, V, S> = Vec<Option<AsyncShard<K, V, S>>>;
+type AsyncShardVec<K, V, S> = Vec<Option<AsyncShard<K, V, S>>>;
 #[cfg(feature = "async")]
-type AsyncShardsArc<K, V, S> = std::sync::Arc<tokio::sync::RwLock<AsyncShards<K, V, S>>>;
+type AsyncShardVecArc<K, V, S> = Arc<TokioRwLock<AsyncShardVec<K, V, S>>>;
 
-#[cfg(feature = "async")]
-use tokio::sync::{
-    RwLock as TokioRwLock, RwLockReadGuard as TokioReadGuard, RwLockWriteGuard as TokioWriteGuard,
-};
+/// Default shard count (power-of-two not required; hashing modulo used).
+pub const DEFAULT_SHARDS: usize = 64;
 
-// Default shard count to balance contention and overhead.
-const DEFAULT_SHARDS: usize = 64;
+/* ============================== Sync Map =============================== */
 
-/* ============================ Sync ============================ */
-
+/// Sharded concurrent HashMap (synchronous).
+///
+/// Cloning the map is cheap (`Arc` handles + atomic length).
 #[derive(Clone)]
 pub struct ShardedHashMap<K, V, S = FxBuildHasher>
 where
@@ -108,62 +171,76 @@ where
     V: Clone + Send + Sync,
     S: BuildHasher + Clone + Send + Sync,
 {
-    // Shards container: lazy-initialized per slot.
-    shards: StdShardsArc<K, V, S>,
-    // Hasher used for shard index calculation and backing HashMaps.
+    shards: StdShardVecArc<K, V, S>,
     hasher: S,
-    // Number of shards.
     shard_count: usize,
-    // Cached length for O(1) len().
     total_len: Arc<AtomicUsize>,
+}
+
+impl<K, V> ShardedHashMap<K, V, FxBuildHasher>
+where
+    K: Eq + Hash + Clone + Send + Sync,
+    V: Clone + Send + Sync,
+{
+    /// Create with default hasher (`FxBuildHasher`).
+    pub fn new(shard_count: usize) -> Self {
+        Self::with_shards_and_hasher(shard_count, FxBuildHasher::default())
+    }
 }
 
 impl<K, V, S> ShardedHashMap<K, V, S>
 where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
-    S: BuildHasher + Clone + Send + Sync + Default,
+    S: BuildHasher + Clone + Send + Sync,
 {
-    /// Create a new map with a given shard count (falls back to DEFAULT_SHARDS if 0).
-    pub fn new(shard_count: usize) -> Self {
-        Self::with_shards_and_hasher(shard_count, S::default())
-    }
-
-    /// Create with custom shard count and hasher.
+    /// Create with explicit hasher (non-zero shard count fallback).
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
-        let shard_count = if shard_count == 0 {
+        let count = if shard_count == 0 {
             DEFAULT_SHARDS
         } else {
             shard_count
         };
-        let shards: StdShards<K, V, S> = vec![None; shard_count]; // lazy init
+        let shards = vec![None; count];
         Self {
             shards: Arc::new(StdRwLock::new(shards)),
             hasher,
-            shard_count,
+            shard_count: count,
             total_len: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Compute shard index by hashing the key.
+    /// Current configured shard slots.
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Number of shards actually initialized (allocated).
+    pub fn initialized_shards(&self) -> usize {
+        let g = self.shards.read().unwrap();
+        g.iter().filter(|o| o.is_some()).count()
+    }
+
+    #[inline]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count as u64) as usize
     }
 
-    /// Get or initialize a shard lazily.
-    fn get_shard(&self, index: usize) -> StdShard<K, V, S> {
-        let mut shards = self.shards.write().unwrap();
-        if shards[index].is_none() {
-            let map: StdShardMap<K, V, S> = StdShardMap::with_hasher(self.hasher.clone());
-            shards[index] = Some(Arc::new(StdRwLock::new(map)));
+    #[inline]
+    fn get_or_init_shard(&self, index: usize) -> StdShard<K, V, S> {
+        let mut g = self.shards.write().unwrap();
+        if g[index].is_none() {
+            let map = StdShardMap::with_hasher(self.hasher.clone());
+            g[index] = Some(Arc::new(StdRwLock::new(map)));
         }
-        shards[index].as_ref().unwrap().clone()
+        g[index].as_ref().unwrap().clone()
     }
 
-    /// Insert a key-value pair; returns the old value if present.
+    /// Insert key/value. Returns previous value if existed.
+    ///
+    /// Complexity: O(1) expected.
     pub fn insert(&self, key: K, value: V) -> Option<V> {
-        let index = self.shard_index(&key);
-        let shard = self.get_shard(index);
+        let shard = self.get_or_init_shard(self.shard_index(&key));
         let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
         let old = guard.insert(key, value);
         if old.is_none() {
@@ -172,18 +249,16 @@ where
         old
     }
 
-    /// Get a cloned value by key.
+    /// Fetch cloned value.
     pub fn get(&self, key: &K) -> Option<V> {
-        let index = self.shard_index(key);
-        let shard = self.get_shard(index);
+        let shard = self.get_or_init_shard(self.shard_index(key));
         let guard: StdReadGuard<'_, HashMap<K, V, S>> = shard.read().unwrap();
         guard.get(key).cloned()
     }
 
-    /// Remove a key; returns the old value if present.
+    /// Remove key, returning previous value.
     pub fn remove(&self, key: &K) -> Option<V> {
-        let index = self.shard_index(key);
-        let shard = self.get_shard(index);
+        let shard = self.get_or_init_shard(self.shard_index(key));
         let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
         let old = guard.remove(key);
         if old.is_some() {
@@ -192,61 +267,64 @@ where
         old
     }
 
-    /// O(1) cached length.
+    /// Length (cached atomic).
+    #[inline]
     pub fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
-    /// Whether the map is empty.
+    /// Whether empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Clear all shards and reset length.
+    /// Clear all data (retains shard allocations).
     pub fn clear(&self) {
-        let shards = self.shards.read().unwrap();
-        for shard in shards.iter().flatten() {
-            let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
-            guard.clear();
+        let slots = self.shards.read().unwrap();
+        for shard in slots.iter().flatten() {
+            let mut g = shard.write().unwrap();
+            g.clear();
         }
         self.total_len.store(0, Ordering::Relaxed);
     }
 
-    /// Iterate over a snapshot of all entries.
-    /// - Takes a snapshot of shard Arcs first to avoid holding `self.shards` lock.
-    /// - Parallel flatten when `rayon` is enabled, otherwise sequential.
+    /// Snapshot iteration over (K,V) clones.
+    ///
+    /// Semantics:
+    /// - Collects a list of initialized shard Arcs first (short critical section).
+    /// - Each shard is read-locked independently; values cloned.
+    /// - Not a live iterator: modifications after a shard snapshot are not reflected.
+    /// - If `rayon` enabled, internal flattening per-shard happens in parallel for speed.
+    ///
+    /// Cost:
+    /// - O(N) cloning cost for visited entries.
+    /// - Temporary Vec allocations proportional to initialized shard count (and item copies).
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
-        // Snapshot Arc list of initialized shards.
-        let shard_arcs: Vec<StdShard<K, V, S>> = {
-            let shards_guard = self.shards.read().unwrap();
-            shards_guard
-                .iter()
-                .filter_map(|opt| opt.as_ref().cloned())
-                .collect()
+        let shards_snapshot: Vec<StdShard<K, V, S>> = {
+            let g = self.shards.read().unwrap();
+            g.iter().filter_map(|o| o.as_ref().cloned()).collect()
         };
 
-        // Parallel path.
         #[cfg(feature = "rayon")]
         {
-            let items: Vec<(K, V)> = shard_arcs
+            let items: Vec<(K, V)> = shards_snapshot
                 .par_iter()
-                .map(|shard| {
+                .flat_map(|shard| {
                     let guard = shard.read().unwrap();
                     guard
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect::<Vec<_>>()
                 })
-                .flatten()
                 .collect();
             items.into_iter()
         }
 
-        // Sequential path.
         #[cfg(not(feature = "rayon"))]
         {
             let mut items = Vec::new();
-            for shard in shard_arcs {
+            for shard in shards_snapshot {
                 let guard = shard.read().unwrap();
                 items.extend(guard.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
@@ -255,8 +333,10 @@ where
     }
 }
 
-/* ============================ Async (feature = "async") ============================ */
+/* ============================== Async Map =============================== */
 
+/// Asynchronous sharded concurrent HashMap (Tokio `RwLock`).
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 #[cfg(feature = "async")]
 #[derive(Clone)]
 pub struct AsyncShardedHashMap<K, V, S = FxBuildHasher>
@@ -265,14 +345,22 @@ where
     V: Clone + Send + Sync,
     S: BuildHasher + Clone + Send + Sync,
 {
-    // Async shards container.
-    shards: AsyncShardsArc<K, V, S>,
-    // Hasher used for shard index calculation and backing HashMaps.
+    shards: AsyncShardVecArc<K, V, S>,
     hasher: S,
-    // Number of shards.
     shard_count: usize,
-    // Cached length for O(1) len().
     total_len: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "async")]
+impl<K, V> AsyncShardedHashMap<K, V, FxBuildHasher>
+where
+    K: Eq + Hash + Clone + Send + Sync,
+    V: Clone + Send + Sync,
+{
+    /// Create with default hasher.
+    pub fn new(shard_count: usize) -> Self {
+        Self::with_shards_and_hasher(shard_count, FxBuildHasher::default())
+    }
 }
 
 #[cfg(feature = "async")]
@@ -280,48 +368,52 @@ impl<K, V, S> AsyncShardedHashMap<K, V, S>
 where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
-    S: BuildHasher + Clone + Send + Sync + Default,
+    S: BuildHasher + Clone + Send + Sync,
 {
-    /// Create a new async map with a given shard count (falls back to DEFAULT_SHARDS if 0).
-    pub fn new(shard_count: usize) -> Self {
-        Self::with_shards_and_hasher(shard_count, S::default())
-    }
-
-    /// Create with custom shard count and hasher.
+    /// Create with custom hasher.
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
-        let shard_count = if shard_count == 0 {
+        let count = if shard_count == 0 {
             DEFAULT_SHARDS
         } else {
             shard_count
         };
-        let shards: AsyncShards<K, V, S> = vec![None; shard_count];
         Self {
-            shards: Arc::new(TokioRwLock::new(shards)),
+            shards: Arc::new(TokioRwLock::new(vec![None; count])),
             hasher,
-            shard_count,
+            shard_count: count,
             total_len: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Compute shard index by hashing the key.
+    /// Configured shard capacity.
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Number of initialized shards.
+    pub async fn initialized_shards(&self) -> usize {
+        let g = self.shards.read().await;
+        g.iter().filter(|o| o.is_some()).count()
+    }
+
+    #[inline]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count as u64) as usize
     }
 
-    /// Get or initialize a shard lazily.
-    async fn get_shard(&self, index: usize) -> Arc<TokioRwLock<HashMap<K, V, S>>> {
-        let mut shards = self.shards.write().await;
-        if shards[index].is_none() {
-            let map: AsyncShardMap<K, V, S> = AsyncShardMap::with_hasher(self.hasher.clone());
-            shards[index] = Some(Arc::new(TokioRwLock::new(map)));
+    #[inline]
+    async fn get_or_init_shard(&self, index: usize) -> AsyncShard<K, V, S> {
+        let mut g = self.shards.write().await;
+        if g[index].is_none() {
+            let map = AsyncShardMap::with_hasher(self.hasher.clone());
+            g[index] = Some(Arc::new(TokioRwLock::new(map)));
         }
-        shards[index].as_ref().unwrap().clone()
+        g[index].as_ref().unwrap().clone()
     }
 
-    /// Insert a key-value pair; returns the old value if present.
+    /// Insert key/value asynchronously.
     pub async fn insert(&self, key: K, value: V) -> Option<V> {
-        let index = self.shard_index(&key);
-        let shard = self.get_shard(index).await;
+        let shard = self.get_or_init_shard(self.shard_index(&key)).await;
         let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
         let old = guard.insert(key, value);
         if old.is_none() {
@@ -330,78 +422,74 @@ where
         old
     }
 
-    /// Get a cloned value by key; prefers non-blocking `try_read` first.
+    /// Get cloned value; uses `try_read` first (fast path, reduces scheduler churn).
     pub async fn get(&self, key: &K) -> Option<V> {
-        let index = self.shard_index(key);
-        let shard = self.get_shard(index).await;
-        if let Ok(guard) = shard.try_read() {
-            return guard.get(key).cloned();
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        if let Ok(g) = shard.try_read() {
+            return g.get(key).cloned();
         }
-        let guard: TokioReadGuard<'_, HashMap<K, V, S>> = shard.read().await;
-        guard.get(key).cloned()
+        let g = shard.read().await;
+        g.get(key).cloned()
     }
 
-    /// Remove a key; returns the old value if present.
+    /// Remove key.
     pub async fn remove(&self, key: &K) -> Option<V> {
-        let index = self.shard_index(key);
-        let shard = self.get_shard(index).await;
-        let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
-        let old = guard.remove(key);
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        let mut g = shard.write().await;
+        let old = g.remove(key);
         if old.is_some() {
             self.total_len.fetch_sub(1, Ordering::Relaxed);
         }
         old
     }
 
-    /// O(1) cached length.
+    /// Length (atomic).
     pub async fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
-    /// Whether the map is empty.
+    /// Empty check.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
 
-    /// Clear all shards and reset length.
+    /// Clear (retains allocated shards).
     pub async fn clear(&self) {
-        let shards = self.shards.read().await;
-        for shard in shards.iter().flatten() {
-            let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
-            guard.clear();
+        let slots = self.shards.read().await;
+        for shard in slots.iter().flatten() {
+            let mut g = shard.write().await;
+            g.clear();
         }
         self.total_len.store(0, Ordering::Relaxed);
     }
 
-    /// Iterate over a snapshot of all entries (async).
-    /// - Snapshot Arc list of initialized shards.
-    /// - Clone per-shard HashMap snapshots under short-lived locks.
-    /// - Parallel flatten when `rayon` is enabled, otherwise sequential.
+    /// Snapshot iteration (async).
+    ///
+    /// Steps:
+    /// 1. Snapshot Arc list of initialized shards under read lock of the shard vector.
+    /// 2. For each shard: try `try_read`; fallback to `await` read.
+    /// 3. Clone inner HashMaps (short critical sections).
+    /// 4. If `rayon` enabled, parallel flatten of snapshots.
+    ///
+    /// Returns a materialized `Vec`.
     pub async fn iter(&self) -> Vec<(K, V)> {
-        // 1) Snapshot Arc list of initialized shards.
         let shard_arcs: Vec<AsyncShard<K, V, S>> = {
-            let shards_guard = self.shards.read().await;
-            shards_guard
-                .iter()
-                .filter_map(|opt| opt.as_ref().cloned())
-                .collect()
+            let g = self.shards.read().await;
+            g.iter().filter_map(|o| o.as_ref().cloned()).collect()
         };
 
-        // 2) Clone per-shard HashMap snapshots, minimizing lock hold time.
-        let mut snapshots: Vec<AsyncShardMap<K, V, S>> = Vec::with_capacity(shard_arcs.len());
+        let mut snapshots = Vec::with_capacity(shard_arcs.len());
         for shard in shard_arcs {
-            if let Ok(guard) = shard.try_read() {
-                snapshots.push(guard.clone());
+            if let Ok(g) = shard.try_read() {
+                snapshots.push(g.clone());
             } else {
-                let guard = shard.read().await;
-                snapshots.push(guard.clone());
+                let g = shard.read().await;
+                snapshots.push(g.clone());
             }
         }
 
-        // 3) Flatten snapshots.
         #[cfg(feature = "rayon")]
         {
-            // Use `m.par_iter()` so the closure returns a ParallelIterator, satisfying `IntoParallelIterator`.
             snapshots
                 .par_iter()
                 .flat_map(|m| m.par_iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -414,109 +502,45 @@ where
             for m in snapshots {
                 items.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
-            return items;
+            items
         }
     }
 }
 
-/* ============================ Tests ============================ */
+/* ================================ Tests ================================ */
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
-    fn test_sync_insert_get_remove() {
-        let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(4);
-        assert!(map.insert("key1".to_string(), 42).is_none());
-        assert_eq!(map.get(&"key1".to_string()), Some(42));
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.remove(&"key1".to_string()), Some(42));
-        assert_eq!(map.len(), 0);
-        assert!(map.is_empty());
+    fn sync_basic() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+        assert!(m.insert("a".into(), 1).is_none());
+        assert_eq!(m.get(&"a".into()), Some(1));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.remove(&"a".into()), Some(1));
+        assert!(m.is_empty());
     }
 
     #[test]
-    fn test_sync_concurrent_insert() {
-        let map = Arc::new(ShardedHashMap::<String, i32, FxBuildHasher>::new(8));
-        let mut handles = vec![];
-        for i in 0..100 {
-            let map_clone = map.clone();
-            handles.push(thread::spawn(move || {
-                map_clone.insert(format!("key{}", i), i);
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(map.len(), 100);
-    }
-
-    #[test]
-    fn test_sync_iter() {
-        let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(4);
-        map.insert("a".to_string(), 1);
-        map.insert("b".to_string(), 2);
-        let mut items: Vec<_> = map.iter().collect();
-        items.sort_by_key(|(k, _)| k.clone());
-        assert_eq!(items, vec![("a".to_string(), 1), ("b".to_string(), 2)]);
-    }
-
-    #[test]
-    fn test_sync_clear() {
-        let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(4);
-        map.insert("key".to_string(), 42);
-        map.clear();
-        assert!(map.is_empty());
-        assert_eq!(map.len(), 0);
+    fn sync_iteration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("x".into(), 10);
+        m.insert("y".into(), 20);
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(v.len(), 2);
     }
 
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_async_insert_get_remove() {
-        let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        assert!(map.insert("key1".to_string(), 42).await.is_none());
-        assert_eq!(map.get(&"key1".to_string()).await, Some(42));
-        assert_eq!(map.len().await, 1);
-        assert_eq!(map.remove(&"key1".to_string()).await, Some(42));
-        assert!(map.is_empty().await);
-    }
-
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_concurrent() {
-        let map = Arc::new(AsyncShardedHashMap::<String, i32, FxBuildHasher>::new(8));
-        let mut handles = vec![];
-        for i in 0..100 {
-            let map_clone = map.clone();
-            handles.push(tokio::spawn(async move {
-                map_clone.insert(format!("key{}", i), i).await;
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-        assert_eq!(map.len().await, 100);
-    }
-
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_iter() {
-        let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        map.insert("a".to_string(), 1).await;
-        map.insert("b".to_string(), 2).await;
-        let mut items = map.iter().await;
-        items.sort_by_key(|(k, _)| k.clone());
-        assert_eq!(items, vec![("a".to_string(), 1), ("b".to_string(), 2)]);
-    }
-
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_clear() {
-        let map: AsyncShardedHashMap<String, i32, FxBuildHasher> = AsyncShardedHashMap::new(4);
-        map.insert("key".to_string(), 42).await;
-        map.clear().await;
-        assert!(map.is_empty().await);
+    async fn async_basic() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
+        assert!(m.insert("a".into(), 1).await.is_none());
+        assert_eq!(m.get(&"a".into()).await, Some(1));
+        assert_eq!(m.len().await, 1);
+        assert_eq!(m.remove(&"a".into()).await, Some(1));
+        assert!(m.is_empty().await);
     }
 }

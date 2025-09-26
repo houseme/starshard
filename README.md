@@ -25,13 +25,18 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 starshard = { version = "0.1.0", features = ["rayon", "async"] }
+fxhash = "0.2.1"
+hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }
+rayon = "1.11.0"
+tokio = { version = "1.47.1", features = ["sync", "rt-multi-thread"] }
 ```
 
 ## Quick Start
 
 ```rust
 use starshard::ShardedHashMap;
-let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+
+let map: ShardedHashMap<String, i32, fxhash::FxBuildHasher> = ShardedHashMap::new(64);
 map.insert("k".into(), 1);
 assert_eq!(map.get(&"k".into()), Some(1));
 ```
@@ -40,6 +45,6 @@ assert_eq!(map.get(&"k".into()), Some(1));
 
 Dual\-licensed under MIT or Apache\-2\.0.
 
-- See `LICENSE-MIT` and `LICENSE-APACHE`.
+- See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
 - © 2025 [houseme](https://github.com/houseme).
 

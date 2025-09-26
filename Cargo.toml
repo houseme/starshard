@@ -1,6 +1,6 @@
 [package]
 name = "starshard"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A blazing-fast sharded concurrent HashMap using hashbrown and RwLock, with lazy shards, atomic length cache, and async support."
 authors = ["houseme <housemecn@gmail.com>"]
@@ -11,6 +11,7 @@ documentation = "https://docs.rs/starshard"
 keywords = ["concurrency", "hashmap", "hashbrown", "rwlock", "async"]
 categories = ["concurrency", "data-structures"]
 readme = "README.md"
+resolver = "2"
 
 [dependencies]
 hashbrown = { version = "0.16", default-features = false }
@@ -22,6 +23,11 @@ tokio = { version = "1.47.1", optional = true, features = ["sync", "rt-multi-thr
 default = ["rayon"]
 async = ["dep:tokio"]
 rayon = ["dep:rayon", "hashbrown/rayon"]
+full = ["async", "rayon"]
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
