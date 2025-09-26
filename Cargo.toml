@@ -1,6 +1,6 @@
 [package]
 name = "starshard"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A blazing-fast sharded concurrent HashMap using hashbrown and RwLock, with lazy shards, atomic length cache, and async support."
 authors = ["houseme <housemecn@gmail.com>"]
@@ -18,15 +18,18 @@ hashbrown = { version = "0.16", default-features = false }
 fxhash = "0.2.1"
 rayon = { version = "1", optional = true }
 tokio = { version = "1.47.1", optional = true, features = ["sync", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = ["rayon"]
 async = ["dep:tokio"]
 rayon = ["dep:rayon", "hashbrown/rayon"]
-full = ["async", "rayon"]
+serde = ["dep:serde", "hashbrown/serde"]
+full = ["async", "rayon", "serde"]
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
 
 [package.metadata.docs.rs]
 all-features = true

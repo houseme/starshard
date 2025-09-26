@@ -7,7 +7,20 @@ Features
 ---------
 - `async`: enables `AsyncShardedHashMap` backed by `tokio::sync::RwLock`.
 - `rayon`: enables parallel snapshot flattening inside iteration for large maps (sync + async).
-- (Optional future) `serde` (not implemented here) could forward to `hashbrown`'s `serde`.
+- `serde`: (sync) serialize/deserialize via a stable map snapshot; async map via snapshot helper.
+
+Serde Semantics
+---------------
+`ShardedHashMap`:
+- Serialized form: { shard_count: usize, entries: Vec<(K,V)> }.
+- Hasher state is *not* preserved; deserialization rebuilds with `S::default()`.
+- Requires `K: Eq + Hash + Clone + Send + Sync + Serialize + Deserialize`, `V: Clone + Send + Sync + Serialize + Deserialize`,
+  `S: BuildHasher + Clone + Send + Sync + Default`.
+
+`AsyncShardedHashMap`:
+- No direct `Serialize`/`Deserialize` (locks need `await`).
+- Use `async_snapshot_serializable().await` to obtain a snapshot wrapper implementing `Serialize`.
+- To rebuild: create a new async map, then bulk insert entries.
 
 Design Goals
 -------------
@@ -137,6 +150,10 @@ use std::sync::{
 
 #[cfg(feature = "async")]
 use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
+
+/* ---------------------------- Serde Imports ----------------------------- */
+#[cfg(feature = "serde")]
+use serde::Serialize;
 
 /* -------------------------------------------------------------------------- */
 /* Internal Type Aliases (reduce visible complexity & silence Clippy)         */
@@ -333,6 +350,67 @@ where
     }
 }
 
+/* ---------------------- Serde for ShardedHashMap ------------------------ */
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::DEFAULT_SHARDS;
+    use super::ShardedHashMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::hash::{BuildHasher, Hash};
+
+    // Transit representation
+    #[derive(Serialize, Deserialize)]
+    struct ShardedMapRepr<K, V> {
+        shard_count: usize,
+        entries: Vec<(K, V)>,
+    }
+
+    // Serialize
+    impl<K, V, S> Serialize for ShardedHashMap<K, V, S>
+    where
+        K: Eq + Hash + Clone + Send + Sync + Serialize,
+        V: Clone + Send + Sync + Serialize,
+        S: BuildHasher + Clone + Send + Sync + Default,
+    {
+        fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+        where
+            Ser: Serializer,
+        {
+            let repr = ShardedMapRepr {
+                shard_count: self.shard_count(),
+                entries: self.iter().collect(),
+            };
+            repr.serialize(serializer)
+        }
+    }
+
+    // Deserialize
+    impl<'de, K, V, S> Deserialize<'de> for ShardedHashMap<K, V, S>
+    where
+        K: Eq + Hash + Clone + Send + Sync + Deserialize<'de>,
+        V: Clone + Send + Sync + Deserialize<'de>,
+        S: BuildHasher + Clone + Send + Sync + Default,
+    {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let repr = ShardedMapRepr::<K, V>::deserialize(deserializer)?;
+            let sc = if repr.shard_count == 0 {
+                DEFAULT_SHARDS
+            } else {
+                repr.shard_count
+            };
+            let map = ShardedHashMap::<K, V, S>::with_shards_and_hasher(sc, S::default());
+            for (k, v) in repr.entries {
+                map.insert(k, v);
+            }
+            Ok(map)
+        }
+    }
+}
+
 /* ============================== Async Map =============================== */
 
 /// Asynchronous sharded concurrent HashMap (Tokio `RwLock`).
@@ -507,6 +585,42 @@ where
     }
 }
 
+#[cfg(all(feature = "async", feature = "serde"))]
+impl<K, V> AsyncShardedHashMap<K, V>
+where
+    K: Eq + Hash + Clone + Send + Sync + Serialize,
+    V: Clone + Send + Sync + Serialize,
+{
+    /// Obtain a serializable snapshot wrapper (for `serde`).
+    pub async fn async_snapshot_serializable(&self) -> AsyncShardedHashMapSnapshot<K, V> {
+        AsyncShardedHashMapSnapshot(self.iter().await)
+    }
+}
+
+/* -------- Serializable Snapshot Wrapper for Async Map -------- */
+/// A serializable snapshot of an `AsyncShardedHashMap`.
+#[cfg(all(feature = "async", feature = "serde"))]
+pub struct AsyncShardedHashMapSnapshot<K, V>(Vec<(K, V)>);
+
+#[cfg(all(feature = "async", feature = "serde"))]
+impl<K, V> Serialize for AsyncShardedHashMapSnapshot<K, V>
+where
+    K: Serialize,
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for kv in &self.0 {
+            seq.serialize_element(kv)?;
+        }
+        seq.end()
+    }
+}
+
 /* ================================ Tests ================================ */
 
 #[cfg(test)]
@@ -542,5 +656,29 @@ mod tests {
         assert_eq!(m.len().await, 1);
         assert_eq!(m.remove(&"a".into()).await, Some(1));
         assert!(m.is_empty().await);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip() {
+        use serde_json;
+        let m: ShardedHashMap<String, u32> = ShardedHashMap::new(4);
+        m.insert("x".into(), 10);
+        m.insert("y".into(), 20);
+        let s = serde_json::to_string(&m).unwrap();
+        let de: ShardedHashMap<String, u32> = serde_json::from_str(&s).unwrap();
+        assert_eq!(de.len(), 2);
+        assert_eq!(de.get(&"x".into()), Some(10));
+    }
+
+    #[cfg(all(feature = "async", feature = "serde"))]
+    #[tokio::test]
+    async fn async_snapshot_serialize() {
+        use serde_json;
+        let m = AsyncShardedHashMap::<u32, u32>::new(8);
+        m.insert(1, 10).await;
+        let snap = m.async_snapshot_serializable().await;
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("[[1,10]]"));
     }
 }
