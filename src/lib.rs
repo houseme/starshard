@@ -84,7 +84,7 @@ Examples
 Sync (default features):
 ```
 use starshard::ShardedHashMap;
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 
 let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(64);
 map.insert("a".into(), 1);
@@ -138,10 +138,10 @@ secure.insert("x".into(), 1);
 ```
 "#]
 
-use fxhash::FxBuildHasher;
 use hashbrown::HashMap;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
     Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
@@ -201,7 +201,7 @@ where
 {
     /// Create with default hasher (`FxBuildHasher`).
     pub fn new(shard_count: usize) -> Self {
-        Self::with_shards_and_hasher(shard_count, FxBuildHasher::default())
+        Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
 }
 
@@ -437,7 +437,7 @@ where
 {
     /// Create with default hasher.
     pub fn new(shard_count: usize) -> Self {
-        Self::with_shards_and_hasher(shard_count, FxBuildHasher::default())
+        Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
 }
 

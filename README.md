@@ -59,9 +59,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.4", features = ["async", "rayon", "serde"] }
+starshard = { version = "0.5", features = ["async", "rayon", "serde"] }
 # or minimal:
-# starshard = "0.4"
+# starshard = "0.5"
 ```
 
 `serde_json` (tests / examples):
@@ -77,7 +77,7 @@ serde_json = "1"
 
 ```rust
 use starshard::ShardedHashMap;
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 
 let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(64);
 map.insert("a".into(), 1);
