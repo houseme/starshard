@@ -63,9 +63,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.5", features = ["async", "rayon", "serde"] }
+starshard = { version = "0.6", features = ["async", "rayon", "serde"] }
 # 最小：
-# starshard = "0.5"
+# starshard = "0.6"
 ```
 
 开发/测试:

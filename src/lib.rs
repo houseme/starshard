@@ -144,8 +144,8 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering}, Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
-    RwLockWriteGuard as StdWriteGuard,
+    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "async")]
@@ -394,8 +394,8 @@ where
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::ShardedHashMap;
     use super::DEFAULT_SHARDS;
+    use super::ShardedHashMap;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::hash::{BuildHasher, Hash};
 
