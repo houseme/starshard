@@ -144,8 +144,8 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
-    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering}, Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
+    RwLockWriteGuard as StdWriteGuard,
 };
 
 #[cfg(feature = "async")]
@@ -256,6 +256,16 @@ where
     /// Insert key/value. Returns previous value if existed.
     ///
     /// Complexity: O(1) expected.
+    ///
+    /// If the key was not present, increments length counter.
+    ///
+    /// # Arguments
+    /// - `key`: key to insert.
+    /// - `value`: value to associate with the key
+    ///
+    /// # Returns
+    /// - `Option<V>`: previous value if the key was already present.
+    ///
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(&key));
         let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
@@ -267,6 +277,13 @@ where
     }
 
     /// Fetch cloned value.
+    ///
+    /// # Arguments
+    /// - `key`: key to look up.
+    ///
+    /// # Returns
+    /// - `Option<V>`: cloned value if the key exists.
+    ///
     pub fn get(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
         let guard: StdReadGuard<'_, HashMap<K, V, S>> = shard.read().unwrap();
@@ -274,6 +291,13 @@ where
     }
 
     /// Remove key, returning previous value.
+    ///
+    /// # Arguments
+    /// - `key`: key to remove.
+    ///
+    /// # Returns
+    /// - `Option<V>`: previous value if the key existed.
+    ///
     pub fn remove(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
         let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
@@ -285,18 +309,30 @@ where
     }
 
     /// Length (cached atomic).
+    ///
+    /// # Returns
+    /// - `usize`: total number of key/value pairs in the map.
+    ///
     #[inline]
     pub fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
     /// Whether empty.
+    ///
+    /// # Returns
+    /// - `bool`: true if the map contains no entries.
+    ///
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Clear all data (retains shard allocations).
+    ///
+    /// # Notes
+    /// - Resets length counter to zero.
+    ///
     pub fn clear(&self) {
         let slots = self.shards.read().unwrap();
         for shard in slots.iter().flatten() {
@@ -317,6 +353,10 @@ where
     /// Cost:
     /// - O(N) cloning cost for visited entries.
     /// - Temporary Vec allocations proportional to initialized shard count (and item copies).
+    ///
+    /// # Returns
+    /// - `impl Iterator<Item = (K, V)>`: iterator over cloned key/value pairs.
+    ///
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
         let shards_snapshot: Vec<StdShard<K, V, S>> = {
             let g = self.shards.read().unwrap();
@@ -354,8 +394,8 @@ where
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::DEFAULT_SHARDS;
     use super::ShardedHashMap;
+    use super::DEFAULT_SHARDS;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::hash::{BuildHasher, Hash};
 
@@ -436,6 +476,13 @@ where
     V: Clone + Send + Sync,
 {
     /// Create with default hasher.
+    ///
+    /// # Arguments
+    /// - `shard_count`: number of shards (0 defaults to `DEFAULT_SHARDS`).
+    ///
+    /// # Returns
+    /// - `Self`: new async sharded hash map.
+    ///
     pub fn new(shard_count: usize) -> Self {
         Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
@@ -449,6 +496,14 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     /// Create with custom hasher.
+    ///
+    /// # Arguments
+    /// - `shard_count`: number of shards (0 defaults to `DEFAULT_SHARDS
+    /// - `hasher`: user-supplied hasher instance.
+    ///
+    /// # Returns
+    /// - `Self`: new async sharded hash map.
+    ///
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
         let count = if shard_count == 0 {
             DEFAULT_SHARDS
@@ -464,11 +519,19 @@ where
     }
 
     /// Configured shard capacity.
+    ///
+    /// # Returns
+    /// - `usize`: number of shard slots.
+    ///
     pub fn shard_count(&self) -> usize {
         self.shard_count
     }
 
     /// Number of initialized shards.
+    ///
+    /// # Returns
+    /// - `usize`: count of allocated shards.
+    ///
     pub async fn initialized_shards(&self) -> usize {
         let g = self.shards.read().await;
         g.iter().filter(|o| o.is_some()).count()
@@ -490,6 +553,14 @@ where
     }
 
     /// Insert key/value asynchronously.
+    ///
+    /// # Arguments
+    /// - `key`: key to insert.
+    /// - `value`: value to associate with the key.
+    ///
+    /// # Returns
+    /// - `Option<V>`: previous value if the key was already present.
+    ///
     pub async fn insert(&self, key: K, value: V) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(&key)).await;
         let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
@@ -501,6 +572,13 @@ where
     }
 
     /// Get cloned value; uses `try_read` first (fast path, reduces scheduler churn).
+    ///
+    /// # Arguments
+    /// - `key`: key to look up.
+    ///
+    /// # Returns
+    /// - `Option<V>`: cloned value if the key exists.
+    ///
     pub async fn get(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         if let Ok(g) = shard.try_read() {
@@ -511,6 +589,13 @@ where
     }
 
     /// Remove key.
+    ///
+    /// # Arguments
+    /// - `key`: key to remove.
+    ///
+    /// # Returns
+    /// - `Option<V>`: previous value if the key existed.
+    ///
     pub async fn remove(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         let mut g = shard.write().await;
@@ -522,16 +607,30 @@ where
     }
 
     /// Length (atomic).
+    ///
+    /// # Returns
+    /// - `usize`: total number of key/value pairs in the map.
+    ///
+    #[inline]
     pub async fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
     /// Empty check.
+    ///
+    /// # Returns
+    /// - `bool`: true if the map contains no entries.
+    ///
+    #[inline]
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
 
     /// Clear (retains allocated shards).
+    ///
+    /// # Notes
+    /// - Resets length counter to zero.
+    ///
     pub async fn clear(&self) {
         let slots = self.shards.read().await;
         for shard in slots.iter().flatten() {
