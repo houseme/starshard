@@ -205,6 +205,121 @@ Do benchmark with your own key/value distribution and CPU topology.
 
 ---
 
+## Version 0.8.0 Features (Entry API & Batch Operations)
+
+### Entry API (Idiomatic Updates)
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+
+// Efficient in-place update without re-locking
+match map.entry("counter".into()) {
+    starshard::Entry::Occupied(mut entry) => {
+        let val = entry.get();
+        entry.insert(val + 1);
+    }
+    starshard::Entry::Vacant(entry) => {
+        entry.insert(0);
+    }
+}
+```
+
+### Batch Operations
+
+```rust
+// Batch insert (amortizes shard lock acquisition)
+let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
+let inserted = map.batch_insert(entries);
+
+// Batch remove
+let removed = map.batch_remove(vec!["a".into(), "b".into()]);
+
+// Batch get
+let keys = vec!["a", "b", "c"];
+let results = map.batch_get(&keys);
+```
+
+### Conditional Operations
+
+```rust
+// Update only if present
+map.compute_if_present(&"key".into(), |v| Some(v * 2));
+
+// Insert only if absent
+let val = map.compute_if_absent("key".into(), || 42);
+```
+
+### Collection Views & Introspection
+
+```rust
+// Iterate keys/values separately
+for key in map.keys() {
+    println!("Key: {}", key);
+}
+
+for value in map.values() {
+    println!("Value: {}", value);
+}
+
+// Shard statistics
+let stats = map.shard_stats();
+println!("Initialized shards: {}", stats.initialized);
+println!("Avg load: {:.2}", stats.avg_load);
+println!("Utilization: {:.1}%", map.shard_utilization());
+
+// Retain entries matching predicate
+map.retain(|k, v| v > &10);
+```
+
+---
+
+## Version 0.9.0 Features (Eviction, Metrics, Advanced Iteration)
+
+**Planned features**:
+
+- **TTL & Eviction**: LRU/LFU/custom eviction policies with background cleanup
+- **Metrics Hooks**: Production observability with hit rates, latency tracking
+- **Advanced Iteration**: Filter + limit + parallel control builders
+- **Drain Operations**: Efficient bulk removal
+
+See [ROADMAP.md](ROADMAP.md) for detailed specification.
+
+---
+
+## Version 1.0.0 Features (Transactions, CAS, Replication)
+
+**Planned features**:
+
+- **MVCC Transactions**: Atomic multi-key operations with conflict detection
+- **Compare-And-Swap**: Lock-free coordination primitives
+- **Copy-On-Write Snapshots**: Minimal-contention read optimization
+- **Distributed Replication**: Quorum-based consistency framework
+- **Lock Diagnostics**: Per-shard contention profiling
+
+See [ROADMAP.md](ROADMAP.md) for detailed specification.
+
+---
+
+## Feature Matrix
+
+| Feature                    | v0.7 | v0.8 | v0.9 | v1.0 | Status     |
+|----------------------------|------|------|------|------|------------|
+| Sharded HashMap (sync)     | ✅    | ✅    | ✅    | ✅    | Stable     |
+| Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | Stable     |
+| Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | Stable     |
+| Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | Stable     |
+| Entry API                  | -    | ✅    | ✅    | ✅    | New in 0.8 |
+| Batch operations           | -    | ✅    | ✅    | ✅    | New in 0.8 |
+| TTL/Eviction               | -    | -    | ✅    | ✅    | Planned    |
+| Metrics                    | -    | -    | ✅    | ✅    | Planned    |
+| Transactions               | -    | -    | -    | ✅    | Planned    |
+| CAS operations             | -    | -    | -    | ✅    | Planned    |
+| Replication                | -    | -    | -    | ✅    | Planned    |
+
+---
+
 ## Design Sketch
 
 ```
