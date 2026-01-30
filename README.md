@@ -10,13 +10,13 @@ English | [简体中文](README_CN.md)
 
 <b>Starshard</b>: a high-performance, lazily sharded concurrent HashMap for Rust.
 
-<code>Sync + Async + Optional Rayon + Optional Serde</code>
+<code>Sync + Async + Optional Rayon + Optional Serde + Lifecycle + Advanced Features</code>
 
 ---
 
 ## Status
 
-Early stage. API may still evolve (semantic stability prioritized; minor naming changes possible).
+Production-ready (v1.0+). API stability prioritized.
 
 ## Motivation
 
@@ -33,18 +33,20 @@ Starshard focuses on:
 3. Atomic cached length.
 4. Snapshot iteration (parallel if `rayon`).
 5. Symmetric sync / async APIs.
-6. Extensible design (future: rebalancing, eviction, metrics).
+6. Extensible design (lifecycle management, advanced concurrency).
 
 ---
 
 ## Features
 
-| Feature | Description                                          | Notes                          |
-|---------|------------------------------------------------------|--------------------------------|
-| `async` | Adds `AsyncShardedHashMap` (Tokio `RwLock`)          | Independent of `rayon`         |
-| `rayon` | Parallel snapshot flatten for large iteration        | Used internally; API unchanged |
-| `serde` | Serialize/Deserialize (sync) + async snapshot helper | Hasher not persisted           |
-| (none)  | Pure sync core                                       | Lowest dependency surface      |
+| Feature     | Description                                          | Notes                          |
+|-------------|------------------------------------------------------|--------------------------------|
+| `async`     | Adds `AsyncShardedHashMap` (Tokio `RwLock`)          | Independent of `rayon`         |
+| `rayon`     | Parallel snapshot flatten for large iteration        | Used internally; API unchanged |
+| `serde`     | Serialize/Deserialize (sync) + async snapshot helper | Hasher not persisted           |
+| `lifecycle` | TTL, Eviction, Metrics, Advanced Iteration           | Consolidated v0.9 features     |
+| `advanced`  | Transactions, CAS, Replication, Diagnostics          | Consolidated v1.0 features     |
+| (none)      | Pure sync core + Batch Ops                           | Lowest dependency surface      |
 
 Enable all in docs.rs via:
 
@@ -59,9 +61,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.7", features = ["async", "rayon", "serde"] }
+starshard = { version = "1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # or minimal:
-# starshard = "0.7"
+# starshard = "1.0"
 ```
 
 `serde_json` (tests / examples):
@@ -171,6 +173,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | Read-heavy mixed workload vs global `RwLock<HashMap>` | Reduced contention           |
 | Large snapshot iteration with `rayon` (100k+)         | 3-4x speedup flattening      |
 | Sparse shard usage                                    | Only touched shards allocate |
+| Batch Insert/Remove                                   | Single lock per shard group  |
 
 Do benchmark with your own key/value distribution and CPU topology.
 
@@ -188,7 +191,6 @@ Do benchmark with your own key/value distribution and CPU topology.
 ## Limitations
 
 - No dynamic shard rebalancing.
-- No eviction / TTL.
 - Snapshot iteration allocates intermediate vectors.
 - Hasher state not serialized.
 - No lock-free progress guarantees.
@@ -198,14 +200,11 @@ Do benchmark with your own key/value distribution and CPU topology.
 ## Roadmap (Potential)
 
 - Optional adaptive shard expansion / rebalancing.
-- Per-shard eviction strategies (LRU / segmented).
-- Metrics hooks (pre/post op instrumentation).
-- Batched multi-insert API.
 - Zero-copy or COW snapshot mode.
 
 ---
 
-## Version 0.8.0 Features (Conditional Operations & Batch Operations)
+## Core Features (v0.8+)
 
 ### Conditional Operations (Method-based, highly efficient)
 
@@ -224,16 +223,10 @@ let val = map.compute_if_absent("new_key".into(), | | 42);
 map.compute_if_present( & "key".into(), | _v| None);
 ```
 
-**Why not Entry API?**
-
-- In a sharded context, returning a mutable reference is infeasible (shard lock held across await points would deadlock
-  async).
-- Conditional operations provide the same expressiveness with better performance and simpler semantics.
-
-### Batch Operations
+### Batch Operations (Optimized)
 
 ```rust
-// Batch insert (amortizes shard lock acquisition)
+// Batch insert (amortizes shard lock acquisition - single lock per shard)
 let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
 let inserted = map.batch_insert(entries);
 
@@ -279,30 +272,26 @@ println!("Utilization: {:.1}%", util);
 
 ---
 
-## Version 0.9.0 Features (Eviction, Metrics, Advanced Iteration)
+## Lifecycle Features (v0.9+)
 
-**Planned features**:
+Enable via `features = ["lifecycle"]`.
 
 - **TTL & Eviction**: LRU/LFU/custom eviction policies with background cleanup
 - **Metrics Hooks**: Production observability with hit rates, latency tracking
 - **Advanced Iteration**: Filter + limit + parallel control builders
 - **Drain Operations**: Efficient bulk removal
 
-See [ROADMAP.md](ROADMAP.md) for detailed specification.
-
 ---
 
-## Version 1.0.0 Features (Transactions, CAS, Replication)
+## Advanced Features (v1.0+)
 
-**Planned features**:
+Enable via `features = ["advanced"]`.
 
 - **MVCC Transactions**: Atomic multi-key operations with conflict detection
 - **Compare-And-Swap**: Lock-free coordination primitives
 - **Copy-On-Write Snapshots**: Minimal-contention read optimization
 - **Distributed Replication**: Quorum-based consistency framework
 - **Lock Diagnostics**: Per-shard contention profiling
-
-See [ROADMAP.md](ROADMAP.md) for detailed specification.
 
 ---
 
@@ -314,13 +303,13 @@ See [ROADMAP.md](ROADMAP.md) for detailed specification.
 | Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | Stable          |
 | Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | Stable          |
 | Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Conditional Operations     | -    | ✅    | ✅    | ✅    | New in 0.8      |
-| Batch operations           | -    | ✅    | ✅    | ✅    | New in 0.8      |
-| TTL/Eviction               | -    | -    | ✅    | ✅    | Planned for 0.9 |
-| Metrics                    | -    | -    | ✅    | ✅    | Planned for 0.9 |
-| Transactions               | -    | -    | -    | ✅    | Planned for 1.0 |
-| CAS operations             | -    | -    | -    | ✅    | Planned for 1.0 |
-| Replication                | -    | -    | -    | ✅    | Planned for 1.0 |
+| Conditional Operations     | -    | ✅    | ✅    | ✅    | Stable          |
+| Batch operations           | -    | ✅    | ✅    | ✅    | Stable          |
+| TTL/Eviction               | -    | -    | ✅    | ✅    | Stable (lifecycle) |
+| Metrics                    | -    | -    | ✅    | ✅    | Stable (lifecycle) |
+| Transactions               | -    | -    | -    | ✅    | Stable (advanced) |
+| CAS operations             | -    | -    | -    | ✅    | Stable (advanced) |
+| Replication                | -    | -    | -    | ✅    | Stable (advanced) |
 
 ---
 

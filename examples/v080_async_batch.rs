@@ -19,31 +19,23 @@ async fn async_batch_example() {
 
     let map: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(16);
 
-    #[cfg(feature = "batch")]
-    {
-        // Async batch insert
-        let entries = vec![
-            ("task_1".into(), 100),
-            ("task_2".into(), 200),
-            ("task_3".into(), 300),
-        ];
-        let inserted = map.batch_insert(entries).await;
-        println!("  Inserted {} tasks", inserted);
+    // Async batch insert
+    let entries = vec![
+        ("task_1".into(), 100),
+        ("task_2".into(), 200),
+        ("task_3".into(), 300),
+    ];
+    let inserted = map.batch_insert(entries).await;
+    println!("  Inserted {} tasks", inserted);
 
-        // Async batch get
-        let keys = vec!["task_1".to_string(), "task_2".to_string()];
-        let results = map.batch_get(&keys).await;
-        println!("  Batch get results: {:?}", results);
+    // Async batch get
+    let keys = vec!["task_1".to_string(), "task_2".to_string()];
+    let results = map.batch_get(&keys).await;
+    println!("  Batch get results: {:?}", results);
 
-        // Async batch remove
-        let removed = map.batch_remove(vec!["task_1".into()]).await;
-        println!("  Removed {} tasks", removed);
-    }
-
-    #[cfg(not(feature = "batch"))]
-    {
-        println!("  (Batch operations disabled)");
-    }
+    // Async batch remove
+    let removed = map.batch_remove(vec!["task_1".into()]).await;
+    println!("  Removed {} tasks", removed);
 }
 
 #[cfg(feature = "async")]

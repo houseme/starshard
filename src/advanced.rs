@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 /// Result of a transaction execution.
-#[cfg(feature = "transactions")]
 #[derive(Debug, Clone)]
 pub enum TransactionResult<T> {
     /// Transaction committed successfully with result
@@ -22,7 +21,6 @@ pub enum TransactionResult<T> {
 }
 
 /// A single transaction operation.
-#[cfg(feature = "transactions")]
 #[derive(Debug, Clone)]
 pub enum TxnOp<K, V> {
     /// Read a key
@@ -34,7 +32,6 @@ pub enum TxnOp<K, V> {
 }
 
 /// Transaction context for coordinated multi-key operations.
-#[cfg(feature = "transactions")]
 pub struct Transaction<K, V> {
     /// Operations within transaction
     pub(crate) ops: Vec<TxnOp<K, V>>,
@@ -47,7 +44,6 @@ pub struct Transaction<K, V> {
     pub(crate) version: u64,
 }
 
-#[cfg(feature = "transactions")]
 impl<K: Clone, V: Clone> Transaction<K, V> {
     /// Create new transaction
     pub fn new() -> Self {
@@ -88,7 +84,6 @@ impl<K: Clone, V: Clone> Transaction<K, V> {
     }
 }
 
-#[cfg(feature = "transactions")]
 impl<K: Clone, V: Clone> Default for Transaction<K, V> {
     fn default() -> Self {
         Self::new()
@@ -96,7 +91,6 @@ impl<K: Clone, V: Clone> Default for Transaction<K, V> {
 }
 
 /// Result of a compare-and-swap operation.
-#[cfg(feature = "cas")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasResult<V> {
     /// Swap succeeded
@@ -105,7 +99,6 @@ pub enum CasResult<V> {
     Failure(V),
 }
 
-#[cfg(feature = "cas")]
 impl<V> CasResult<V> {
     /// Check if operation succeeded
     pub fn is_success(&self) -> bool {
@@ -121,7 +114,6 @@ impl<V> CasResult<V> {
 }
 
 /// Copy-on-write snapshot for minimal locking during reads.
-#[cfg(feature = "cow-snapshot")]
 pub struct CowSnapshot<K, V> {
     /// Immutable data snapshot
     pub(crate) data: std::sync::Arc<Vec<(K, V)>>,
@@ -129,7 +121,6 @@ pub struct CowSnapshot<K, V> {
     pub(crate) version: u64,
 }
 
-#[cfg(feature = "cow-snapshot")]
 impl<K: Clone, V: Clone> CowSnapshot<K, V> {
     /// Create new CoW snapshot
     pub fn new(data: Vec<(K, V)>, version: u64) -> Self {
@@ -161,7 +152,6 @@ impl<K: Clone, V: Clone> CowSnapshot<K, V> {
 }
 
 /// Replication error types.
-#[cfg(feature = "replication")]
 #[derive(Debug, Clone)]
 pub enum ReplicaError {
     /// Connection failed
@@ -175,7 +165,6 @@ pub enum ReplicaError {
 }
 
 /// Operations for replication.
-#[cfg(feature = "replication")]
 #[derive(Debug, Clone)]
 pub enum ReplicationOp<K, V> {
     /// Insert or update
@@ -195,7 +184,6 @@ pub enum ReplicationOp<K, V> {
 }
 
 /// Trait for implementing replicas.
-#[cfg(feature = "replication")]
 #[async_trait::async_trait]
 pub trait Replica<K, V>: Send + Sync
 where
@@ -215,7 +203,6 @@ where
 }
 
 /// Lock profile for diagnostics.
-#[cfg(feature = "diagnostics")]
 #[derive(Debug, Clone, Default)]
 pub struct LockProfile {
     /// Shard identifier
@@ -233,7 +220,6 @@ pub struct LockProfile {
 }
 
 /// Snapshot with version for time-travel queries.
-#[cfg(feature = "diagnostics")]
 #[derive(Debug, Clone)]
 pub struct IsolatedSnapshot<K, V> {
     /// Version number
@@ -244,7 +230,6 @@ pub struct IsolatedSnapshot<K, V> {
     pub(crate) data: Arc<Vec<(K, V)>>,
 }
 
-#[cfg(feature = "diagnostics")]
 impl<K, V> IsolatedSnapshot<K, V> {
     /// Create new isolated snapshot
     pub fn new(version: u64, data: Vec<(K, V)>) -> Self {
@@ -277,7 +262,6 @@ impl<K, V> IsolatedSnapshot<K, V> {
 }
 
 /// Quorum-based consistency configuration.
-#[cfg(feature = "replication")]
 #[derive(Debug, Clone)]
 pub struct QuorumConfig {
     /// Total number of replicas (including primary)
@@ -290,7 +274,6 @@ pub struct QuorumConfig {
     pub timeout: std::time::Duration,
 }
 
-#[cfg(feature = "replication")]
 impl QuorumConfig {
     /// Create strict quorum config (all replicas)
     pub fn strict(replica_count: usize) -> Self {
@@ -324,7 +307,6 @@ impl QuorumConfig {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "transactions")]
     #[test]
     fn transaction_creation() {
         let txn: crate::Transaction<String, i32> = crate::Transaction::new();
@@ -332,7 +314,6 @@ mod tests {
         assert_eq!(txn.len(), 0);
     }
 
-    #[cfg(feature = "transactions")]
     #[test]
     fn transaction_operations() {
         let mut txn: crate::Transaction<String, i32> = crate::Transaction::new();
@@ -342,7 +323,6 @@ mod tests {
         assert_eq!(txn.len(), 3);
     }
 
-    #[cfg(feature = "cas")]
     #[test]
     fn cas_result_is_success() {
         let success: crate::CasResult<i32> = crate::CasResult::Success(42);
@@ -352,7 +332,6 @@ mod tests {
         assert!(!failure.is_success());
     }
 
-    #[cfg(feature = "cow-snapshot")]
     #[test]
     fn cow_snapshot_creation() {
         let data = vec![("a", 1), ("b", 2)];
@@ -361,7 +340,6 @@ mod tests {
         assert_eq!(snap.version(), 1);
     }
 
-    #[cfg(feature = "replication")]
     #[test]
     fn quorum_config_majority() {
         let config = crate::QuorumConfig::majority(5);
@@ -369,7 +347,6 @@ mod tests {
         assert_eq!(config.write_quorum, 3);
     }
 
-    #[cfg(feature = "replication")]
     #[test]
     fn quorum_config_strict() {
         let config = crate::QuorumConfig::strict(3);
@@ -378,7 +355,6 @@ mod tests {
         assert_eq!(config.read_quorum, 3);
     }
 
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn isolated_snapshot() {
         let data = vec![("a", 1), ("b", 2)];

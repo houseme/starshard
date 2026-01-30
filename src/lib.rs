@@ -158,13 +158,7 @@ use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
 pub mod eviction;
 
 /// Version 1.0.0 features: Transactions, CAS, replication, and diagnostics.
-#[cfg(any(
-    feature = "transactions",
-    feature = "cas",
-    feature = "cow-snapshot",
-    feature = "replication",
-    feature = "diagnostics"
-))]
+#[cfg(feature = "advanced")]
 pub mod advanced;
 
 // Re-export key v0.9.0 types
@@ -175,20 +169,11 @@ pub use eviction::{
 };
 
 // Re-export key v1.0.0 types
-#[cfg(feature = "transactions")]
-pub use advanced::{Transaction, TransactionResult, TxnOp};
-
-#[cfg(feature = "cas")]
-pub use advanced::CasResult;
-
-#[cfg(feature = "cow-snapshot")]
-pub use advanced::CowSnapshot;
-
-#[cfg(feature = "replication")]
-pub use advanced::{QuorumConfig, Replica, ReplicaError, ReplicationOp};
-
-#[cfg(feature = "diagnostics")]
-pub use advanced::{IsolatedSnapshot, LockProfile};
+#[cfg(feature = "advanced")]
+pub use advanced::{
+    CasResult, CowSnapshot, IsolatedSnapshot, LockProfile, QuorumConfig, Replica, ReplicaError,
+    ReplicationOp, Transaction, TransactionResult, TxnOp,
+};
 
 /* ======================== Serde Imports ======================== */
 #[cfg(feature = "serde")]
@@ -562,9 +547,23 @@ where
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(self.get(key));
+        let mut results = vec![None; keys.len()];
+        let mut grouped: std::collections::HashMap<usize, Vec<(usize, &K)>> =
+            std::collections::HashMap::new();
+
+        for (idx, key) in keys.iter().enumerate() {
+            let shard_idx = self.shard_index(key);
+            grouped.entry(shard_idx).or_default().push((idx, key));
+        }
+
+        for (shard_idx, items) in grouped {
+            let shard = self.get_or_init_shard(shard_idx);
+            let guard = shard.read().unwrap();
+            for (idx, key) in items {
+                if let Some(val) = guard.get(key) {
+                    results[idx] = Some(val.clone());
+                }
+            }
         }
         results
     }
@@ -636,22 +635,123 @@ where
     ///
     pub fn retain<F>(&self, predicate: F)
     where
-        F: Fn(&K, &V) -> bool,
+        F: Fn(&K, &V) -> bool + Sync + Send,
     {
         let shards_snapshot: Vec<StdShard<K, V, S>> = {
             let g = self.shards.read().unwrap();
             g.iter().filter_map(|o| o.as_ref().cloned()).collect()
         };
 
-        for shard in shards_snapshot {
-            let mut guard = shard.write().unwrap();
-            let removed_count = guard.len();
-            guard.retain(|k, v| predicate(k, v));
-            let removed = removed_count - guard.len();
-            if removed > 0 {
-                self.total_len.fetch_sub(removed, Ordering::Relaxed);
+        #[cfg(feature = "rayon")]
+        {
+            let removed_count: usize = shards_snapshot
+                .par_iter()
+                .map(|shard| {
+                    let mut guard = shard.write().unwrap();
+                    let initial_len = guard.len();
+                    guard.retain(|k, v| predicate(k, v));
+                    initial_len - guard.len()
+                })
+                .sum();
+
+            if removed_count > 0 {
+                self.total_len.fetch_sub(removed_count, Ordering::Relaxed);
             }
         }
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            for shard in shards_snapshot {
+                let mut guard = shard.write().unwrap();
+                let removed_count = guard.len();
+                guard.retain(|k, v| predicate(k, v));
+                let removed = removed_count - guard.len();
+                if removed > 0 {
+                    self.total_len.fetch_sub(removed, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Execute a transaction (basic implementation).
+    ///
+    /// This method executes a transaction by acquiring locks on all involved shards
+    /// in a deterministic order to avoid deadlocks.
+    ///
+    /// # Arguments
+    /// - `txn`: The transaction to execute.
+    ///
+    /// # Returns
+    /// - `TransactionResult<()>`: The result of the transaction.
+    #[cfg(feature = "advanced")]
+    pub fn execute_transaction(&self, txn: Transaction<K, V>) -> TransactionResult<()> {
+        // 1. Identify involved shards
+        let mut shard_indices: Vec<usize> = txn
+            .ops
+            .iter()
+            .map(|op| match op {
+                TxnOp::Read(k) => self.shard_index(k),
+                TxnOp::Write(k, _) => self.shard_index(k),
+                TxnOp::Remove(k) => self.shard_index(k),
+            })
+            .collect();
+
+        // 2. Sort and deduplicate to prevent deadlocks
+        shard_indices.sort_unstable();
+        shard_indices.dedup();
+
+        // 3. Acquire locks (pessimistic locking: acquire all write locks)
+        // Note: In a real MVCC system, we might acquire read locks for reads,
+        // but for simplicity and correctness here, we use write locks for everything
+        // to ensure isolation during the transaction execution.
+        let shards: Vec<_> = shard_indices
+            .iter()
+            .map(|&idx| self.get_or_init_shard(idx))
+            .collect();
+        let mut guards = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            // We must use write locks because we might modify the shards.
+            // Even for read-only ops in a mixed transaction, we need consistent view.
+            let guard = shard.write().unwrap();
+            guards.push(guard);
+        }
+
+        // 4. Execute operations
+        // We need to map shard index back to the correct guard.
+        // Since guards are stored in the same order as sorted shard_indices,
+        // we can use binary search to find the index.
+
+        for op in txn.ops {
+            match op {
+                TxnOp::Read(k) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &guards[guard_idx];
+                    // Just checking existence/value for now.
+                    // In a real txn, we might return values.
+                    // Here we just ensure it runs.
+                    let _ = guard.get(&k);
+                }
+                TxnOp::Write(k, v) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &mut guards[guard_idx];
+                    if guard.insert(k, v).is_none() {
+                        self.total_len.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                TxnOp::Remove(k) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &mut guards[guard_idx];
+                    if guard.remove(&k).is_some() {
+                        self.total_len.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        TransactionResult::Committed(())
     }
 
     /// Iterate over all keys (snapshot-based).
@@ -1110,9 +1210,23 @@ where
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
     pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(self.get(key).await);
+        let mut results = vec![None; keys.len()];
+        let mut grouped: std::collections::HashMap<usize, Vec<(usize, &K)>> =
+            std::collections::HashMap::new();
+
+        for (idx, key) in keys.iter().enumerate() {
+            let shard_idx = self.shard_index(key);
+            grouped.entry(shard_idx).or_default().push((idx, key));
+        }
+
+        for (shard_idx, items) in grouped {
+            let shard = self.get_or_init_shard(shard_idx).await;
+            let guard = shard.read().await;
+            for (idx, key) in items {
+                if let Some(val) = guard.get(key) {
+                    results[idx] = Some(val.clone());
+                }
+            }
         }
         results
     }
@@ -1198,6 +1312,77 @@ where
                 self.total_len.fetch_sub(removed, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Execute a transaction (basic implementation, async).
+    ///
+    /// This method executes a transaction by acquiring locks on all involved shards
+    /// in a deterministic order to avoid deadlocks.
+    ///
+    /// # Arguments
+    /// - `txn`: The transaction to execute.
+    ///
+    /// # Returns
+    /// - `TransactionResult<()>`: The result of the transaction.
+    #[cfg(feature = "advanced")]
+    pub async fn execute_transaction(&self, txn: Transaction<K, V>) -> TransactionResult<()> {
+        // 1. Identify involved shards
+        let mut shard_indices: Vec<usize> = txn
+            .ops
+            .iter()
+            .map(|op| match op {
+                TxnOp::Read(k) => self.shard_index(k),
+                TxnOp::Write(k, _) => self.shard_index(k),
+                TxnOp::Remove(k) => self.shard_index(k),
+            })
+            .collect();
+
+        // 2. Sort and deduplicate to prevent deadlocks
+        shard_indices.sort_unstable();
+        shard_indices.dedup();
+
+        // 3. Acquire locks (pessimistic locking: acquire all write locks)
+        let mut shards = Vec::with_capacity(shard_indices.len());
+        for &idx in &shard_indices {
+            shards.push(self.get_or_init_shard(idx).await);
+        }
+
+        let mut guards = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            // We must use write locks because we might modify the shards.
+            let guard = shard.write().await;
+            guards.push(guard);
+        }
+
+        // 4. Execute operations
+        for op in txn.ops {
+            match op {
+                TxnOp::Read(k) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &guards[guard_idx];
+                    let _ = guard.get(&k);
+                }
+                TxnOp::Write(k, v) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &mut guards[guard_idx];
+                    if guard.insert(k, v).is_none() {
+                        self.total_len.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                TxnOp::Remove(k) => {
+                    let idx = self.shard_index(&k);
+                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard = &mut guards[guard_idx];
+                    if guard.remove(&k).is_some() {
+                        self.total_len.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        TransactionResult::Committed(())
     }
 
     /// Iterate over all keys (snapshot-based, async).

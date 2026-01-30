@@ -10,13 +10,13 @@
 
 <b>Starshard</b>：高性能、延迟初始化分片的并发 HashMap
 
-<code>同步 + 异步 + 可选 Rayon 并行 + 可选 Serde 序列化</code>
+<code>同步 + 异步 + 可选 Rayon 并行 + 可选 Serde 序列化 + 生命周期管理 + 高级特性</code>
 
 ---
 
 ## 状态
 
-早期阶段（核心语义趋稳，接口命名仍可能微调）。欢迎试用与反馈。
+生产就绪 (v1.0+)。API 稳定性优先。
 
 ## 为什么需要它
 
@@ -33,18 +33,20 @@ Starshard 目标：
 3. 原子长度缓存（`len()` O(1)）。
 4. 可并行快照迭代（`rayon`）。
 5. 同步 / 异步接口语义一致。
-6. 架构可拓展（重分片、淘汰、指标钩子等）。
+6. 架构可拓展（生命周期管理、高级并发）。
 
 ---
 
 ## 特性 (features)
 
-| Feature | 说明                                       | 备注          |
-|---------|------------------------------------------|-------------|
-| `async` | 提供 `AsyncShardedHashMap`（Tokio `RwLock`） | 独立启用        |
-| `rayon` | 大体量迭代时分片快照并行扁平化                          | 内部加速        |
-| `serde` | 同步版序列化/反序列化；异步版提供快照封装                    | 不持久化 hasher |
-| （空）     | 仅同步核心                                    | 依赖面最小       |
+| Feature     | 说明                                       | 备注          |
+|-------------|------------------------------------------|-------------|
+| `async`     | 提供 `AsyncShardedHashMap`（Tokio `RwLock`） | 独立启用        |
+| `rayon`     | 大体量迭代时分片快照并行扁平化                          | 内部加速        |
+| `serde`     | 同步版序列化/反序列化；异步版提供快照封装                    | 不持久化 hasher |
+| `lifecycle` | TTL、淘汰、指标、高级迭代                           | 整合 v0.9 特性  |
+| `advanced`  | 事务、CAS、复制、诊断                             | 整合 v1.0 特性  |
+| （空）         | 仅同步核心 + 批量操作                             | 依赖面最小       |
 
 `docs.rs` 展示全部：
 
@@ -59,9 +61,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.7", features = ["async", "rayon", "serde"] }
+starshard = { version = "1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小：
-# starshard = "0.7"
+# starshard = "1.0"
 ```
 
 开发/测试:
@@ -169,6 +171,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | 读多写少 vs 全局单锁     | 写冲突显著下降               |
 | 大量快照迭代 + `rayon` | 3~4 倍扁平化速度 (100k+ 元素) |
 | 稀疏访问             | 仅访问分片分配内存             |
+| 批量插入/移除          | 每个分片组仅一次锁获取           |
 
 请基准测试你的真实负载（键分布、核心数、缓存行为）。
 
@@ -186,7 +189,6 @@ let json = serde_json::to_string( & snap).unwrap();
 ## 局限
 
 - 无在线分片再平衡。
-- 无 TTL / 淘汰。
 - 迭代需分配临时 `Vec`。
 - Hasher 状态不序列化。
 - 大量写倾斜仍可能产生热点锁。
@@ -196,10 +198,116 @@ let json = serde_json::to_string( & snap).unwrap();
 ## Roadmap（潜在）
 
 - 自适应/重分片机制
-- 分片级 LRU / 分段淘汰
-- 指标观察钩子
-- 批量多键插入 API
 - 更低拷贝成本的 COW 快照
+
+---
+
+## 核心特性 (v0.8+)
+
+### 条件操作 (基于方法，高效)
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+
+// 仅当键存在时更新；单分片锁
+map.compute_if_present( & "counter".into(), | v| Some(v + 1));
+
+// 仅当键不存在时插入；单分片锁
+let val = map.compute_if_absent("new_key".into(), | | 42);
+
+// 条件删除
+map.compute_if_present( & "key".into(), | _v| None);
+```
+
+### 批量操作 (已优化)
+
+```rust
+// 批量插入 (分摊分片锁获取成本 - 每个分片组仅一次锁)
+let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
+let inserted = map.batch_insert(entries);
+
+// 批量移除
+let removed = map.batch_remove(vec!["a".into(), "b".into()]);
+
+// 批量获取
+let keys = vec!["a", "b", "c"];
+let results = map.batch_get( & keys);
+```
+
+### 集合视图与过滤
+
+```rust
+// 迭代所有键
+let all_keys: Vec<_ > = map.keys().collect();
+
+// 迭代所有值
+let all_values: Vec<_ > = map.values().collect();
+
+// 标准迭代
+for (k, v) in map.iter() {
+println ! ("{}: {}", k, v);
+}
+
+// 保留过滤
+map.retain( | k, v| v > & 10);  // 仅保留 v > 10 的条目
+```
+
+### 分片内省
+
+```rust
+// 获取分片分布统计
+let stats = map.shard_stats();
+println!("Total slots: {}", stats.total);
+println!("Initialized shards: {}", stats.initialized);
+println!("Avg load: {:.2}", stats.avg_load);
+
+// 获取利用率百分比
+let util = map.shard_utilization();
+println!("Utilization: {:.1}%", util);
+```
+
+---
+
+## 生命周期特性 (v0.9+)
+
+通过 `features = ["lifecycle"]` 启用。
+
+- **TTL & 淘汰**: LRU/LFU/自定义淘汰策略，带后台清理
+- **指标钩子**: 生产级可观测性，命中率、延迟跟踪
+- **高级迭代**: 过滤器 + 限制 + 并行控制构建器
+- **Drain 操作**: 高效批量移除
+
+---
+
+## 高级特性 (v1.0+)
+
+通过 `features = ["advanced"]` 启用。
+
+- **MVCC 事务**: 带冲突检测的原子多键操作
+- **比较并交换 (CAS)**: 无锁协调原语
+- **写时复制快照**: 最小化争用的读取优化
+- **分布式复制**: 基于 Quorum 的一致性框架
+- **锁诊断**: 分片级争用分析
+
+---
+
+## 特性矩阵
+
+| 特性                     | v0.7 | v0.8 | v0.9 | v1.0 | 状态              |
+|------------------------|------|------|------|------|-----------------|
+| 分片 HashMap (同步)      | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 异步 (Tokio)             | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 并行迭代 (rayon)           | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| Serde (反)序列化           | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 条件操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
+| 批量操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
+| TTL/淘汰                 | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
+| 指标                     | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
+| 事务                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
+| CAS 操作                 | -    | -    | -    | ✅    | 稳定 (advanced)  |
+| 复制                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
 
 ---
 

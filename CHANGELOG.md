@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-02-02
+
+### Changed
+
+- **Feature Consolidation**:
+    - Merged `ttl`, `metrics`, and `advanced-iter` features into a single `lifecycle` feature.
+    - Merged `transactions`, `cas`, `cow-snapshot`, `replication`, and `diagnostics` features into a single `advanced` feature.
+    - Promoted `batch` operations to core functionality (removed `batch` feature flag).
+    - Updated `full` feature to include `async`, `rayon`, `serde`, `lifecycle`, and `advanced`.
+
+### Optimized
+
+- **Batch Operations**:
+    - Optimized `batch_insert` and `batch_remove` to acquire the shard lock only once per shard group, significantly reducing lock contention.
+
 ## [1.0.0] - 2026-02-01
 
 ### Added

@@ -67,39 +67,31 @@ fn entry_api_example() {
 fn batch_operations_example() {
     let map: ShardedHashMap<String, u32> = ShardedHashMap::new(8);
 
-    #[cfg(feature = "batch")]
-    {
-        // Batch insert
-        let entries = vec![
-            ("alice".into(), 100),
-            ("bob".into(), 200),
-            ("charlie".into(), 300),
-            ("diana".into(), 400),
-        ];
-        let count = map.batch_insert(entries);
-        println!("  Inserted {} entries", count);
-        println!("  Map size: {}", map.len());
+    // Batch insert
+    let entries = vec![
+        ("alice".into(), 100),
+        ("bob".into(), 200),
+        ("charlie".into(), 300),
+        ("diana".into(), 400),
+    ];
+    let count = map.batch_insert(entries);
+    println!("  Inserted {} entries", count);
+    println!("  Map size: {}", map.len());
 
-        // Batch get
-        let keys = vec![
-            "alice".to_string(),
-            "bob".to_string(),
-            "unknown".to_string(),
-        ];
-        let results = map.batch_get(&keys);
-        println!("  Batch get {:?}: {:?}", keys, results);
+    // Batch get
+    let keys = vec![
+        "alice".to_string(),
+        "bob".to_string(),
+        "unknown".to_string(),
+    ];
+    let results = map.batch_get(&keys);
+    println!("  Batch get {:?}: {:?}", keys, results);
 
-        // Batch remove
-        let to_remove = vec!["alice".into(), "bob".into()];
-        let removed = map.batch_remove(to_remove);
-        println!("  Removed {} entries", removed);
-        println!("  Map size: {}", map.len());
-    }
-
-    #[cfg(not(feature = "batch"))]
-    {
-        println!("  (Batch operations disabled - enable with 'batch' feature)");
-    }
+    // Batch remove
+    let to_remove = vec!["alice".into(), "bob".into()];
+    let removed = map.batch_remove(to_remove);
+    println!("  Removed {} entries", removed);
+    println!("  Map size: {}", map.len());
 }
 
 fn collection_views_example() {
