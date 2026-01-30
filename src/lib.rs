@@ -290,6 +290,20 @@ where
         guard.get(key).cloned()
     }
 
+    /// Check if a key exists (returns bool without cloning the value).
+    ///
+    /// # Arguments
+    /// - `key`: key to check.
+    ///
+    /// # Returns
+    /// - `bool`: true if the key exists in the map, false otherwise.
+    ///
+    pub fn contains(&self, key: &K) -> bool {
+        let shard = self.get_or_init_shard(self.shard_index(key));
+        let guard: StdReadGuard<'_, HashMap<K, V, S>> = shard.read().unwrap();
+        guard.contains_key(key)
+    }
+
     /// Remove key, returning previous value.
     ///
     /// # Arguments
@@ -588,6 +602,23 @@ where
         g.get(key).cloned()
     }
 
+    /// Check if a key exists; uses `try_read` first (fast path, reduces scheduler churn).
+    ///
+    /// # Arguments
+    /// - `key`: key to check.
+    ///
+    /// # Returns
+    /// - `bool`: true if the key exists in the map, false otherwise.
+    ///
+    pub async fn contains(&self, key: &K) -> bool {
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        if let Ok(g) = shard.try_read() {
+            return g.contains_key(key);
+        }
+        let g = shard.read().await;
+        g.contains_key(key)
+    }
+
     /// Remove key.
     ///
     /// # Arguments
@@ -737,6 +768,19 @@ mod tests {
     }
 
     #[test]
+    fn sync_contains() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+        assert!(!m.contains(&"a".into()));
+        m.insert("a".into(), 1);
+        assert!(m.contains(&"a".into()));
+        m.insert("b".into(), 2);
+        assert!(m.contains(&"b".into()));
+        m.remove(&"a".into());
+        assert!(!m.contains(&"a".into()));
+        assert!(m.contains(&"b".into()));
+    }
+
+    #[test]
     fn sync_iteration() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
         m.insert("x".into(), 10);
@@ -755,6 +799,20 @@ mod tests {
         assert_eq!(m.len().await, 1);
         assert_eq!(m.remove(&"a".into()).await, Some(1));
         assert!(m.is_empty().await);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_contains() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
+        assert!(!m.contains(&"a".into()).await);
+        m.insert("a".into(), 1).await;
+        assert!(m.contains(&"a".into()).await);
+        m.insert("b".into(), 2).await;
+        assert!(m.contains(&"b".into()).await);
+        m.remove(&"a".into()).await;
+        assert!(!m.contains(&"a".into()).await);
+        assert!(m.contains(&"b".into()).await);
     }
 
     #[cfg(feature = "serde")]
