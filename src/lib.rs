@@ -151,7 +151,49 @@ use std::sync::{
 #[cfg(feature = "async")]
 use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
 
-/* ---------------------------- Serde Imports ----------------------------- */
+/* ======================== Module Declarations ======================== */
+
+/// Version 0.9.0 features: TTL, eviction, metrics, and advanced iteration.
+#[cfg(any(feature = "ttl", feature = "metrics", feature = "advanced-iter"))]
+pub mod eviction;
+
+/// Version 1.0.0 features: Transactions, CAS, replication, and diagnostics.
+#[cfg(any(
+    feature = "transactions",
+    feature = "cas",
+    feature = "cow-snapshot",
+    feature = "replication",
+    feature = "diagnostics"
+))]
+pub mod advanced;
+
+// Re-export key v0.9.0 types
+#[cfg(feature = "ttl")]
+pub use eviction::{EvictionConfig, EvictionPolicy};
+
+#[cfg(feature = "metrics")]
+pub use eviction::{AtomicMetrics, MemoryStats, MetricsStats};
+
+#[cfg(feature = "advanced-iter")]
+pub use eviction::{DrainIterator, IterBuilder};
+
+// Re-export key v1.0.0 types
+#[cfg(feature = "transactions")]
+pub use advanced::{Transaction, TransactionResult, TxnOp};
+
+#[cfg(feature = "cas")]
+pub use advanced::CasResult;
+
+#[cfg(feature = "cow-snapshot")]
+pub use advanced::CowSnapshot;
+
+#[cfg(feature = "replication")]
+pub use advanced::{QuorumConfig, Replica, ReplicaError, ReplicationOp};
+
+#[cfg(feature = "diagnostics")]
+pub use advanced::{IsolatedSnapshot, LockProfile};
+
+/* ======================== Serde Imports ======================== */
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
@@ -175,6 +217,43 @@ type AsyncShardVecArc<K, V, S> = Arc<TokioRwLock<AsyncShardVec<K, V, S>>>;
 
 /// Default shard count (power-of-two not required; hashing modulo used).
 pub const DEFAULT_SHARDS: usize = 64;
+
+/// Statistics about shard distribution and utilization.
+///
+/// Fields:
+/// - `initialized`: number of shards that have been allocated
+/// - `total`: total configured shard slots
+/// - `empty`: number of initialized shards with zero entries
+/// - `avg_load`: average load across initialized shards
+/// - `max_load`: maximum load in any shard
+#[derive(Clone, Debug)]
+pub struct ShardStats {
+    /// Number of shards that have been allocated.
+    pub initialized: usize,
+    /// Total configured shard slots.
+    pub total: usize,
+    /// Number of initialized shards with zero entries.
+    pub empty: usize,
+    /// Average load across initialized shards.
+    pub avg_load: f64,
+    /// Maximum load in any shard.
+    pub max_load: usize,
+}
+
+impl ShardStats {
+    /// Returns shard utilization as a percentage (0-100).
+    ///
+    /// # Returns
+    /// - `f64`: percentage of shards that have been initialized
+    ///
+    pub fn utilization_percent(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.initialized as f64 / self.total as f64) * 100.0
+        }
+    }
+}
 
 /* ============================== Sync Map =============================== */
 
@@ -401,6 +480,242 @@ where
             }
             return items.into_iter();
         }
+    }
+
+    /* ==================== v0.8.0 Sync Methods ==================== */
+
+    /// Batch insert multiple key-value pairs.
+    ///
+    /// # Arguments
+    /// - `entries`: iterator of (K, V) pairs
+    ///
+    /// # Returns
+    /// - `usize`: number of new entries inserted
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_insert<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
+            std::collections::HashMap::new();
+
+        for (k, v) in entries {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push((k, v));
+        }
+
+        let mut count = 0;
+        for (_shard_idx, pairs) in grouped {
+            for (k, v) in pairs {
+                let shard = self.get_or_init_shard(self.shard_index(&k));
+                let mut guard = shard.write().unwrap();
+                if guard.insert(k, v).is_none() {
+                    count += 1;
+                    self.total_len.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch remove multiple keys.
+    ///
+    /// # Arguments
+    /// - `keys`: iterator of keys to remove
+    ///
+    /// # Returns
+    /// - `usize`: number of entries actually removed
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_remove<I>(&self, keys: I) -> usize
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<K>> =
+            std::collections::HashMap::new();
+
+        for k in keys {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push(k);
+        }
+
+        let mut count = 0;
+        for (_shard_idx, keys) in grouped {
+            for k in keys {
+                let shard = self.get_or_init_shard(self.shard_index(&k));
+                let mut guard = shard.write().unwrap();
+                if guard.remove(&k).is_some() {
+                    count += 1;
+                    self.total_len.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch get multiple keys.
+    ///
+    /// # Arguments
+    /// - `keys`: slice of keys to fetch
+    ///
+    /// # Returns
+    /// - `Vec<Option<V>>`: results in same order as keys
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get(key));
+        }
+        results
+    }
+
+    /// Update entry if it exists, or remove it if the function returns None.
+    ///
+    /// # Arguments
+    /// - `key`: key to check.
+    /// - `f`: function that takes the current value and returns `Some(new_value)` to update or `None` to remove.
+    ///
+    /// # Returns
+    /// - `Option<V>`: the new value if the key existed and was updated, `None` otherwise.
+    ///
+    pub fn compute_if_present<F>(&self, key: &K, f: F) -> Option<V>
+    where
+        F: FnOnce(&V) -> Option<V>,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key));
+        let mut guard = shard.write().unwrap();
+
+        if let Some(old_val) = guard.get(key) {
+            if let Some(new_val) = f(old_val) {
+                let result = new_val.clone();
+                guard.insert(key.clone(), new_val);
+                Some(result)
+            } else {
+                // Remove the entry
+                guard.remove(key);
+                self.total_len.fetch_sub(1, Ordering::Relaxed);
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Insert value if key is absent, or return existing value.
+    ///
+    /// # Arguments
+    /// - `key`: key to check/insert.
+    /// - `f`: function that returns the value to insert if the key is absent.
+    ///
+    /// # Returns
+    /// - `V`: existing or newly inserted value.
+    ///
+    pub fn compute_if_absent<F>(&self, key: K, f: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(&key));
+        let mut guard = shard.write().unwrap();
+
+        if let Some(val) = guard.get(&key) {
+            val.clone()
+        } else {
+            let new_v = f();
+            guard.insert(key, new_v.clone());
+            self.total_len.fetch_add(1, Ordering::Relaxed);
+            new_v
+        }
+    }
+
+    /// Remove entries where predicate returns false.
+    ///
+    /// Locks each shard independently to maximize parallelism.
+    ///
+    /// # Arguments
+    /// - `predicate`: function that returns true to keep, false to remove
+    ///
+    pub fn retain<F>(&self, predicate: F)
+    where
+        F: Fn(&K, &V) -> bool,
+    {
+        let shards_snapshot: Vec<StdShard<K, V, S>> = {
+            let g = self.shards.read().unwrap();
+            g.iter().filter_map(|o| o.as_ref().cloned()).collect()
+        };
+
+        for shard in shards_snapshot {
+            let mut guard = shard.write().unwrap();
+            let removed_count = guard.len();
+            guard.retain(|k, v| predicate(k, v));
+            let removed = removed_count - guard.len();
+            if removed > 0 {
+                self.total_len.fetch_sub(removed, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Iterate over all keys (snapshot-based).
+    ///
+    /// # Returns
+    /// - `Vec<K>`: vector of cloned keys
+    ///
+    pub fn keys(&self) -> impl Iterator<Item = K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Iterate over all values (snapshot-based).
+    ///
+    /// # Returns
+    /// - `Vec<V>`: vector of cloned values
+    ///
+    pub fn values(&self) -> impl Iterator<Item = V> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    /// Returns statistics about shard distribution and utilization.
+    ///
+    /// # Returns
+    /// - `ShardStats`: structure containing shard metrics
+    ///
+    pub fn shard_stats(&self) -> ShardStats {
+        let slots = self.shards.read().unwrap();
+        let mut initialized = 0;
+        let mut loads = Vec::new();
+
+        for shard in slots.iter().flatten() {
+            initialized += 1;
+            let guard = shard.read().unwrap();
+            loads.push(guard.len());
+        }
+
+        let total = slots.len();
+        let empty = initialized - loads.iter().filter(|&&l| l == 0).count();
+        let max_load = loads.iter().max().copied().unwrap_or(0);
+        let avg_load = if initialized > 0 {
+            loads.iter().sum::<usize>() as f64 / initialized as f64
+        } else {
+            0.0
+        };
+
+        ShardStats {
+            initialized,
+            total,
+            empty,
+            avg_load,
+            max_load,
+        }
+    }
+
+    /// Returns shard utilization as a percentage (0-100).
+    ///
+    /// # Returns
+    /// - `f64`: percentage of shards that have been initialized
+    ///
+    pub fn shard_utilization(&self) -> f64 {
+        let stats = self.shard_stats();
+        stats.utilization_percent()
     }
 }
 
@@ -674,7 +989,7 @@ where
     /// Snapshot iteration (async).
     ///
     /// Steps:
-    /// 1. Snapshot Arc list of initialized shards under read lock of the shard vector.
+    /// 1. Snapshot Arc of initialized shards under read lock of the shard vector.
     /// 2. For each shard: try `try_read`; fallback to `await` read.
     /// 3. Clone inner HashMaps (short critical sections).
     /// 4. If `rayon` enabled, parallel flatten of snapshots.
@@ -712,6 +1027,240 @@ where
             }
             items
         }
+    }
+
+    /* ==================== v0.8.0 Async Methods ==================== */
+
+    /// Batch insert multiple key-value pairs asynchronously.
+    ///
+    /// # Arguments
+    /// - `entries`: iterator of (K, V) pairs
+    ///
+    /// # Returns
+    /// - `usize`: number of new entries inserted
+    ///
+    #[cfg(feature = "batch")]
+    pub async fn batch_insert<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
+            std::collections::HashMap::new();
+
+        for (k, v) in entries {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push((k, v));
+        }
+
+        let mut count = 0;
+        for (_shard_idx, pairs) in grouped {
+            for (k, v) in pairs {
+                let shard = self.get_or_init_shard(self.shard_index(&k)).await;
+                let mut guard = shard.write().await;
+                if guard.insert(k, v).is_none() {
+                    count += 1;
+                    self.total_len.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch remove multiple keys asynchronously.
+    ///
+    /// # Arguments
+    /// - `keys`: iterator of keys to remove
+    ///
+    /// # Returns
+    /// - `usize`: number of entries actually removed
+    ///
+    #[cfg(feature = "batch")]
+    pub async fn batch_remove<I>(&self, keys: I) -> usize
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<K>> =
+            std::collections::HashMap::new();
+
+        for k in keys {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push(k);
+        }
+
+        let mut count = 0;
+        for (_shard_idx, keys) in grouped {
+            for k in keys {
+                let shard = self.get_or_init_shard(self.shard_index(&k)).await;
+                let mut guard = shard.write().await;
+                if guard.remove(&k).is_some() {
+                    count += 1;
+                    self.total_len.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch get multiple keys asynchronously.
+    ///
+    /// # Arguments
+    /// - `keys`: slice of keys to fetch
+    ///
+    /// # Returns
+    /// - `Vec<Option<V>>`: results in same order as keys
+    ///
+    #[cfg(feature = "batch")]
+    pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get(key).await);
+        }
+        results
+    }
+
+    /// Update value only if key is present; remove if closure returns None (async).
+    ///
+    /// # Arguments
+    /// - `key`: key to check
+    /// - `f`: function that receives current value and returns new value (or None to remove)
+    ///
+    /// # Returns
+    /// - `Option<V>`: the new value if present, None if removed or key absent
+    ///
+    pub async fn compute_if_present<F>(&self, key: &K, f: F) -> Option<V>
+    where
+        F: FnOnce(V) -> Option<V>,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        let mut guard = shard.write().await;
+
+        match guard.remove(key) {
+            Some(old_v) => {
+                let new_opt = f(old_v);
+                if let Some(new_v) = new_opt.clone() {
+                    guard.insert(key.clone(), new_v);
+                } else {
+                    self.total_len.fetch_sub(1, Ordering::Relaxed);
+                }
+                new_opt
+            }
+            None => None,
+        }
+    }
+
+    /// Insert value only if key is absent; returns final value (async).
+    ///
+    /// # Arguments
+    /// - `key`: key to check/insert
+    /// - `f`: function to generate value if key absent
+    ///
+    /// # Returns
+    /// - `V`: either the existing value or newly inserted value
+    ///
+    pub async fn compute_if_absent<F>(&self, key: K, f: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(&key)).await;
+        let mut guard = shard.write().await;
+
+        if let Some(v) = guard.get(&key) {
+            v.clone()
+        } else {
+            let new_v = f();
+            guard.insert(key, new_v.clone());
+            self.total_len.fetch_add(1, Ordering::Relaxed);
+            new_v
+        }
+    }
+
+    /// Remove entries where predicate returns false (async).
+    ///
+    /// Locks each shard independently to maximize parallelism.
+    ///
+    /// # Arguments
+    /// - `predicate`: function that returns true to keep, false to remove
+    ///
+    pub async fn retain<F>(&self, predicate: F)
+    where
+        F: Fn(&K, &V) -> bool,
+    {
+        let shards_snapshot: Vec<AsyncShard<K, V, S>> = {
+            let g = self.shards.read().await;
+            g.iter().filter_map(|o| o.as_ref().cloned()).collect()
+        };
+
+        for shard in shards_snapshot {
+            let mut guard = shard.write().await;
+            let removed_count = guard.len();
+            guard.retain(|k, v| predicate(k, v));
+            let removed = removed_count - guard.len();
+            if removed > 0 {
+                self.total_len.fetch_sub(removed, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Iterate over all keys (snapshot-based, async).
+    ///
+    /// # Returns
+    /// - `Vec<K>`: vector of cloned keys
+    ///
+    pub async fn keys(&self) -> Vec<K> {
+        self.iter().await.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Iterate over all values (snapshot-based, async).
+    ///
+    /// # Returns
+    /// - `Vec<V>`: vector of cloned values
+    ///
+    pub async fn values(&self) -> Vec<V> {
+        self.iter().await.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Returns statistics about shard distribution and utilization (async).
+    ///
+    /// # Returns
+    /// - `ShardStats`: structure containing shard metrics
+    ///
+    pub async fn shard_stats(&self) -> ShardStats {
+        let slots = self.shards.read().await;
+        let mut initialized = 0;
+        let mut loads = Vec::new();
+
+        for shard in slots.iter().flatten() {
+            initialized += 1;
+            let guard = shard.read().await;
+            loads.push(guard.len());
+        }
+
+        let total = slots.len();
+        let empty = initialized - loads.iter().filter(|&&l| l == 0).count();
+        let max_load = loads.iter().max().copied().unwrap_or(0);
+        let avg_load = if initialized > 0 {
+            loads.iter().sum::<usize>() as f64 / initialized as f64
+        } else {
+            0.0
+        };
+
+        ShardStats {
+            initialized,
+            total,
+            empty,
+            avg_load,
+            max_load,
+        }
+    }
+
+    /// Returns shard utilization as a percentage (0-100, async).
+    ///
+    /// # Returns
+    /// - `f64`: percentage of shards that have been initialized
+    ///
+    pub async fn shard_utilization(&self) -> f64 {
+        let stats = self.shard_stats().await;
+        stats.utilization_percent()
     }
 }
 
@@ -837,5 +1386,277 @@ mod tests {
         let snap = m.async_snapshot_serializable().await;
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("[[1,10]]"));
+    }
+
+    /* ==================== v0.8.0 Feature Tests ==================== */
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn batch_insert_new_entries() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
+        let inserted = m.batch_insert(entries);
+        assert_eq!(inserted, 3);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.get(&"b".into()), Some(2));
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn batch_insert_with_replacements() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+
+        let entries = vec![
+            ("a".into(), 10), // replacement
+            ("c".into(), 3),  // new
+        ];
+        let inserted = m.batch_insert(entries);
+        assert_eq!(inserted, 1); // only new entries count
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.get(&"a".into()), Some(10));
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn batch_remove() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+        m.insert("c".into(), 3);
+
+        let keys = vec!["a".into(), "b".into(), "d".into()];
+        let removed = m.batch_remove(keys);
+        assert_eq!(removed, 2);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&"c".into()), Some(3));
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn batch_get() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 1);
+        m.insert("c".into(), 3);
+
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let results = m.batch_get(&keys);
+        assert_eq!(results, vec![Some(1), None, Some(3)]);
+    }
+
+    #[test]
+    fn compute_if_present_exists() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 10);
+
+        let result = m.compute_if_present(&"a".into(), |v| Some(v * 2));
+        assert_eq!(result, Some(20));
+        assert_eq!(m.get(&"a".into()), Some(20));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn compute_if_present_absent() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        let result = m.compute_if_present(&"a".into(), |v| Some(v * 2));
+        assert_eq!(result, None);
+        assert_eq!(m.len(), 0);
+    }
+
+    #[test]
+    fn compute_if_present_remove() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 10);
+        m.insert("b".into(), 20);
+
+        let result = m.compute_if_present(&"a".into(), |_v| None);
+        assert_eq!(result, None);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&"b".into()), Some(20));
+    }
+
+    #[test]
+    fn compute_if_absent_exists() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 10);
+
+        let result = m.compute_if_absent("a".into(), || 20);
+        assert_eq!(result, 10);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn compute_if_absent_inserts() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        let result = m.compute_if_absent("a".into(), || 20);
+        assert_eq!(result, 20);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&"a".into()), Some(20));
+    }
+
+    #[test]
+    fn retain_filter() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..10 {
+            m.insert(format!("k{i}"), i);
+        }
+        assert_eq!(m.len(), 10);
+
+        m.retain(|_, v| v % 2 == 0); // keep only even values
+        assert_eq!(m.len(), 5);
+        assert_eq!(m.get(&"k2".into()), Some(2));
+        assert_eq!(m.get(&"k3".into()), None);
+    }
+
+    #[test]
+    fn keys_iteration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+        m.insert("c".into(), 3);
+
+        let mut keys: Vec<_> = m.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn values_iteration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 10);
+        m.insert("b".into(), 20);
+        m.insert("c".into(), 30);
+
+        let mut values: Vec<_> = m.values().collect();
+        values.sort();
+        assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn shard_stats_basic() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..10 {
+            m.insert(format!("k{i}"), i);
+        }
+
+        let stats = m.shard_stats();
+        assert_eq!(stats.total, 4);
+        assert!(stats.initialized > 0);
+        assert!(stats.max_load > 0);
+        assert!(stats.avg_load > 0.0);
+    }
+
+    #[test]
+    fn shard_utilization() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
+        m.insert("a".into(), 1);
+
+        let util = m.shard_utilization();
+        assert!(util > 0.0 && util <= 100.0);
+    }
+
+    #[cfg(feature = "batch")]
+    #[tokio::test]
+    async fn async_batch_insert() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        let entries = vec![("a".into(), 1), ("b".into(), 2)];
+        let inserted = m.batch_insert(entries).await;
+        assert_eq!(inserted, 2);
+        assert_eq!(m.len().await, 2);
+    }
+
+    #[cfg(feature = "batch")]
+    #[tokio::test]
+    async fn async_batch_remove() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+        m.insert("c".into(), 3).await;
+
+        let removed = m.batch_remove(vec!["a".into(), "b".into()]).await;
+        assert_eq!(removed, 2);
+        assert_eq!(m.len().await, 1);
+    }
+
+    #[cfg(feature = "batch")]
+    #[tokio::test]
+    async fn async_batch_get() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 1).await;
+        m.insert("c".into(), 3).await;
+
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let results = m.batch_get(&keys).await;
+        assert_eq!(results, vec![Some(1), None, Some(3)]);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_compute_if_present() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 10).await;
+
+        let result = m.compute_if_present(&"a".into(), |v| Some(v * 2)).await;
+        assert_eq!(result, Some(20));
+        assert_eq!(m.get(&"a".into()).await, Some(20));
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_compute_if_absent() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        let result = m.compute_if_absent("a".into(), || 20).await;
+        assert_eq!(result, 20);
+        assert_eq!(m.len().await, 1);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_retain() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..10 {
+            m.insert(format!("k{i}"), i).await;
+        }
+
+        m.retain(|_, v| v % 2 == 0).await;
+        assert_eq!(m.len().await, 5);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_keys() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+
+        let mut keys = m.keys().await;
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_values() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+
+        let mut values = m.values().await;
+        values.sort();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_shard_stats() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..10 {
+            m.insert(format!("k{i}"), i).await;
+        }
+
+        let stats = m.shard_stats().await;
+        assert_eq!(stats.total, 4);
+        assert!(stats.initialized > 0);
     }
 }

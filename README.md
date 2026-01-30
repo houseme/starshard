@@ -205,10 +205,131 @@ Do benchmark with your own key/value distribution and CPU topology.
 
 ---
 
+## Version 0.8.0 Features (Conditional Operations & Batch Operations)
+
+### Conditional Operations (Method-based, highly efficient)
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+
+// Update only if key exists; single shard lock
+map.compute_if_present( & "counter".into(), | v| Some(v + 1));
+
+// Insert only if key absent; single shard lock
+let val = map.compute_if_absent("new_key".into(), | | 42);
+
+// Conditional deletion
+map.compute_if_present( & "key".into(), | _v| None);
+```
+
+**Why not Entry API?**
+
+- In a sharded context, returning a mutable reference is infeasible (shard lock held across await points would deadlock
+  async).
+- Conditional operations provide the same expressiveness with better performance and simpler semantics.
+
+### Batch Operations
+
+```rust
+// Batch insert (amortizes shard lock acquisition)
+let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
+let inserted = map.batch_insert(entries);
+
+// Batch remove
+let removed = map.batch_remove(vec!["a".into(), "b".into()]);
+
+// Batch get
+let keys = vec!["a", "b", "c"];
+let results = map.batch_get( & keys);
+```
+
+### Collection Views & Filtering
+
+```rust
+// Iterate all keys
+let all_keys: Vec<_ > = map.keys().collect();
+
+// Iterate all values
+let all_values: Vec<_ > = map.values().collect();
+
+// Standard iteration
+for (k, v) in map.iter() {
+println ! ("{}: {}", k, v);
+}
+
+// Retention filtering
+map.retain( | k, v| v > & 10);  // Keep only entries where v > 10
+```
+
+### Shard Introspection
+
+```rust
+// Get shard distribution statistics
+let stats = map.shard_stats();
+println!("Total slots: {}", stats.total);
+println!("Initialized shards: {}", stats.initialized);
+println!("Avg load: {:.2}", stats.avg_load);
+
+// Get utilization percentage
+let util = map.shard_utilization();
+println!("Utilization: {:.1}%", util);
+```
+
+---
+
+## Version 0.9.0 Features (Eviction, Metrics, Advanced Iteration)
+
+**Planned features**:
+
+- **TTL & Eviction**: LRU/LFU/custom eviction policies with background cleanup
+- **Metrics Hooks**: Production observability with hit rates, latency tracking
+- **Advanced Iteration**: Filter + limit + parallel control builders
+- **Drain Operations**: Efficient bulk removal
+
+See [ROADMAP.md](ROADMAP.md) for detailed specification.
+
+---
+
+## Version 1.0.0 Features (Transactions, CAS, Replication)
+
+**Planned features**:
+
+- **MVCC Transactions**: Atomic multi-key operations with conflict detection
+- **Compare-And-Swap**: Lock-free coordination primitives
+- **Copy-On-Write Snapshots**: Minimal-contention read optimization
+- **Distributed Replication**: Quorum-based consistency framework
+- **Lock Diagnostics**: Per-shard contention profiling
+
+See [ROADMAP.md](ROADMAP.md) for detailed specification.
+
+---
+
+## Feature Matrix
+
+| Feature                    | v0.7 | v0.8 | v0.9 | v1.0 | Status          |
+|----------------------------|------|------|------|------|-----------------|
+| Sharded HashMap (sync)     | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Conditional Operations     | -    | ✅    | ✅    | ✅    | New in 0.8      |
+| Batch operations           | -    | ✅    | ✅    | ✅    | New in 0.8      |
+| TTL/Eviction               | -    | -    | ✅    | ✅    | Planned for 0.9 |
+| Metrics                    | -    | -    | ✅    | ✅    | Planned for 0.9 |
+| Transactions               | -    | -    | -    | ✅    | Planned for 1.0 |
+| CAS operations             | -    | -    | -    | ✅    | Planned for 1.0 |
+| Replication                | -    | -    | -    | ✅    | Planned for 1.0 |
+
+---
+
 ## Design Sketch
 
 ```
+
 Arc -> RwLock<Vec<Option<Arc<RwLock<HashMap<K,V,S>>>>>> + AtomicUsize(len)
+
 ```
 
 Lazy fill of inner `Option` slot when first key hashes into shard.
