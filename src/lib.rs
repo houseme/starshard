@@ -154,7 +154,7 @@ use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
 /* ======================== Module Declarations ======================== */
 
 /// Version 0.9.0 features: TTL, eviction, metrics, and advanced iteration.
-#[cfg(any(feature = "ttl", feature = "metrics", feature = "advanced-iter"))]
+#[cfg(feature = "lifecycle")]
 pub mod eviction;
 
 /// Version 1.0.0 features: Transactions, CAS, replication, and diagnostics.
@@ -168,14 +168,11 @@ pub mod eviction;
 pub mod advanced;
 
 // Re-export key v0.9.0 types
-#[cfg(feature = "ttl")]
-pub use eviction::{EvictionConfig, EvictionPolicy};
-
-#[cfg(feature = "metrics")]
-pub use eviction::{AtomicMetrics, MemoryStats, MetricsStats};
-
-#[cfg(feature = "advanced-iter")]
-pub use eviction::{DrainIterator, IterBuilder};
+#[cfg(feature = "lifecycle")]
+pub use eviction::{
+    AtomicMetrics, DrainIterator, EvictionConfig, EvictionPolicy, IterBuilder, MemoryStats,
+    MetricsStats,
+};
 
 // Re-export key v1.0.0 types
 #[cfg(feature = "transactions")]
@@ -492,7 +489,6 @@ where
     /// # Returns
     /// - `usize`: number of new entries inserted
     ///
-    #[cfg(feature = "batch")]
     pub fn batch_insert<I>(&self, entries: I) -> usize
     where
         I: IntoIterator<Item = (K, V)>,
@@ -506,15 +502,17 @@ where
         }
 
         let mut count = 0;
-        for (_shard_idx, pairs) in grouped {
+        for (shard_idx, pairs) in grouped {
+            let shard = self.get_or_init_shard(shard_idx);
+            let mut guard = shard.write().unwrap();
             for (k, v) in pairs {
-                let shard = self.get_or_init_shard(self.shard_index(&k));
-                let mut guard = shard.write().unwrap();
                 if guard.insert(k, v).is_none() {
                     count += 1;
-                    self.total_len.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        if count > 0 {
+            self.total_len.fetch_add(count, Ordering::Relaxed);
         }
         count
     }
@@ -527,7 +525,6 @@ where
     /// # Returns
     /// - `usize`: number of entries actually removed
     ///
-    #[cfg(feature = "batch")]
     pub fn batch_remove<I>(&self, keys: I) -> usize
     where
         I: IntoIterator<Item = K>,
@@ -541,15 +538,17 @@ where
         }
 
         let mut count = 0;
-        for (_shard_idx, keys) in grouped {
+        for (shard_idx, keys) in grouped {
+            let shard = self.get_or_init_shard(shard_idx);
+            let mut guard = shard.write().unwrap();
             for k in keys {
-                let shard = self.get_or_init_shard(self.shard_index(&k));
-                let mut guard = shard.write().unwrap();
                 if guard.remove(&k).is_some() {
                     count += 1;
-                    self.total_len.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+        }
+        if count > 0 {
+            self.total_len.fetch_sub(count, Ordering::Relaxed);
         }
         count
     }
@@ -562,7 +561,6 @@ where
     /// # Returns
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
-    #[cfg(feature = "batch")]
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -1039,7 +1037,6 @@ where
     /// # Returns
     /// - `usize`: number of new entries inserted
     ///
-    #[cfg(feature = "batch")]
     pub async fn batch_insert<I>(&self, entries: I) -> usize
     where
         I: IntoIterator<Item = (K, V)>,
@@ -1053,15 +1050,17 @@ where
         }
 
         let mut count = 0;
-        for (_shard_idx, pairs) in grouped {
+        for (shard_idx, pairs) in grouped {
+            let shard = self.get_or_init_shard(shard_idx).await;
+            let mut guard = shard.write().await;
             for (k, v) in pairs {
-                let shard = self.get_or_init_shard(self.shard_index(&k)).await;
-                let mut guard = shard.write().await;
                 if guard.insert(k, v).is_none() {
                     count += 1;
-                    self.total_len.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        if count > 0 {
+            self.total_len.fetch_add(count, Ordering::Relaxed);
         }
         count
     }
@@ -1074,7 +1073,6 @@ where
     /// # Returns
     /// - `usize`: number of entries actually removed
     ///
-    #[cfg(feature = "batch")]
     pub async fn batch_remove<I>(&self, keys: I) -> usize
     where
         I: IntoIterator<Item = K>,
@@ -1088,15 +1086,17 @@ where
         }
 
         let mut count = 0;
-        for (_shard_idx, keys) in grouped {
+        for (shard_idx, keys) in grouped {
+            let shard = self.get_or_init_shard(shard_idx).await;
+            let mut guard = shard.write().await;
             for k in keys {
-                let shard = self.get_or_init_shard(self.shard_index(&k)).await;
-                let mut guard = shard.write().await;
                 if guard.remove(&k).is_some() {
                     count += 1;
-                    self.total_len.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+        }
+        if count > 0 {
+            self.total_len.fetch_sub(count, Ordering::Relaxed);
         }
         count
     }
@@ -1109,7 +1109,6 @@ where
     /// # Returns
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
-    #[cfg(feature = "batch")]
     pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -1390,7 +1389,6 @@ mod tests {
 
     /* ==================== v0.8.0 Feature Tests ==================== */
 
-    #[cfg(feature = "batch")]
     #[test]
     fn batch_insert_new_entries() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
@@ -1401,7 +1399,6 @@ mod tests {
         assert_eq!(m.get(&"b".into()), Some(2));
     }
 
-    #[cfg(feature = "batch")]
     #[test]
     fn batch_insert_with_replacements() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
@@ -1418,7 +1415,6 @@ mod tests {
         assert_eq!(m.get(&"a".into()), Some(10));
     }
 
-    #[cfg(feature = "batch")]
     #[test]
     fn batch_remove() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
@@ -1433,7 +1429,6 @@ mod tests {
         assert_eq!(m.get(&"c".into()), Some(3));
     }
 
-    #[cfg(feature = "batch")]
     #[test]
     fn batch_get() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
@@ -1556,7 +1551,7 @@ mod tests {
         assert!(util > 0.0 && util <= 100.0);
     }
 
-    #[cfg(feature = "batch")]
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_batch_insert() {
         let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
@@ -1566,7 +1561,7 @@ mod tests {
         assert_eq!(m.len().await, 2);
     }
 
-    #[cfg(feature = "batch")]
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_batch_remove() {
         let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
@@ -1579,7 +1574,7 @@ mod tests {
         assert_eq!(m.len().await, 1);
     }
 
-    #[cfg(feature = "batch")]
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_batch_get() {
         let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);

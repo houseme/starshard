@@ -4,7 +4,7 @@
 //! and advanced iteration patterns for the Starshard sharded HashMap.
 
 /// Eviction policy for cache entries.
-#[cfg(feature = "ttl")]
+#[cfg(feature = "lifecycle")]
 #[derive(Clone)]
 pub enum EvictionPolicy {
     /// Least Recently Used: removes least recently accessed entries
@@ -17,7 +17,7 @@ pub enum EvictionPolicy {
     Custom(std::sync::Arc<dyn Fn() -> bool + Send + Sync>),
 }
 
-#[cfg(feature = "ttl")]
+#[cfg(feature = "lifecycle")]
 impl std::fmt::Debug for EvictionPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -32,7 +32,7 @@ impl std::fmt::Debug for EvictionPolicy {
 }
 
 /// Configuration for eviction behavior.
-#[cfg(feature = "ttl")]
+#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct EvictionConfig {
     /// The eviction policy to apply
@@ -45,7 +45,7 @@ pub struct EvictionConfig {
     pub background_enabled: bool,
 }
 
-#[cfg(feature = "ttl")]
+#[cfg(feature = "lifecycle")]
 impl Default for EvictionConfig {
     fn default() -> Self {
         Self {
@@ -58,7 +58,7 @@ impl Default for EvictionConfig {
 }
 
 /// Per-shard eviction statistics.
-#[cfg(feature = "ttl")]
+#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone, Default)]
 pub struct ShardEvictionStats {
     /// Total evictions performed on this shard
@@ -72,7 +72,7 @@ pub struct ShardEvictionStats {
 }
 
 /// Metrics collected during operation.
-#[cfg(feature = "metrics")]
+#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct MetricsStats {
     /// Total insert operations
@@ -109,7 +109,7 @@ impl Default for MetricsStats {
 }
 
 /// Internal atomic counters for metrics.
-#[cfg(feature = "metrics")]
+#[cfg(feature = "lifecycle")]
 pub struct AtomicMetrics {
     /// Total insert operations.
     pub inserts: std::sync::atomic::AtomicU64,
@@ -125,7 +125,7 @@ pub struct AtomicMetrics {
     pub evictions: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "metrics")]
+#[cfg(feature = "lifecycle")]
 impl Default for AtomicMetrics {
     fn default() -> Self {
         Self {
@@ -139,7 +139,7 @@ impl Default for AtomicMetrics {
     }
 }
 
-#[cfg(feature = "metrics")]
+#[cfg(feature = "lifecycle")]
 impl AtomicMetrics {
     /// Create snapshot of current metrics
     pub fn snapshot(&self) -> MetricsStats {
@@ -176,7 +176,7 @@ impl AtomicMetrics {
 }
 
 /// Memory utilization statistics.
-#[cfg(feature = "metrics")]
+#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
     /// Number of initialized shards
@@ -188,10 +188,10 @@ pub struct MemoryStats {
 }
 
 /// Iterator builder for advanced iteration control.
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 type IterFilter<K, V> = std::sync::Arc<dyn Fn(&K, &V) -> bool + Send + Sync>;
 
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 /// Builder for creating customized iterators over the HashMap.
 pub struct IterBuilder<K, V> {
     /// Optional filter predicate
@@ -204,7 +204,7 @@ pub struct IterBuilder<K, V> {
     pub(crate) parallel: bool,
 }
 
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     /// Create new iterator builder
     pub fn new() -> Self {
@@ -257,7 +257,7 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     }
 }
 
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 impl<K: Clone + Send + Sync, V: Clone + Send + Sync> Default for IterBuilder<K, V> {
     fn default() -> Self {
         Self::new()
@@ -265,7 +265,7 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> Default for IterBuilder<K, 
 }
 
 /// Drain iterator for bulk removal.
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 pub struct DrainIterator<K, V> {
     /// All items to drain
     pub(crate) items: Vec<(K, V)>,
@@ -273,7 +273,7 @@ pub struct DrainIterator<K, V> {
     pub(crate) index: usize,
 }
 
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 impl<K, V> Iterator for DrainIterator<K, V> {
     type Item = (K, V);
 
@@ -287,7 +287,7 @@ impl<K, V> Iterator for DrainIterator<K, V> {
     }
 }
 
-#[cfg(feature = "advanced-iter")]
+#[cfg(feature = "lifecycle")]
 impl<K, V> ExactSizeIterator for DrainIterator<K, V> {
     fn len(&self) -> usize {
         self.items.len() - self.index
@@ -307,7 +307,7 @@ pub struct PerShardLoad {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "ttl")]
+    #[cfg(feature = "lifecycle")]
     #[test]
     fn eviction_config_default() {
         let config = crate::EvictionConfig::default();
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(config.max_entries, None);
     }
 
-    #[cfg(feature = "metrics")]
+    #[cfg(feature = "lifecycle")]
     #[test]
     fn atomic_metrics_default() {
         let metrics = crate::AtomicMetrics::default();
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(snap.hit_rate, 0.0);
     }
 
-    #[cfg(feature = "metrics")]
+    #[cfg(feature = "lifecycle")]
     #[test]
     fn atomic_metrics_hit_rate() {
         let metrics = crate::AtomicMetrics::default();
@@ -335,7 +335,7 @@ mod tests {
         assert!((snap.hit_rate - 0.7).abs() < 0.01);
     }
 
-    #[cfg(feature = "advanced-iter")]
+    #[cfg(feature = "lifecycle")]
     #[test]
     fn iter_builder_filter() {
         let builder = crate::IterBuilder::<String, i32>::new()
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
-    #[cfg(feature = "advanced-iter")]
+    #[cfg(feature = "lifecycle")]
     #[test]
     fn drain_iterator() {
         let drain = crate::DrainIterator {
