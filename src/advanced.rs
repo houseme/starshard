@@ -307,6 +307,11 @@ impl QuorumConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ShardedHashMap;
+    #[cfg(feature = "async")]
+    use crate::AsyncShardedHashMap;
+
     #[test]
     fn transaction_creation() {
         let txn: crate::Transaction<String, i32> = crate::Transaction::new();
@@ -362,5 +367,44 @@ mod tests {
         assert_eq!(snap.version(), 1);
         assert_eq!(snap.len(), 2);
         assert!(snap.age() >= std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_sync_transaction_execution() {
+        let map: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+        map.insert("a".into(), 1);
+        map.insert("b".into(), 2);
+
+        let mut txn = Transaction::new();
+        txn.write("a".into(), 10);
+        txn.write("c".into(), 30);
+        txn.remove("b".into());
+
+        let result = map.execute_transaction(txn);
+        assert!(matches!(result, TransactionResult::Committed(())));
+
+        assert_eq!(map.get(&"a".into()), Some(10));
+        assert_eq!(map.get(&"b".into()), None);
+        assert_eq!(map.get(&"c".into()), Some(30));
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_transaction_execution() {
+        let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
+        map.insert("a".into(), 1).await;
+        map.insert("b".into(), 2).await;
+
+        let mut txn = Transaction::new();
+        txn.write("a".into(), 10);
+        txn.write("c".into(), 30);
+        txn.remove("b".into());
+
+        let result = map.execute_transaction(txn).await;
+        assert!(matches!(result, TransactionResult::Committed(())));
+
+        assert_eq!(map.get(&"a".into()).await, Some(10));
+        assert_eq!(map.get(&"b".into()).await, None);
+        assert_eq!(map.get(&"c".into()).await, Some(30));
     }
 }
