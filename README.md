@@ -59,9 +59,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.6", features = ["async", "rayon", "serde"] }
+starshard = { version = "0.7", features = ["async", "rayon", "serde"] }
 # or minimal:
-# starshard = "0.6"
+# starshard = "0.7"
 ```
 
 `serde_json` (tests / examples):
