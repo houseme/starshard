@@ -81,7 +81,11 @@ fn batch_operations_example() {
         println!("  Map size: {}", map.len());
 
         // Batch get
-        let keys = vec!["alice".to_string(), "bob".to_string(), "unknown".to_string()];
+        let keys = vec![
+            "alice".to_string(),
+            "bob".to_string(),
+            "unknown".to_string(),
+        ];
         let results = map.batch_get(&keys);
         println!("  Batch get {:?}: {:?}", keys, results);
 
