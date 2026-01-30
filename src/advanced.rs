@@ -308,9 +308,9 @@ impl QuorumConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ShardedHashMap;
     #[cfg(feature = "async")]
     use crate::AsyncShardedHashMap;
+    use crate::ShardedHashMap;
 
     #[test]
     fn transaction_creation() {

@@ -8,9 +8,9 @@
 #[derive(Clone)]
 pub enum EvictionPolicy {
     /// Least Recently Used: removes least recently accessed entries
-    LRU,
+    Lru,
     /// Least Frequently Used: removes least frequently accessed entries
-    LFU,
+    Lfu,
     /// Time-To-Live: removes entries after specified duration
     TimeToLive(std::time::Duration),
     /// Custom predicate: removes entries matching predicate
@@ -21,8 +21,8 @@ pub enum EvictionPolicy {
 impl std::fmt::Debug for EvictionPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EvictionPolicy::LRU => f.write_str("LRU"),
-            EvictionPolicy::LFU => f.write_str("LFU"),
+            EvictionPolicy::Lru => f.write_str("LRU"),
+            EvictionPolicy::Lfu => f.write_str("LFU"),
             EvictionPolicy::TimeToLive(duration) => {
                 f.debug_tuple("TimeToLive").field(duration).finish()
             }
@@ -39,6 +39,10 @@ pub struct EvictionConfig {
     pub policy: EvictionPolicy,
     /// Maximum total entries; None = unlimited
     pub max_entries: Option<usize>,
+    /// Maximum items per shard; None = unlimited
+    pub max_items_per_shard: Option<usize>,
+    /// Time-To-Live for entries; None = unlimited
+    pub ttl: Option<std::time::Duration>,
     /// How often to check for eviction candidates
     pub check_interval: std::time::Duration,
     /// Whether to enable background eviction task
@@ -49,8 +53,10 @@ pub struct EvictionConfig {
 impl Default for EvictionConfig {
     fn default() -> Self {
         Self {
-            policy: EvictionPolicy::LRU,
+            policy: EvictionPolicy::Lru,
             max_entries: None,
+            max_items_per_shard: None,
+            ttl: None,
             check_interval: std::time::Duration::from_secs(60),
             background_enabled: true,
         }
