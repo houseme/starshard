@@ -155,7 +155,7 @@ use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
 
 /// Version 0.9.0 features: TTL, eviction, metrics, and advanced iteration.
 #[cfg(any(feature = "ttl", feature = "metrics", feature = "advanced-iter"))]
-pub mod v090_eviction;
+pub mod eviction;
 
 /// Version 1.0.0 features: Transactions, CAS, replication, and diagnostics.
 #[cfg(any(
@@ -165,33 +165,33 @@ pub mod v090_eviction;
     feature = "replication",
     feature = "diagnostics"
 ))]
-pub mod v100_advanced;
+pub mod advanced;
 
 // Re-export key v0.9.0 types
 #[cfg(feature = "ttl")]
-pub use v090_eviction::{EvictionConfig, EvictionPolicy};
+pub use eviction::{EvictionConfig, EvictionPolicy};
 
 #[cfg(feature = "metrics")]
-pub use v090_eviction::{AtomicMetrics, MemoryStats, MetricsStats};
+pub use eviction::{AtomicMetrics, MemoryStats, MetricsStats};
 
 #[cfg(feature = "advanced-iter")]
-pub use v090_eviction::{DrainIterator, IterBuilder};
+pub use eviction::{DrainIterator, IterBuilder};
 
 // Re-export key v1.0.0 types
 #[cfg(feature = "transactions")]
-pub use v100_advanced::{Transaction, TransactionResult, TxnOp};
+pub use advanced::{Transaction, TransactionResult, TxnOp};
 
 #[cfg(feature = "cas")]
-pub use v100_advanced::CasResult;
+pub use advanced::CasResult;
 
 #[cfg(feature = "cow-snapshot")]
-pub use v100_advanced::CowSnapshot;
+pub use advanced::CowSnapshot;
 
 #[cfg(feature = "replication")]
-pub use v100_advanced::{QuorumConfig, Replica, ReplicaError, ReplicationOp};
+pub use advanced::{QuorumConfig, Replica, ReplicaError, ReplicationOp};
 
 #[cfg(feature = "diagnostics")]
-pub use v100_advanced::{IsolatedSnapshot, LockProfile};
+pub use advanced::{IsolatedSnapshot, LockProfile};
 
 /* ======================== Serde Imports ======================== */
 #[cfg(feature = "serde")]
@@ -482,6 +482,95 @@ where
         }
     }
 
+    /* ==================== v0.8.0 Sync Methods ==================== */
+
+    /// Batch insert multiple key-value pairs.
+    ///
+    /// # Arguments
+    /// - `entries`: iterator of (K, V) pairs
+    ///
+    /// # Returns
+    /// - `usize`: number of new entries inserted
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_insert<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
+            std::collections::HashMap::new();
+
+        for (k, v) in entries {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push((k, v));
+        }
+
+        let mut count = 0;
+        for (_shard_idx, pairs) in grouped {
+            for (k, v) in pairs {
+                let shard = self.get_or_init_shard(self.shard_index(&k));
+                let mut guard = shard.write().unwrap();
+                if guard.insert(k, v).is_none() {
+                    count += 1;
+                    self.total_len.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch remove multiple keys.
+    ///
+    /// # Arguments
+    /// - `keys`: iterator of keys to remove
+    ///
+    /// # Returns
+    /// - `usize`: number of entries actually removed
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_remove<I>(&self, keys: I) -> usize
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut grouped: std::collections::HashMap<usize, Vec<K>> =
+            std::collections::HashMap::new();
+
+        for k in keys {
+            let shard_idx = self.shard_index(&k);
+            grouped.entry(shard_idx).or_default().push(k);
+        }
+
+        let mut count = 0;
+        for (_shard_idx, keys) in grouped {
+            for k in keys {
+                let shard = self.get_or_init_shard(self.shard_index(&k));
+                let mut guard = shard.write().unwrap();
+                if guard.remove(&k).is_some() {
+                    count += 1;
+                    self.total_len.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+        count
+    }
+
+    /// Batch get multiple keys.
+    ///
+    /// # Arguments
+    /// - `keys`: slice of keys to fetch
+    ///
+    /// # Returns
+    /// - `Vec<Option<V>>`: results in same order as keys
+    ///
+    #[cfg(feature = "batch")]
+    pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get(key));
+        }
+        results
+    }
+
     /// Update entry if it exists, or remove it if the function returns None.
     ///
     /// # Arguments
@@ -595,12 +684,10 @@ where
         let mut initialized = 0;
         let mut loads = Vec::new();
 
-        for shard_opt in slots.iter() {
-            if let Some(shard) = shard_opt {
-                initialized += 1;
-                let guard = shard.read().unwrap();
-                loads.push(guard.len());
-            }
+        for shard in slots.iter().flatten() {
+            initialized += 1;
+            let guard = shard.read().unwrap();
+            loads.push(guard.len());
         }
 
         let total = slots.len();
@@ -902,7 +989,7 @@ where
     /// Snapshot iteration (async).
     ///
     /// Steps:
-    /// 1. Snapshot Arc list of initialized shards under read lock of the shard vector.
+    /// 1. Snapshot Arc of initialized shards under read lock of the shard vector.
     /// 2. For each shard: try `try_read`; fallback to `await` read.
     /// 3. Clone inner HashMaps (short critical sections).
     /// 4. If `rayon` enabled, parallel flatten of snapshots.
@@ -962,10 +1049,7 @@ where
 
         for (k, v) in entries {
             let shard_idx = self.shard_index(&k);
-            grouped
-                .entry(shard_idx)
-                .or_insert_with(Vec::new)
-                .push((k, v));
+            grouped.entry(shard_idx).or_default().push((k, v));
         }
 
         let mut count = 0;
@@ -1000,7 +1084,7 @@ where
 
         for k in keys {
             let shard_idx = self.shard_index(&k);
-            grouped.entry(shard_idx).or_insert_with(Vec::new).push(k);
+            grouped.entry(shard_idx).or_default().push(k);
         }
 
         let mut count = 0;
@@ -1145,12 +1229,10 @@ where
         let mut initialized = 0;
         let mut loads = Vec::new();
 
-        for shard_opt in slots.iter() {
-            if let Some(shard) = shard_opt {
-                initialized += 1;
-                let guard = shard.read().await;
-                loads.push(guard.len());
-            }
+        for shard in slots.iter().flatten() {
+            initialized += 1;
+            let guard = shard.read().await;
+            loads.push(guard.len());
         }
 
         let total = slots.len();
@@ -1358,7 +1440,7 @@ mod tests {
         m.insert("a".into(), 1);
         m.insert("c".into(), 3);
 
-        let keys = vec!["a", "b", "c"];
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let results = m.batch_get(&keys);
         assert_eq!(results, vec![Some(1), None, Some(3)]);
     }
@@ -1504,7 +1586,7 @@ mod tests {
         m.insert("a".into(), 1).await;
         m.insert("c".into(), 3).await;
 
-        let keys = vec!["a", "b", "c"];
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let results = m.batch_get(&keys).await;
         assert_eq!(results, vec![Some(1), None, Some(3)]);
     }

@@ -1,33 +1,29 @@
-// Example: v0.8.0 Entry API and Batch Operations
+// Example: v0.8.0 Conditional Operations and Batch Operations
 // Run with: cargo run --example v080_entry_api --all-features
 
 use starshard::ShardedHashMap;
 
 fn main() {
-    println!("=== Starshard v0.8.0: Entry API & Batch Operations ===\n");
+    println!("=== Starshard v0.8.0: Conditional Operations & Collection Views ===\n");
 
-    // Example 1: Entry API for efficient updates
-    println!("1. Entry API - Conditional Updates");
+    // Example 1: Conditional operations (compute_if_present, compute_if_absent)
+    println!("1. Conditional Operations");
     entry_api_example();
 
-    // Example 2: Batch operations
-    println!("\n2. Batch Operations");
-    batch_operations_example();
-
-    // Example 3: Conditional operations
-    println!("\n3. Conditional Operations");
-    conditional_operations_example();
-
-    // Example 4: Collection views
-    println!("\n4. Collection Views (Keys & Values)");
+    // Example 2: Collection views
+    println!("\n2. Collection Views (Keys & Values)");
     collection_views_example();
 
-    // Example 5: Shard introspection
-    println!("\n5. Shard Introspection");
+    // Example 3: Shard introspection
+    println!("\n3. Shard Introspection");
     shard_stats_example();
 
-    // Example 6: Retention/filtering
-    println!("\n6. Retention (Filter)");
+    // Example 4: Batch operations
+    println!("\n4. Batch Operations");
+    batch_operations_example();
+
+    // Example 5: Retention/filtering
+    println!("\n5. Retention (Filter)");
     retention_example();
 }
 
@@ -37,36 +33,35 @@ fn entry_api_example() {
     // Insert initial value
     map.insert("counter".into(), 0);
 
-    // Use entry API to increment
-    #[cfg(feature = "entry")]
-    {
-        use starshard::Entry;
+    // Method 1: compute_if_absent for default insertion
+    let val = map.compute_if_absent("counter".into(), || 999);
+    println!(
+        "  compute_if_absent('counter'): {} (exists, so returned existing)",
+        val
+    );
 
-        match map.entry("counter".into()) {
-            Entry::Occupied(entry) => {
-                println!("  Key exists with value: {}", entry.get());
-            }
-            Entry::Vacant(_) => {
-                println!("  Key vacant (unexpected)");
-            }
-        }
+    let val = map.compute_if_absent("new_key".into(), || 42);
+    println!(
+        "  compute_if_absent('new_key'): {} (absent, so inserted new)",
+        val
+    );
 
-        // More practical: or_insert for default values
-        let val = map.entry("new_key".into()).or_insert_with(|| 42);
-        println!("  Inserted 'new_key' with value: {}", val);
+    // Method 2: compute_if_present for in-place updates
+    let updated = map.compute_if_present(&"counter".into(), |v| Some(v + 1));
+    println!(
+        "  compute_if_present('counter'): {:?} (incremented to {})",
+        updated,
+        map.get(&"counter".into()).unwrap()
+    );
 
-        // and_modify for conditional updates
-        let _entry = map.entry("counter".into()).and_modify(|v| *v += 1);
-        println!(
-            "  Incremented 'counter' to: {}",
-            map.get(&"counter".into()).unwrap()
-        );
-    }
-
-    #[cfg(not(feature = "entry"))]
-    {
-        println!("  (Entry API disabled - enable with 'entry' feature)");
-    }
+    // Method 3: compute_if_present with removal
+    map.insert("to_remove".into(), 5);
+    let removed = map.compute_if_present(&"to_remove".into(), |_v| None);
+    println!("  compute_if_present with None (remove): {:?}", removed);
+    println!(
+        "  'to_remove' still exists: {}",
+        map.contains(&"to_remove".into())
+    );
 }
 
 fn batch_operations_example() {
@@ -86,7 +81,7 @@ fn batch_operations_example() {
         println!("  Map size: {}", map.len());
 
         // Batch get
-        let keys = vec!["alice", "bob", "unknown"];
+        let keys = vec!["alice".to_string(), "bob".to_string(), "unknown".to_string()];
         let results = map.batch_get(&keys);
         println!("  Batch get {:?}: {:?}", keys, results);
 
@@ -101,35 +96,6 @@ fn batch_operations_example() {
     {
         println!("  (Batch operations disabled - enable with 'batch' feature)");
     }
-}
-
-fn conditional_operations_example() {
-    let map: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
-
-    // compute_if_present: Update only if key exists
-    let result = map.compute_if_present(&"nonexistent".into(), |v| Some(v * 2));
-    println!("  compute_if_present (absent): {:?}", result);
-
-    map.insert("score".into(), 10);
-    let result = map.compute_if_present(&"score".into(), |v| Some(v * 2));
-    println!("  compute_if_present (present): {:?}", result);
-    println!("  score is now: {}", map.get(&"score".into()).unwrap());
-
-    // compute_if_absent: Insert only if key absent
-    let val = map.compute_if_absent("score".into(), || 999);
-    println!("  compute_if_absent (present): {}", val); // Returns existing 20
-
-    let val = map.compute_if_absent("new_score".into(), || 50);
-    println!("  compute_if_absent (absent): {}", val); // Returns newly inserted 50
-
-    // compute_if_present with removal (return None)
-    map.insert("removable".into(), 5);
-    let result = map.compute_if_present(&"removable".into(), |_v| None);
-    println!("  compute_if_present with removal: {:?}", result);
-    println!(
-        "  'removable' still exists: {}",
-        map.contains(&"removable".into())
-    );
 }
 
 fn collection_views_example() {

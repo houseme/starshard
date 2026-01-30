@@ -1,15 +1,13 @@
-// Example: v0.8.0 Async API and Batch Operations
-// Run with: cargo run --example v080_async_batch --all-features --no-default-features --features async,batch
+// Example: v0.8.0 Async Conditional Operations and Batch Operations
+// Run with: cargo run --example v080_async_batch --all-features
 
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() {
-    use starshard::AsyncShardedHashMap;
+    println!("=== Starshard v0.8.0: Async Conditional Operations & Batch ===\n");
 
-    println!("=== Starshard v0.8.0: Async Batch Operations ===\n");
-
-    async_batch_example().await;
     async_conditional_example().await;
+    async_batch_example().await;
     async_introspection_example().await;
 }
 
@@ -17,7 +15,7 @@ async fn main() {
 async fn async_batch_example() {
     use starshard::AsyncShardedHashMap;
 
-    println!("1. Async Batch Operations");
+    println!("\n2. Async Batch Operations");
 
     let map: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(16);
 
@@ -33,7 +31,7 @@ async fn async_batch_example() {
         println!("  Inserted {} tasks", inserted);
 
         // Async batch get
-        let keys = vec!["task_1", "task_2"];
+        let keys = vec!["task_1".to_string(), "task_2".to_string()];
         let results = map.batch_get(&keys).await;
         println!("  Batch get results: {:?}", results);
 
@@ -52,7 +50,7 @@ async fn async_batch_example() {
 async fn async_conditional_example() {
     use starshard::AsyncShardedHashMap;
 
-    println!("\n2. Async Conditional Operations");
+    println!("1. Async Conditional Operations");
 
     let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
 
@@ -79,7 +77,7 @@ async fn async_conditional_example() {
 async fn async_introspection_example() {
     use starshard::AsyncShardedHashMap;
 
-    println!("\n3. Async Introspection");
+    println!("\n3. Async Introspection & Stats");
 
     let map: AsyncShardedHashMap<String, String> = AsyncShardedHashMap::new(32);
 
