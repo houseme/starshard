@@ -12,10 +12,6 @@
 
 <code>同步 + 异步 + 可选 Rayon 并行 + 可选 Serde 序列化</code>
 
-
-
-
-
 ---
 
 ## 状态
@@ -63,9 +59,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "0.6", features = ["async", "rayon", "serde"] }
+starshard = { version = "0.7", features = ["async", "rayon", "serde"] }
 # 最小：
-# starshard = "0.6"
+# starshard = "0.7"
 ```
 
 开发/测试:
