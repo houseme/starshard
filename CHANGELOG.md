@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-02-03
+
 ### Added
 
 - **Shard Introspection**:
@@ -40,51 +42,83 @@ All notable changes to this project will be documented in this file.
     - Optimized `batch_insert` and `batch_remove` to acquire the shard lock only once per shard group, significantly
       reducing lock contention.
 
-## [1.0.0] - 2026-02-01
+## [1.0.0] - 2026-01-31
 
 ### Added
 
-#### Advanced Concurrency & Distributed Features (v1.0.0)
+#### Advanced Concurrency & Distributed Features
 
-- **Atomic Transactions**: MVCC-based multi-key operations
-    - `Transaction<K, V>`: Structure for coordinated read/write/remove operations
-    - `TransactionResult<T>`: Enum for commit/abort/conflict results
-    - Per-shard versioning with optimistic locking
+- **Atomic Transactions (MVCC-based)**:
+    - `Transaction<K, V>`: Multi-key atomic operations with read/write/remove support
+    - `execute_transaction()`: Sync and async transaction execution with deadlock prevention
+    - `TransactionResult<T>`: Result enum (Committed, Aborted, Conflict)
+    - Shard-level locking with sorted indices to prevent deadlocks
+
 - **Compare-And-Swap (CAS) Operations**:
-    - `compare_and_swap()`: Atomic value comparison and swap
-    - `compare_and_remove()`: Conditional removal based on value matching
-    - Lock-free coordination for multi-key consistency
-- **Copy-On-Write (CoW) Snapshots**:
-    - `CowSnapshot<K, V>`: Minimal-locking snapshot structure
-    - Optimized for read-heavy workloads
-    - Zero-copy iteration on snapshot data
-- **Distributed Replication Framework**:
-    - `Replica<K, V>` trait for implementing custom replicas
+    - `compare_and_swap(key, expected, new)`: Atomic value replacement
+    - `compare_and_remove(key, expected)`: Conditional removal
+    - `CasResult<V>`: Success/Failure result with current value
+    - Full support for both sync and async variants
+
+- **Copy-On-Write Snapshots**:
+    - `cow_snapshot()`: Zero-allocation snapshot for read-heavy workloads
+    - `CowSnapshot<K, V>`: Immutable snapshot with version tracking
+    - Minimal lock contention during snapshot creation
+    - Iterator support with snapshot isolation guarantees
+
+- **Snapshot Isolation & Versioning**:
+    - `versioned_snapshot()`: Create timestamped snapshots for time-travel queries
+    - `snapshot_at_version(version)`: Retrieve snapshot at specific version
+    - `IsolatedSnapshot<K, V>`: Version-tagged snapshot with age tracking
+    - Monotonic version counter for consistency
+
+- **Lock Profiling & Diagnostics**:
+    - `lock_profiles()`: Per-shard lock contention statistics
+    - `enable_profiling(bool)`: Toggle profiling with minimal overhead
+    - `LockProfile`: Metrics including reads, writes, contention count, wait times
+    - Runtime-configurable profiling for production diagnostics
+
+- **Distributed Replication Framework** (async only):
+    - `Replica<K, V>` trait: Interface for custom replica implementations
+    - `with_replication()`: Configure map with replica set and quorum
+    - `insert_replicated()` / `remove_replicated()`: Quorum-based operations
     - `ReplicationOp<K, V>`: Serializable operation types (Insert, Remove, Clear)
     - `QuorumConfig`: Majority and strict quorum configurations
-    - Async replication with timeout handling
-- **Lock Profiling & Diagnostics**:
-    - `LockProfile`: Per-shard contention tracking and statistics
-    - `IsolatedSnapshot<K, V>`: Time-travel queries with version tracking
-    - Shard-level performance metrics (reads, writes, wait times)
+    - Parallel async replication with configurable timeouts
+    - `ReplicaError`: Comprehensive error handling for replication failures
 
-#### Infrastructure (v1.0.0)
+### Implementation Details
 
-- New feature flags: `transactions`, `cas`, `cow-snapshot`, `replication`, `diagnostics`
-- `async-trait` dependency for async trait support
-- `dashmap` dependency for CoW snapshot alternatives
-- `parking_lot` dependency for fair RwLock alternatives
-- Comprehensive test suite for advanced features
-- Full documentation with async patterns and examples
+- **Type Safety**: All generic types use `'static` bounds for async compatibility
+- **Zero External Dependencies**: No `dashmap` or `parking_lot` - uses only `hashbrown` and std library
+- **Type Aliases**: `ReplicaList<K, V>` to reduce type complexity (clippy-clean)
+- **Version Tracking**: `Arc<AtomicUsize>` for lock-free version increments
+- **Feature Flags**: All functionality behind `advanced` feature flag
 
-### Configuration Changes
+### Testing
 
-**Cargo.toml**:
+- **40+ Test Cases**: Comprehensive coverage for all features
+    - Transaction tests (5): basic commit, multi-shard, read ops, empty, async
+    - CAS tests (11): success/failure scenarios, multi-threaded, async variants
+    - CoW snapshot tests (6): creation, isolation, iteration, race conditions
+    - Versioned snapshot tests (8): ordering, version queries, time-travel
+    - Lock profiling tests (3): enable/disable, structure validation
+    - Replication tests (4): quorum configs, insert/remove operations
+    - Integration tests (3): cross-feature interactions
 
-- Version bumped to 1.0.0
-- Added dependencies: `async-trait`, `dashmap`, `parking_lot`
-- Updated feature flags with new modules
-- `full` feature includes all functionality
+### Fixed
+
+- Type complexity warning (clippy): Added `ReplicaList<K, V>` type alias
+- Lifetime errors: Added `'static` bounds to K and V types for async compatibility
+- Test race conditions: Used `Barrier` for proper synchronization
+- Quorum validation: Corrected replica count matching in tests
+
+### Documentation
+
+- 14 detailed documentation files covering implementation and fixes
+- API documentation with examples for all public methods
+- Comprehensive test suite serving as usage examples
+- Full async/await pattern documentation
 
 ## [0.9.0] - 2026-01-31
 

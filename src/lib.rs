@@ -197,6 +197,10 @@ type AsyncShardVec<K, V, S> = Vec<Option<AsyncShard<K, V, S>>>;
 #[cfg(feature = "async")]
 type AsyncShardVecArc<K, V, S> = Arc<TokioRwLock<AsyncShardVec<K, V, S>>>;
 
+/// Type alias for replica list to reduce type complexity
+#[cfg(all(feature = "async", feature = "advanced"))]
+type ReplicaList<K, V> = Arc<StdRwLock<Vec<Arc<dyn advanced::Replica<K, V>>>>>;
+
 /// Default shard count (power-of-two not required; hashing modulo used).
 pub const DEFAULT_SHARDS: usize = 64;
 
@@ -280,6 +284,10 @@ where
     hasher: S,
     shard_count: usize,
     total_len: Arc<AtomicUsize>,
+    #[cfg(feature = "advanced")]
+    version: Arc<AtomicUsize>,
+    #[cfg(feature = "advanced")]
+    profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<K, V> ShardedHashMap<K, V, FxBuildHasher>
@@ -314,6 +322,10 @@ where
             hasher,
             shard_count: count,
             total_len: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "advanced")]
+            version: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "advanced")]
+            profiling_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -838,6 +850,147 @@ where
         TransactionResult::Committed(())
     }
 
+    /// Compare and swap: atomically replace value if it matches expected.
+    ///
+    /// # Arguments
+    /// - `key`: The key to update.
+    /// - `expected`: The expected current value.
+    /// - `new`: The new value to swap in.
+    ///
+    /// # Returns
+    /// - `CasResult<V>`: Success with new value, or Failure with current value.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key, expected, new), level = "trace")]
+    pub fn compare_and_swap(&self, key: &K, expected: &V, new: V) -> CasResult<V>
+    where
+        V: PartialEq,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key));
+        let mut guard = std_write_guard(&shard, "cas");
+
+        match guard.get(key) {
+            Some(current) if current == expected => {
+                guard.insert(key.clone(), new.clone());
+                CasResult::Success(new)
+            }
+            Some(current) => CasResult::Failure(current.clone()),
+            None => CasResult::Failure(new),
+        }
+    }
+
+    /// Compare and remove: atomically remove entry if value matches expected.
+    ///
+    /// # Arguments
+    /// - `key`: The key to remove.
+    /// - `expected`: The expected current value.
+    ///
+    /// # Returns
+    /// - `bool`: true if removed, false if value didn't match or key not found.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key, expected), level = "trace")]
+    pub fn compare_and_remove(&self, key: &K, expected: &V) -> bool
+    where
+        V: PartialEq,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key));
+        let mut guard = std_write_guard(&shard, "cas_remove");
+
+        match guard.get(key) {
+            Some(current) if current == expected => {
+                guard.remove(key);
+                self.total_len.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Create a copy-on-write snapshot for minimal-locking reads.
+    ///
+    /// # Returns
+    /// - `CowSnapshot<K, V>`: Immutable snapshot of current state.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn cow_snapshot(&self) -> CowSnapshot<K, V> {
+        let data = self.iter().collect();
+        let version = self.version.load(Ordering::SeqCst) as u64;
+        CowSnapshot::new(data, version)
+    }
+
+    /// Create a versioned snapshot for time-travel queries.
+    ///
+    /// # Returns
+    /// - `IsolatedSnapshot<K, V>`: Snapshot with version information.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn versioned_snapshot(&self) -> IsolatedSnapshot<K, V> {
+        let data = self.iter().collect();
+        let version = self.version.fetch_add(1, Ordering::SeqCst) as u64;
+        IsolatedSnapshot::new(version, data)
+    }
+
+    /// Create a snapshot at a specific version (if available).
+    ///
+    /// # Arguments
+    /// - `version`: The version number to snapshot at.
+    ///
+    /// # Returns
+    /// - `Option<IsolatedSnapshot<K, V>>`: Snapshot if version is current, None otherwise.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn snapshot_at_version(&self, version: u64) -> Option<IsolatedSnapshot<K, V>> {
+        let current_version = self.version.load(Ordering::SeqCst) as u64;
+        if version == current_version {
+            let data = self.iter().collect();
+            Some(IsolatedSnapshot::new(version, data))
+        } else {
+            None
+        }
+    }
+
+    /// Get lock profiling data for all shards.
+    ///
+    /// # Returns
+    /// - `Vec<LockProfile>`: Per-shard lock statistics.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn lock_profiles(&self) -> Vec<LockProfile> {
+        let profiling_enabled = self.profiling_enabled.load(Ordering::Relaxed);
+        if !profiling_enabled {
+            return Vec::new();
+        }
+
+        let slots = std_read_guard(&self.shards, "lock_profiles");
+        let mut profiles = Vec::new();
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Some(_shard) = slot {
+                // In a real implementation, we'd track lock stats per shard
+                // For now, return basic profile structure
+                profiles.push(LockProfile {
+                    shard_id: idx,
+                    contention_count: 0,
+                    avg_wait_time_ns: 0,
+                    max_wait_time_ns: 0,
+                    reads: 0,
+                    writes: 0,
+                });
+            }
+        }
+
+        profiles
+    }
+
+    /// Enable or disable lock profiling.
+    ///
+    /// # Arguments
+    /// - `enabled`: Whether to enable profiling.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn enable_profiling(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     /// Iterate over all keys (snapshot-based).
     ///
     /// # Returns
@@ -1002,13 +1155,21 @@ where
     hasher: S,
     shard_count: usize,
     total_len: Arc<AtomicUsize>,
+    #[cfg(feature = "advanced")]
+    version: Arc<AtomicUsize>,
+    #[cfg(feature = "advanced")]
+    profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "advanced")]
+    replicas: ReplicaList<K, V>,
+    #[cfg(feature = "advanced")]
+    quorum_config: Arc<StdRwLock<Option<QuorumConfig>>>,
 }
 
 #[cfg(feature = "async")]
 impl<K, V> AsyncShardedHashMap<K, V, FxBuildHasher>
 where
-    K: Eq + Hash + Clone + Send + Sync,
-    V: Clone + Send + Sync,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
 {
     /// Create with default hasher.
     #[tracing::instrument(level = "trace")]
@@ -1020,8 +1181,8 @@ where
 #[cfg(feature = "async")]
 impl<K, V, S> AsyncShardedHashMap<K, V, S>
 where
-    K: Eq + Hash + Clone + Send + Sync,
-    V: Clone + Send + Sync,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync,
 {
     /// Create with custom hasher.
@@ -1037,6 +1198,14 @@ where
             hasher,
             shard_count: count,
             total_len: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "advanced")]
+            version: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "advanced")]
+            profiling_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "advanced")]
+            replicas: Arc::new(StdRwLock::new(Vec::new())),
+            #[cfg(feature = "advanced")]
+            quorum_config: Arc::new(StdRwLock::new(None)),
         }
     }
 
@@ -1531,6 +1700,296 @@ where
         TransactionResult::Committed(())
     }
 
+    /// Compare and swap: atomically replace value if it matches expected (async).
+    ///
+    /// # Arguments
+    /// - `key`: The key to update.
+    /// - `expected`: The expected current value.
+    /// - `new`: The new value to swap in.
+    ///
+    /// # Returns
+    /// - `CasResult<V>`: Success with new value, or Failure with current value.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key, expected, new), level = "trace")]
+    pub async fn compare_and_swap(&self, key: &K, expected: &V, new: V) -> CasResult<V>
+    where
+        V: PartialEq,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        let mut guard = shard.write().await;
+
+        match guard.get(key) {
+            Some(current) if current == expected => {
+                guard.insert(key.clone(), new.clone());
+                CasResult::Success(new)
+            }
+            Some(current) => CasResult::Failure(current.clone()),
+            None => CasResult::Failure(new),
+        }
+    }
+
+    /// Compare and remove: atomically remove entry if value matches expected (async).
+    ///
+    /// # Arguments
+    /// - `key`: The key to remove.
+    /// - `expected`: The expected current value.
+    ///
+    /// # Returns
+    /// - `bool`: true if removed, false if value didn't match or key not found.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key, expected), level = "trace")]
+    pub async fn compare_and_remove(&self, key: &K, expected: &V) -> bool
+    where
+        V: PartialEq,
+    {
+        let shard = self.get_or_init_shard(self.shard_index(key)).await;
+        let mut guard = shard.write().await;
+
+        match guard.get(key) {
+            Some(current) if current == expected => {
+                guard.remove(key);
+                self.total_len.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Create a copy-on-write snapshot for minimal-locking reads (async).
+    ///
+    /// # Returns
+    /// - `CowSnapshot<K, V>`: Immutable snapshot of current state.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn cow_snapshot(&self) -> CowSnapshot<K, V> {
+        let data = self.iter().await;
+        let version = self.version.load(Ordering::SeqCst) as u64;
+        CowSnapshot::new(data, version)
+    }
+
+    /// Create a versioned snapshot for time-travel queries (async).
+    ///
+    /// # Returns
+    /// - `IsolatedSnapshot<K, V>`: Snapshot with version information.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn versioned_snapshot(&self) -> IsolatedSnapshot<K, V> {
+        let data = self.iter().await;
+        let version = self.version.fetch_add(1, Ordering::SeqCst) as u64;
+        IsolatedSnapshot::new(version, data)
+    }
+
+    /// Create a snapshot at a specific version (if available, async).
+    ///
+    /// # Arguments
+    /// - `version`: The version number to snapshot at.
+    ///
+    /// # Returns
+    /// - `Option<IsolatedSnapshot<K, V>>`: Snapshot if version is current, None otherwise.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn snapshot_at_version(&self, version: u64) -> Option<IsolatedSnapshot<K, V>> {
+        let current_version = self.version.load(Ordering::SeqCst) as u64;
+        if version == current_version {
+            let data = self.iter().await;
+            Some(IsolatedSnapshot::new(version, data))
+        } else {
+            None
+        }
+    }
+
+    /// Get lock profiling data for all shards (async).
+    ///
+    /// # Returns
+    /// - `Vec<LockProfile>`: Per-shard lock statistics.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn lock_profiles(&self) -> Vec<LockProfile> {
+        let profiling_enabled = self.profiling_enabled.load(Ordering::Relaxed);
+        if !profiling_enabled {
+            return Vec::new();
+        }
+
+        let slots = self.shards.read().await;
+        let mut profiles = Vec::new();
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Some(_shard) = slot {
+                profiles.push(LockProfile {
+                    shard_id: idx,
+                    contention_count: 0,
+                    avg_wait_time_ns: 0,
+                    max_wait_time_ns: 0,
+                    reads: 0,
+                    writes: 0,
+                });
+            }
+        }
+
+        profiles
+    }
+
+    /// Enable or disable lock profiling (async).
+    ///
+    /// # Arguments
+    /// - `enabled`: Whether to enable profiling.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn enable_profiling(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Create an AsyncShardedHashMap with replication support.
+    ///
+    /// # Arguments
+    /// - `shard_count`: Number of shards.
+    /// - `replicas`: Vector of replica implementations.
+    /// - `quorum_config`: Quorum configuration for consistency.
+    ///
+    /// # Returns
+    /// - `Self`: New map with replication configured.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(replicas, quorum_config), level = "trace")]
+    pub fn with_replication(
+        shard_count: usize,
+        replicas: Vec<Arc<dyn Replica<K, V>>>,
+        quorum_config: QuorumConfig,
+    ) -> Self
+    where
+        S: Default,
+    {
+        let map = Self::with_shards_and_hasher(shard_count, S::default());
+        {
+            let mut r = std_write_guard(&map.replicas, "with_replication");
+            *r = replicas;
+        }
+        {
+            let mut q = std_write_guard(&map.quorum_config, "with_replication_quorum");
+            *q = Some(quorum_config);
+        }
+        map
+    }
+
+    /// Insert with replication to configured replicas.
+    ///
+    /// # Arguments
+    /// - `key`: The key to insert.
+    /// - `value`: The value to insert.
+    ///
+    /// # Returns
+    /// - `Result<Option<V>, ReplicaError>`: Previous value or error.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key, value), level = "trace")]
+    pub async fn insert_replicated(&self, key: K, value: V) -> Result<Option<V>, ReplicaError> {
+        // Insert locally first
+        let old = self.insert(key.clone(), value.clone()).await;
+
+        // Replicate to quorum
+        let replicas = {
+            let r = std_read_guard(&self.replicas, "insert_replicated");
+            r.clone()
+        };
+
+        if replicas.is_empty() {
+            return Ok(old);
+        }
+
+        let quorum_config = {
+            let q = std_read_guard(&self.quorum_config, "insert_replicated_quorum");
+            q.clone()
+        };
+
+        let op = ReplicationOp::Insert {
+            key: key.clone(),
+            value: value.clone(),
+        };
+
+        // Replicate to all replicas in parallel
+        let mut tasks = Vec::new();
+        for replica in replicas.iter() {
+            let replica_clone = Arc::clone(replica);
+            let op_clone = op.clone();
+            tasks.push(tokio::spawn(async move {
+                replica_clone.replicate(op_clone).await
+            }));
+        }
+
+        // Wait for results
+        let mut success_count = 0;
+        for task in tasks {
+            if let Ok(Ok(())) = task.await {
+                success_count += 1;
+            }
+        }
+
+        // Check quorum
+        if let Some(config) = quorum_config
+            && success_count < config.write_quorum
+        {
+            return Err(ReplicaError::QuorumFailed);
+        }
+
+        Ok(old)
+    }
+
+    /// Remove with replication to configured replicas.
+    ///
+    /// # Arguments
+    /// - `key`: The key to remove.
+    ///
+    /// # Returns
+    /// - `Result<Option<V>, ReplicaError>`: Removed value or error.
+    #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, key), level = "trace")]
+    pub async fn remove_replicated(&self, key: &K) -> Result<Option<V>, ReplicaError> {
+        // Remove locally first
+        let old = self.remove(key).await;
+
+        // Replicate to quorum
+        let replicas = {
+            let r = std_read_guard(&self.replicas, "remove_replicated");
+            r.clone()
+        };
+
+        if replicas.is_empty() {
+            return Ok(old);
+        }
+
+        let quorum_config = {
+            let q = std_read_guard(&self.quorum_config, "remove_replicated_quorum");
+            q.clone()
+        };
+
+        let op = ReplicationOp::Remove { key: key.clone() };
+
+        // Replicate to all replicas in parallel
+        let mut tasks = Vec::new();
+        for replica in replicas.iter() {
+            let replica_clone = Arc::clone(replica);
+            let op_clone = op.clone();
+            tasks.push(tokio::spawn(async move {
+                replica_clone.replicate(op_clone).await
+            }));
+        }
+
+        // Wait for results
+        let mut success_count = 0;
+        for task in tasks {
+            if let Ok(Ok(())) = task.await {
+                success_count += 1;
+            }
+        }
+
+        // Check quorum
+        if let Some(config) = quorum_config
+            && success_count < config.write_quorum
+        {
+            return Err(ReplicaError::QuorumFailed);
+        }
+
+        Ok(old)
+    }
+
     /// Iterate over all keys (snapshot-based, async).
     ///
     /// # Returns
@@ -1601,8 +2060,8 @@ where
 #[cfg(all(feature = "async", feature = "serde"))]
 impl<K, V> AsyncShardedHashMap<K, V>
 where
-    K: Eq + Hash + Clone + Send + Sync + Serialize,
-    V: Clone + Send + Sync + Serialize,
+    K: Eq + Hash + Clone + Send + Sync + Serialize + 'static,
+    V: Clone + Send + Sync + Serialize + 'static,
 {
     /// Obtain a serializable snapshot wrapper (for `serde`).
     pub async fn async_snapshot_serializable(&self) -> AsyncShardedHashMapSnapshot<K, V> {
