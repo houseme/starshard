@@ -165,7 +165,7 @@ pub mod advanced;
 #[cfg(feature = "lifecycle")]
 pub use eviction::{
     AtomicMetrics, DrainIterator, EvictionConfig, EvictionPolicy, IterBuilder, MemoryStats,
-    MetricsStats,
+    MetricsStats, PerShardLoad,
 };
 
 // Re-export key v1.0.0 types
@@ -228,11 +228,38 @@ impl ShardStats {
     /// # Returns
     /// - `f64`: percentage of shards that have been initialized
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn utilization_percent(&self) -> f64 {
         if self.total == 0 {
             0.0
         } else {
             (self.initialized as f64 / self.total as f64) * 100.0
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Sync Lock Helpers (poisoned lock fallback + logging)                       */
+/* -------------------------------------------------------------------------- */
+
+#[inline]
+fn std_read_guard<'a, T>(lock: &'a StdRwLock<T>, context: &'static str) -> StdReadGuard<'a, T> {
+    match lock.read() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!(context = %context, "std rwlock poisoned (read)");
+            poisoned.into_inner()
+        }
+    }
+}
+
+#[inline]
+fn std_write_guard<'a, T>(lock: &'a StdRwLock<T>, context: &'static str) -> StdWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!(context = %context, "std rwlock poisoned (write)");
+            poisoned.into_inner()
         }
     }
 }
@@ -261,6 +288,7 @@ where
     V: Clone + Send + Sync,
 {
     /// Create with default hasher (`FxBuildHasher`).
+    #[tracing::instrument(level = "trace")]
     pub fn new(shard_count: usize) -> Self {
         Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
@@ -273,6 +301,7 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     /// Create with explicit hasher (non-zero shard count fallback).
+    #[tracing::instrument(skip(hasher), level = "trace")]
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
         let count = if shard_count == 0 {
             DEFAULT_SHARDS
@@ -289,29 +318,44 @@ where
     }
 
     /// Current configured shard slots.
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn shard_count(&self) -> usize {
         self.shard_count
     }
 
     /// Number of shards actually initialized (allocated).
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn initialized_shards(&self) -> usize {
-        let g = self.shards.read().unwrap();
+        let g = std_read_guard(&self.shards, "shards");
         g.iter().filter(|o| o.is_some()).count()
     }
 
     #[inline]
+    #[tracing::instrument(skip(self, key), level = "trace")]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count as u64) as usize
     }
 
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     fn get_or_init_shard(&self, index: usize) -> StdShard<K, V, S> {
-        let mut g = self.shards.write().unwrap();
+        let mut g = std_write_guard(&self.shards, "shards");
         if g[index].is_none() {
             let map = StdShardMap::with_hasher(self.hasher.clone());
             g[index] = Some(Arc::new(StdRwLock::new(map)));
         }
-        g[index].as_ref().unwrap().clone()
+        if let Some(shard) = g[index].as_ref() {
+            shard.clone()
+        } else {
+            tracing::error!(
+                shard_index = index,
+                "shard slot still uninitialized; creating fallback shard"
+            );
+            let map = StdShardMap::with_hasher(self.hasher.clone());
+            let shard = Arc::new(StdRwLock::new(map));
+            g[index] = Some(shard.clone());
+            shard
+        }
     }
 
     /// Insert key/value. Returns previous value if existed.
@@ -327,9 +371,10 @@ where
     /// # Returns
     /// - `Option<V>`: previous value if the key was already present.
     ///
+    #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(&key));
-        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
+        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
         let old = guard.insert(key, value);
         if old.is_none() {
             self.total_len.fetch_add(1, Ordering::Relaxed);
@@ -345,9 +390,10 @@ where
     /// # Returns
     /// - `Option<V>`: cloned value if the key exists.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn get(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
-        let guard: StdReadGuard<'_, HashMap<K, V, S>> = shard.read().unwrap();
+        let guard: StdReadGuard<'_, HashMap<K, V, S>> = std_read_guard(&shard, "shard");
         guard.get(key).cloned()
     }
 
@@ -359,9 +405,10 @@ where
     /// # Returns
     /// - `bool`: true if the key exists in the map, false otherwise.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn contains(&self, key: &K) -> bool {
         let shard = self.get_or_init_shard(self.shard_index(key));
-        let guard: StdReadGuard<'_, HashMap<K, V, S>> = shard.read().unwrap();
+        let guard: StdReadGuard<'_, HashMap<K, V, S>> = std_read_guard(&shard, "shard");
         guard.contains_key(key)
     }
 
@@ -373,9 +420,10 @@ where
     /// # Returns
     /// - `Option<V>`: previous value if the key existed.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn remove(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
-        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = shard.write().unwrap();
+        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
         let old = guard.remove(key);
         if old.is_some() {
             self.total_len.fetch_sub(1, Ordering::Relaxed);
@@ -389,16 +437,18 @@ where
     /// - `usize`: total number of key/value pairs in the map.
     ///
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
-    /// Whether empty.
+    /// Check if map is empty.
     ///
     /// # Returns
-    /// - `bool`: true if the map contains no entries.
+    /// - `bool`: true if length is zero, false otherwise.
     ///
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -408,10 +458,11 @@ where
     /// # Notes
     /// - Resets length counter to zero.
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn clear(&self) {
-        let slots = self.shards.read().unwrap();
+        let slots = std_read_guard(&self.shards, "shards");
         for shard in slots.iter().flatten() {
-            let mut g = shard.write().unwrap();
+            let mut g = std_write_guard(shard, "shard");
             g.clear();
         }
         self.total_len.store(0, Ordering::Relaxed);
@@ -432,9 +483,10 @@ where
     /// # Returns
     /// - `impl Iterator<Item = (K, V)>`: iterator over cloned key/value pairs.
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
         let shards_snapshot: Vec<StdShard<K, V, S>> = {
-            let g = self.shards.read().unwrap();
+            let g = std_read_guard(&self.shards, "shards");
             g.iter().filter_map(|o| o.as_ref().cloned()).collect()
         };
 
@@ -443,7 +495,7 @@ where
             let items: Vec<(K, V)> = shards_snapshot
                 .par_iter()
                 .flat_map(|shard| {
-                    let guard = shard.read().unwrap();
+                    let guard = std_read_guard(shard, "shard");
                     guard
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
@@ -457,14 +509,12 @@ where
         {
             let mut items = Vec::new();
             for shard in shards_snapshot {
-                let guard = shard.read().unwrap();
+                let guard = std_read_guard(&shard, "shard");
                 items.extend(guard.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             return items.into_iter();
         }
     }
-
-    /* ==================== v0.8.0 Sync Methods ==================== */
 
     /// Batch insert multiple key-value pairs.
     ///
@@ -474,12 +524,13 @@ where
     /// # Returns
     /// - `usize`: number of new entries inserted
     ///
+    #[tracing::instrument(skip(self, entries), level = "trace")]
     pub fn batch_insert<I>(&self, entries: I) -> usize
     where
         I: IntoIterator<Item = (K, V)>,
     {
         let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for (k, v) in entries {
             let shard_idx = self.shard_index(&k);
@@ -489,7 +540,7 @@ where
         let mut count = 0;
         for (shard_idx, pairs) in grouped {
             let shard = self.get_or_init_shard(shard_idx);
-            let mut guard = shard.write().unwrap();
+            let mut guard = std_write_guard(&shard, "shard");
             for (k, v) in pairs {
                 if guard.insert(k, v).is_none() {
                     count += 1;
@@ -510,12 +561,13 @@ where
     /// # Returns
     /// - `usize`: number of entries actually removed
     ///
+    #[tracing::instrument(skip(self, keys), level = "trace")]
     pub fn batch_remove<I>(&self, keys: I) -> usize
     where
         I: IntoIterator<Item = K>,
     {
         let mut grouped: std::collections::HashMap<usize, Vec<K>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for k in keys {
             let shard_idx = self.shard_index(&k);
@@ -525,7 +577,7 @@ where
         let mut count = 0;
         for (shard_idx, keys) in grouped {
             let shard = self.get_or_init_shard(shard_idx);
-            let mut guard = shard.write().unwrap();
+            let mut guard = std_write_guard(&shard, "shard");
             for k in keys {
                 if guard.remove(&k).is_some() {
                     count += 1;
@@ -546,10 +598,11 @@ where
     /// # Returns
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
+    #[tracing::instrument(skip(self, keys), level = "trace")]
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = vec![None; keys.len()];
         let mut grouped: std::collections::HashMap<usize, Vec<(usize, &K)>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for (idx, key) in keys.iter().enumerate() {
             let shard_idx = self.shard_index(key);
@@ -558,7 +611,7 @@ where
 
         for (shard_idx, items) in grouped {
             let shard = self.get_or_init_shard(shard_idx);
-            let guard = shard.read().unwrap();
+            let guard = std_read_guard(&shard, "shard");
             for (idx, key) in items {
                 if let Some(val) = guard.get(key) {
                     results[idx] = Some(val.clone());
@@ -577,12 +630,13 @@ where
     /// # Returns
     /// - `Option<V>`: the new value if the key existed and was updated, `None` otherwise.
     ///
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub fn compute_if_present<F>(&self, key: &K, f: F) -> Option<V>
     where
         F: FnOnce(&V) -> Option<V>,
     {
         let shard = self.get_or_init_shard(self.shard_index(key));
-        let mut guard = shard.write().unwrap();
+        let mut guard = std_write_guard(&shard, "shard");
 
         if let Some(old_val) = guard.get(key) {
             if let Some(new_val) = f(old_val) {
@@ -609,12 +663,13 @@ where
     /// # Returns
     /// - `V`: existing or newly inserted value.
     ///
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub fn compute_if_absent<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> V,
     {
         let shard = self.get_or_init_shard(self.shard_index(&key));
-        let mut guard = shard.write().unwrap();
+        let mut guard = std_write_guard(&shard, "shard");
 
         if let Some(val) = guard.get(&key) {
             val.clone()
@@ -633,12 +688,13 @@ where
     /// # Arguments
     /// - `predicate`: function that returns true to keep, false to remove
     ///
+    #[tracing::instrument(skip(self, predicate), level = "trace")]
     pub fn retain<F>(&self, predicate: F)
     where
         F: Fn(&K, &V) -> bool + Sync + Send,
     {
         let shards_snapshot: Vec<StdShard<K, V, S>> = {
-            let g = self.shards.read().unwrap();
+            let g = std_read_guard(&self.shards, "shards");
             g.iter().filter_map(|o| o.as_ref().cloned()).collect()
         };
 
@@ -647,7 +703,7 @@ where
             let removed_count: usize = shards_snapshot
                 .par_iter()
                 .map(|shard| {
-                    let mut guard = shard.write().unwrap();
+                    let mut guard = std_write_guard(shard, "shard");
                     let initial_len = guard.len();
                     guard.retain(|k, v| predicate(k, v));
                     initial_len - guard.len()
@@ -662,7 +718,7 @@ where
         #[cfg(not(feature = "rayon"))]
         {
             for shard in shards_snapshot {
-                let mut guard = shard.write().unwrap();
+                let mut guard = std_write_guard(&shard, "shard");
                 let removed_count = guard.len();
                 guard.retain(|k, v| predicate(k, v));
                 let removed = removed_count - guard.len();
@@ -684,6 +740,7 @@ where
     /// # Returns
     /// - `TransactionResult<()>`: The result of the transaction.
     #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, txn), level = "trace")]
     pub fn execute_transaction(&self, txn: Transaction<K, V>) -> TransactionResult<()> {
         // 1. Identify involved shards
         let mut shard_indices: Vec<usize> = txn
@@ -712,7 +769,7 @@ where
         for shard in &shards {
             // We must use write locks because we might modify the shards.
             // Even for read-only ops in a mixed transaction, we need consistent view.
-            let guard = shard.write().unwrap();
+            let guard = std_write_guard(shard, "transaction shard");
             guards.push(guard);
         }
 
@@ -725,7 +782,16 @@ where
             match op {
                 TxnOp::Read(k) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &guards[guard_idx];
                     // Just checking existence/value for now.
                     // In a real txn, we might return values.
@@ -734,7 +800,16 @@ where
                 }
                 TxnOp::Write(k, v) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &mut guards[guard_idx];
                     if guard.insert(k, v).is_none() {
                         self.total_len.fetch_add(1, Ordering::Relaxed);
@@ -742,7 +817,16 @@ where
                 }
                 TxnOp::Remove(k) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &mut guards[guard_idx];
                     if guard.remove(&k).is_some() {
                         self.total_len.fetch_sub(1, Ordering::Relaxed);
@@ -759,6 +843,7 @@ where
     /// # Returns
     /// - `Vec<K>`: vector of cloned keys
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn keys(&self) -> impl Iterator<Item = K> {
         self.iter().map(|(k, _)| k)
     }
@@ -768,6 +853,7 @@ where
     /// # Returns
     /// - `Vec<V>`: vector of cloned values
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn values(&self) -> impl Iterator<Item = V> {
         self.iter().map(|(_, v)| v)
     }
@@ -777,14 +863,15 @@ where
     /// # Returns
     /// - `ShardStats`: structure containing shard metrics
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn shard_stats(&self) -> ShardStats {
-        let slots = self.shards.read().unwrap();
+        let slots = std_read_guard(&self.shards, "shards");
         let mut initialized = 0;
         let mut loads = Vec::new();
 
         for shard in slots.iter().flatten() {
             initialized += 1;
-            let guard = shard.read().unwrap();
+            let guard = std_read_guard(shard, "shard");
             loads.push(guard.len());
         }
 
@@ -811,9 +898,30 @@ where
     /// # Returns
     /// - `f64`: percentage of shards that have been initialized
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn shard_utilization(&self) -> f64 {
         let stats = self.shard_stats();
         stats.utilization_percent()
+    }
+
+    /// Returns load statistics for each initialized shard.
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn per_shard_load(&self) -> Vec<PerShardLoad> {
+        let slots = std_read_guard(&self.shards, "shards");
+        let mut stats = Vec::new();
+
+        for (i, shard_opt) in slots.iter().enumerate() {
+            if let Some(shard) = shard_opt {
+                let guard = std_read_guard(shard, "shard");
+                stats.push(PerShardLoad {
+                    shard_idx: i,
+                    entry_count: guard.len(),
+                    capacity: guard.capacity(),
+                });
+            }
+        }
+        stats
     }
 }
 
@@ -903,13 +1011,7 @@ where
     V: Clone + Send + Sync,
 {
     /// Create with default hasher.
-    ///
-    /// # Arguments
-    /// - `shard_count`: number of shards (0 defaults to `DEFAULT_SHARDS`).
-    ///
-    /// # Returns
-    /// - `Self`: new async sharded hash map.
-    ///
+    #[tracing::instrument(level = "trace")]
     pub fn new(shard_count: usize) -> Self {
         Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
@@ -923,14 +1025,7 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     /// Create with custom hasher.
-    ///
-    /// # Arguments
-    /// - `shard_count`: number of shards (0 defaults to `DEFAULT_SHARDS
-    /// - `hasher`: user-supplied hasher instance.
-    ///
-    /// # Returns
-    /// - `Self`: new async sharded hash map.
-    ///
+    #[tracing::instrument(skip(hasher), level = "trace")]
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
         let count = if shard_count == 0 {
             DEFAULT_SHARDS
@@ -946,37 +1041,44 @@ where
     }
 
     /// Configured shard capacity.
-    ///
-    /// # Returns
-    /// - `usize`: number of shard slots.
-    ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn shard_count(&self) -> usize {
         self.shard_count
     }
 
     /// Number of initialized shards.
-    ///
-    /// # Returns
-    /// - `usize`: count of allocated shards.
-    ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn initialized_shards(&self) -> usize {
         let g = self.shards.read().await;
         g.iter().filter(|o| o.is_some()).count()
     }
 
     #[inline]
+    #[tracing::instrument(skip(self, key), level = "trace")]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count as u64) as usize
     }
 
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     async fn get_or_init_shard(&self, index: usize) -> AsyncShard<K, V, S> {
         let mut g = self.shards.write().await;
         if g[index].is_none() {
             let map = AsyncShardMap::with_hasher(self.hasher.clone());
             g[index] = Some(Arc::new(TokioRwLock::new(map)));
         }
-        g[index].as_ref().unwrap().clone()
+        if let Some(shard) = g[index].as_ref() {
+            shard.clone()
+        } else {
+            tracing::error!(
+                shard_index = index,
+                "async shard slot still uninitialized; creating fallback shard"
+            );
+            let map = AsyncShardMap::with_hasher(self.hasher.clone());
+            let shard = Arc::new(TokioRwLock::new(map));
+            g[index] = Some(shard.clone());
+            shard
+        }
     }
 
     /// Insert key/value asynchronously.
@@ -988,6 +1090,7 @@ where
     /// # Returns
     /// - `Option<V>`: previous value if the key was already present.
     ///
+    #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub async fn insert(&self, key: K, value: V) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(&key)).await;
         let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
@@ -1006,6 +1109,7 @@ where
     /// # Returns
     /// - `Option<V>`: cloned value if the key exists.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub async fn get(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         if let Ok(g) = shard.try_read() {
@@ -1023,6 +1127,7 @@ where
     /// # Returns
     /// - `bool`: true if the key exists in the map, false otherwise.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub async fn contains(&self, key: &K) -> bool {
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         if let Ok(g) = shard.try_read() {
@@ -1040,6 +1145,7 @@ where
     /// # Returns
     /// - `Option<V>`: previous value if the key existed.
     ///
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub async fn remove(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         let mut g = shard.write().await;
@@ -1056,16 +1162,18 @@ where
     /// - `usize`: total number of key/value pairs in the map.
     ///
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn len(&self) -> usize {
         self.total_len.load(Ordering::Relaxed)
     }
 
-    /// Empty check.
+    /// Check if map is empty.
     ///
     /// # Returns
-    /// - `bool`: true if the map contains no entries.
+    /// - `bool`: true if the map is empty, false otherwise.
     ///
     #[inline]
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
@@ -1075,6 +1183,7 @@ where
     /// # Notes
     /// - Resets length counter to zero.
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn clear(&self) {
         let slots = self.shards.read().await;
         for shard in slots.iter().flatten() {
@@ -1093,6 +1202,7 @@ where
     /// 4. If `rayon` enabled, parallel flatten of snapshots.
     ///
     /// Returns a materialized `Vec`.
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn iter(&self) -> Vec<(K, V)> {
         let shard_arcs: Vec<AsyncShard<K, V, S>> = {
             let g = self.shards.read().await;
@@ -1137,12 +1247,13 @@ where
     /// # Returns
     /// - `usize`: number of new entries inserted
     ///
+    #[tracing::instrument(skip(self, entries), level = "trace")]
     pub async fn batch_insert<I>(&self, entries: I) -> usize
     where
         I: IntoIterator<Item = (K, V)>,
     {
         let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for (k, v) in entries {
             let shard_idx = self.shard_index(&k);
@@ -1173,12 +1284,13 @@ where
     /// # Returns
     /// - `usize`: number of entries actually removed
     ///
+    #[tracing::instrument(skip(self, keys), level = "trace")]
     pub async fn batch_remove<I>(&self, keys: I) -> usize
     where
         I: IntoIterator<Item = K>,
     {
         let mut grouped: std::collections::HashMap<usize, Vec<K>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for k in keys {
             let shard_idx = self.shard_index(&k);
@@ -1209,10 +1321,11 @@ where
     /// # Returns
     /// - `Vec<Option<V>>`: results in same order as keys
     ///
+    #[tracing::instrument(skip(self, keys), level = "trace")]
     pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = vec![None; keys.len()];
         let mut grouped: std::collections::HashMap<usize, Vec<(usize, &K)>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
 
         for (idx, key) in keys.iter().enumerate() {
             let shard_idx = self.shard_index(key);
@@ -1240,6 +1353,7 @@ where
     /// # Returns
     /// - `Option<V>`: the new value if present, None if removed or key absent
     ///
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub async fn compute_if_present<F>(&self, key: &K, f: F) -> Option<V>
     where
         F: FnOnce(V) -> Option<V>,
@@ -1270,6 +1384,7 @@ where
     /// # Returns
     /// - `V`: either the existing value or newly inserted value
     ///
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub async fn compute_if_absent<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> V,
@@ -1294,6 +1409,7 @@ where
     /// # Arguments
     /// - `predicate`: function that returns true to keep, false to remove
     ///
+    #[tracing::instrument(skip(self, predicate), level = "trace")]
     pub async fn retain<F>(&self, predicate: F)
     where
         F: Fn(&K, &V) -> bool,
@@ -1325,6 +1441,7 @@ where
     /// # Returns
     /// - `TransactionResult<()>`: The result of the transaction.
     #[cfg(feature = "advanced")]
+    #[tracing::instrument(skip(self, txn), level = "trace")]
     pub async fn execute_transaction(&self, txn: Transaction<K, V>) -> TransactionResult<()> {
         // 1. Identify involved shards
         let mut shard_indices: Vec<usize> = txn
@@ -1342,15 +1459,17 @@ where
         shard_indices.dedup();
 
         // 3. Acquire locks (pessimistic locking: acquire all write locks)
-        let mut shards = Vec::with_capacity(shard_indices.len());
+        // Collect shard Arcs first to keep them alive
+        let mut shard_arcs = Vec::with_capacity(shard_indices.len());
         for &idx in &shard_indices {
-            shards.push(self.get_or_init_shard(idx).await);
+            shard_arcs.push(self.get_or_init_shard(idx).await);
         }
 
-        let mut guards = Vec::with_capacity(shards.len());
-        for shard in &shards {
+        // Now acquire write locks from the Arc references
+        let mut guards = Vec::with_capacity(shard_arcs.len());
+        for shard_arc in &shard_arcs {
             // We must use write locks because we might modify the shards.
-            let guard = shard.write().await;
+            let guard = shard_arc.write().await;
             guards.push(guard);
         }
 
@@ -1359,13 +1478,31 @@ where
             match op {
                 TxnOp::Read(k) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in async transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &guards[guard_idx];
                     let _ = guard.get(&k);
                 }
                 TxnOp::Write(k, v) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in async transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &mut guards[guard_idx];
                     if guard.insert(k, v).is_none() {
                         self.total_len.fetch_add(1, Ordering::Relaxed);
@@ -1373,7 +1510,16 @@ where
                 }
                 TxnOp::Remove(k) => {
                     let idx = self.shard_index(&k);
-                    let guard_idx = shard_indices.binary_search(&idx).unwrap();
+                    let guard_idx = match shard_indices.binary_search(&idx) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            tracing::error!(
+                                shard_index = idx,
+                                "shard index missing in async transaction"
+                            );
+                            return TransactionResult::Aborted;
+                        }
+                    };
                     let guard = &mut guards[guard_idx];
                     if guard.remove(&k).is_some() {
                         self.total_len.fetch_sub(1, Ordering::Relaxed);
@@ -1390,6 +1536,7 @@ where
     /// # Returns
     /// - `Vec<K>`: vector of cloned keys
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn keys(&self) -> Vec<K> {
         self.iter().await.into_iter().map(|(k, _)| k).collect()
     }
@@ -1399,6 +1546,7 @@ where
     /// # Returns
     /// - `Vec<V>`: vector of cloned values
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn values(&self) -> Vec<V> {
         self.iter().await.into_iter().map(|(_, v)| v).collect()
     }
@@ -1408,6 +1556,7 @@ where
     /// # Returns
     /// - `ShardStats`: structure containing shard metrics
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn shard_stats(&self) -> ShardStats {
         let slots = self.shards.read().await;
         let mut initialized = 0;
@@ -1442,6 +1591,7 @@ where
     /// # Returns
     /// - `f64`: percentage of shards that have been initialized
     ///
+    #[tracing::instrument(skip(self), level = "trace")]
     pub async fn shard_utilization(&self) -> f64 {
         let stats = self.shard_stats().await;
         stats.utilization_percent()

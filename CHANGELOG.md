@@ -2,20 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Shard Introspection**:
+    - `per_shard_load()`: Returns detailed load statistics (`PerShardLoad`) for each initialized shard, including entry
+      count and capacity. Available for both `ShardedHashMap` and `AsyncShardedHashMap` when the `lifecycle` feature is
+      enabled.
+
+- **Logging**:
+    - Added `#[tracing::instrument]` to public APIs and core helpers across sync/async maps and lifecycle/advanced
+      modules.
+
+### Changed
+
+- **Robust Error Handling**:
+    - Replaced `unwrap()` in shard initialization and transaction shard lookup with logged fallbacks; transactions abort
+      safely on missing shard indices.
+- **Refactoring**:
+    - Introduced shared std `RwLock` guard helpers to reduce repetitive poisoned-lock handling.
+
 ## [1.0.1] - 2026-02-02
 
 ### Changed
 
 - **Feature Consolidation**:
     - Merged `ttl`, `metrics`, and `advanced-iter` features into a single `lifecycle` feature.
-    - Merged `transactions`, `cas`, `cow-snapshot`, `replication`, and `diagnostics` features into a single `advanced` feature.
+    - Merged `transactions`, `cas`, `cow-snapshot`, `replication`, and `diagnostics` features into a single `advanced`
+      feature.
     - Promoted `batch` operations to core functionality (removed `batch` feature flag).
     - Updated `full` feature to include `async`, `rayon`, `serde`, `lifecycle`, and `advanced`.
 
 ### Optimized
 
 - **Batch Operations**:
-    - Optimized `batch_insert` and `batch_remove` to acquire the shard lock only once per shard group, significantly reducing lock contention.
+    - Optimized `batch_insert` and `batch_remove` to acquire the shard lock only once per shard group, significantly
+      reducing lock contention.
 
 ## [1.0.0] - 2026-02-01
 

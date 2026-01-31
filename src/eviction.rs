@@ -4,7 +4,6 @@
 //! and advanced iteration patterns for the Starshard sharded HashMap.
 
 /// Eviction policy for cache entries.
-#[cfg(feature = "lifecycle")]
 #[derive(Clone)]
 pub enum EvictionPolicy {
     /// Least Recently Used: removes least recently accessed entries
@@ -17,8 +16,8 @@ pub enum EvictionPolicy {
     Custom(std::sync::Arc<dyn Fn() -> bool + Send + Sync>),
 }
 
-#[cfg(feature = "lifecycle")]
 impl std::fmt::Debug for EvictionPolicy {
+    #[tracing::instrument(skip(self, f), level = "trace")]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EvictionPolicy::Lru => f.write_str("LRU"),
@@ -32,7 +31,6 @@ impl std::fmt::Debug for EvictionPolicy {
 }
 
 /// Configuration for eviction behavior.
-#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct EvictionConfig {
     /// The eviction policy to apply
@@ -49,8 +47,8 @@ pub struct EvictionConfig {
     pub background_enabled: bool,
 }
 
-#[cfg(feature = "lifecycle")]
 impl Default for EvictionConfig {
+    #[tracing::instrument(level = "trace")]
     fn default() -> Self {
         Self {
             policy: EvictionPolicy::Lru,
@@ -64,7 +62,6 @@ impl Default for EvictionConfig {
 }
 
 /// Per-shard eviction statistics.
-#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone, Default)]
 pub struct ShardEvictionStats {
     /// Total evictions performed on this shard
@@ -78,7 +75,6 @@ pub struct ShardEvictionStats {
 }
 
 /// Metrics collected during operation.
-#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct MetricsStats {
     /// Total insert operations
@@ -100,6 +96,7 @@ pub struct MetricsStats {
 }
 
 impl Default for MetricsStats {
+    #[tracing::instrument(level = "trace")]
     fn default() -> Self {
         Self {
             total_inserts: 0,
@@ -115,7 +112,6 @@ impl Default for MetricsStats {
 }
 
 /// Internal atomic counters for metrics.
-#[cfg(feature = "lifecycle")]
 pub struct AtomicMetrics {
     /// Total insert operations.
     pub inserts: std::sync::atomic::AtomicU64,
@@ -131,8 +127,8 @@ pub struct AtomicMetrics {
     pub evictions: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "lifecycle")]
 impl Default for AtomicMetrics {
+    #[tracing::instrument(level = "trace")]
     fn default() -> Self {
         Self {
             inserts: std::sync::atomic::AtomicU64::new(0),
@@ -145,9 +141,9 @@ impl Default for AtomicMetrics {
     }
 }
 
-#[cfg(feature = "lifecycle")]
 impl AtomicMetrics {
     /// Create snapshot of current metrics
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn snapshot(&self) -> MetricsStats {
         let total_gets = self.gets.load(std::sync::atomic::Ordering::Relaxed);
         let hits = self.hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -170,6 +166,7 @@ impl AtomicMetrics {
     }
 
     /// Reset all metrics to zero
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn reset(&self) {
         self.inserts.store(0, std::sync::atomic::Ordering::Relaxed);
         self.removes.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -182,7 +179,6 @@ impl AtomicMetrics {
 }
 
 /// Memory utilization statistics.
-#[cfg(feature = "lifecycle")]
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
     /// Number of initialized shards
@@ -194,10 +190,8 @@ pub struct MemoryStats {
 }
 
 /// Iterator builder for advanced iteration control.
-#[cfg(feature = "lifecycle")]
 type IterFilter<K, V> = std::sync::Arc<dyn Fn(&K, &V) -> bool + Send + Sync>;
 
-#[cfg(feature = "lifecycle")]
 /// Builder for creating customized iterators over the HashMap.
 pub struct IterBuilder<K, V> {
     /// Optional filter predicate
@@ -210,9 +204,9 @@ pub struct IterBuilder<K, V> {
     pub(crate) parallel: bool,
 }
 
-#[cfg(feature = "lifecycle")]
 impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     /// Create new iterator builder
+    #[tracing::instrument(level = "trace")]
     pub fn new() -> Self {
         Self {
             filter: None,
@@ -222,24 +216,28 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     }
 
     /// Add a filter predicate
+    #[tracing::instrument(skip(self, f), level = "trace")]
     pub fn filter<F: Fn(&K, &V) -> bool + Send + Sync + 'static>(mut self, f: F) -> Self {
         self.filter = Some(std::sync::Arc::new(f));
         self
     }
 
     /// Set maximum result count
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
     }
 
     /// Enable or disable parallel processing
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn parallel(mut self, enabled: bool) -> Self {
         self.parallel = enabled;
         self
     }
 
     /// Execute the iteration and collect results
+    #[tracing::instrument(skip(self, items), level = "trace")]
     pub fn collect(&self, items: Vec<(K, V)>) -> Vec<(K, V)> {
         let mut result = items;
 
@@ -255,6 +253,7 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     }
 
     /// Execute the iteration with a callback
+    #[tracing::instrument(skip(self, items, f), level = "trace")]
     pub fn for_each<F: Fn((K, V))>(&self, items: Vec<(K, V)>, f: F) {
         let items = self.collect(items);
         for item in items {
@@ -263,15 +262,14 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
     }
 }
 
-#[cfg(feature = "lifecycle")]
 impl<K: Clone + Send + Sync, V: Clone + Send + Sync> Default for IterBuilder<K, V> {
+    #[tracing::instrument(level = "trace")]
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// Drain iterator for bulk removal.
-#[cfg(feature = "lifecycle")]
 pub struct DrainIterator<K, V> {
     /// All items to drain
     pub(crate) items: Vec<(K, V)>,
@@ -279,10 +277,10 @@ pub struct DrainIterator<K, V> {
     pub(crate) index: usize,
 }
 
-#[cfg(feature = "lifecycle")]
 impl<K, V> Iterator for DrainIterator<K, V> {
     type Item = (K, V);
 
+    #[tracing::instrument(skip(self), level = "trace")]
     fn next(&mut self) -> Option<(K, V)> {
         if self.index < self.items.len() {
             let item = self.items.swap_remove(self.index);
@@ -293,8 +291,8 @@ impl<K, V> Iterator for DrainIterator<K, V> {
     }
 }
 
-#[cfg(feature = "lifecycle")]
 impl<K, V> ExactSizeIterator for DrainIterator<K, V> {
+    #[tracing::instrument(skip(self), level = "trace")]
     fn len(&self) -> usize {
         self.items.len() - self.index
     }
@@ -313,38 +311,36 @@ pub struct PerShardLoad {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "lifecycle")]
+    use crate::{AtomicMetrics, DrainIterator, EvictionConfig, IterBuilder};
+
     #[test]
     fn eviction_config_default() {
-        let config = crate::EvictionConfig::default();
+        let config = EvictionConfig::default();
         assert_eq!(config.check_interval, std::time::Duration::from_secs(60));
         assert!(config.background_enabled);
         assert_eq!(config.max_entries, None);
     }
 
-    #[cfg(feature = "lifecycle")]
     #[test]
     fn atomic_metrics_default() {
-        let metrics = crate::AtomicMetrics::default();
+        let metrics = AtomicMetrics::default();
         let snap = metrics.snapshot();
         assert_eq!(snap.total_inserts, 0);
         assert_eq!(snap.hit_rate, 0.0);
     }
 
-    #[cfg(feature = "lifecycle")]
     #[test]
     fn atomic_metrics_hit_rate() {
-        let metrics = crate::AtomicMetrics::default();
+        let metrics = AtomicMetrics::default();
         metrics.gets.store(10, std::sync::atomic::Ordering::Relaxed);
         metrics.hits.store(7, std::sync::atomic::Ordering::Relaxed);
         let snap = metrics.snapshot();
         assert!((snap.hit_rate - 0.7).abs() < 0.01);
     }
 
-    #[cfg(feature = "lifecycle")]
     #[test]
     fn iter_builder_filter() {
-        let builder = crate::IterBuilder::<String, i32>::new()
+        let builder = IterBuilder::<String, i32>::new()
             .filter(|_, v| v > &10)
             .limit(5);
 
@@ -353,10 +349,9 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
-    #[cfg(feature = "lifecycle")]
     #[test]
     fn drain_iterator() {
-        let drain = crate::DrainIterator {
+        let drain = DrainIterator {
             items: vec![("a", 1), ("b", 2), ("c", 3)],
             index: 0,
         };

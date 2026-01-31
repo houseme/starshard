@@ -46,6 +46,7 @@ pub struct Transaction<K, V> {
 
 impl<K: Clone, V: Clone> Transaction<K, V> {
     /// Create new transaction
+    #[tracing::instrument(level = "trace")]
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
@@ -56,35 +57,41 @@ impl<K: Clone, V: Clone> Transaction<K, V> {
     }
 
     /// Add a read operation
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn read(&mut self, key: K) {
         self.read_set.push(key.clone());
         self.ops.push(TxnOp::Read(key));
     }
 
     /// Add a write operation
+    #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub fn write(&mut self, key: K, value: V) {
         self.write_set.push(key.clone());
         self.ops.push(TxnOp::Write(key, value));
     }
 
     /// Add a remove operation
+    #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn remove(&mut self, key: K) {
         self.write_set.push(key.clone());
         self.ops.push(TxnOp::Remove(key));
     }
 
     /// Get operation count
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
     /// Check if transaction is empty
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 }
 
 impl<K: Clone, V: Clone> Default for Transaction<K, V> {
+    #[tracing::instrument(level = "trace")]
     fn default() -> Self {
         Self::new()
     }
@@ -101,11 +108,13 @@ pub enum CasResult<V> {
 
 impl<V> CasResult<V> {
     /// Check if operation succeeded
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_success(&self) -> bool {
         matches!(self, CasResult::Success(_))
     }
 
     /// Extract the value
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn into_value(self) -> V {
         match self {
             CasResult::Success(v) | CasResult::Failure(v) => v,
@@ -123,6 +132,7 @@ pub struct CowSnapshot<K, V> {
 
 impl<K: Clone, V: Clone> CowSnapshot<K, V> {
     /// Create new CoW snapshot
+    #[tracing::instrument(skip(data), level = "trace")]
     pub fn new(data: Vec<(K, V)>, version: u64) -> Self {
         Self {
             data: std::sync::Arc::new(data),
@@ -131,21 +141,25 @@ impl<K: Clone, V: Clone> CowSnapshot<K, V> {
     }
 
     /// Get snapshot version
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn version(&self) -> u64 {
         self.version
     }
 
     /// Iterate over snapshot data
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn iter(&self) -> impl Iterator<Item = &(K, V)> {
         self.data.iter()
     }
 
     /// Get count of entries
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Check if snapshot is empty
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -197,6 +211,7 @@ where
     async fn fetch_state(&self) -> Result<Vec<(K, V)>, ReplicaError>;
 
     /// Verify replica health
+    #[tracing::instrument(skip(self), level = "trace")]
     async fn health_check(&self) -> Result<bool, ReplicaError> {
         Ok(true)
     }
@@ -232,6 +247,7 @@ pub struct IsolatedSnapshot<K, V> {
 
 impl<K, V> IsolatedSnapshot<K, V> {
     /// Create new isolated snapshot
+    #[tracing::instrument(skip(data), level = "trace")]
     pub fn new(version: u64, data: Vec<(K, V)>) -> Self {
         Self {
             version,
@@ -241,21 +257,25 @@ impl<K, V> IsolatedSnapshot<K, V> {
     }
 
     /// Get snapshot version
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn version(&self) -> u64 {
         self.version
     }
 
     /// Get snapshot age
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn age(&self) -> std::time::Duration {
         std::time::Instant::now().saturating_duration_since(self.timestamp)
     }
 
     /// Get entry count
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Check if empty
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -276,6 +296,7 @@ pub struct QuorumConfig {
 
 impl QuorumConfig {
     /// Create strict quorum config (all replicas)
+    #[tracing::instrument(level = "trace")]
     pub fn strict(replica_count: usize) -> Self {
         Self {
             replica_count,
@@ -286,6 +307,7 @@ impl QuorumConfig {
     }
 
     /// Create majority quorum config
+    #[tracing::instrument(level = "trace")]
     pub fn majority(replica_count: usize) -> Self {
         let quorum = (replica_count / 2) + 1;
         Self {
@@ -297,6 +319,7 @@ impl QuorumConfig {
     }
 
     /// Validate configuration
+    #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_valid(&self) -> bool {
         self.write_quorum > self.replica_count / 2
             && self.read_quorum > 0
@@ -314,14 +337,14 @@ mod tests {
 
     #[test]
     fn transaction_creation() {
-        let txn: crate::Transaction<String, i32> = crate::Transaction::new();
+        let txn: Transaction<String, i32> = Transaction::new();
         assert!(txn.is_empty());
         assert_eq!(txn.len(), 0);
     }
 
     #[test]
     fn transaction_operations() {
-        let mut txn: crate::Transaction<String, i32> = crate::Transaction::new();
+        let mut txn: Transaction<String, i32> = Transaction::new();
         txn.read("a".into());
         txn.write("b".into(), 10);
         txn.remove("c".into());
@@ -330,31 +353,31 @@ mod tests {
 
     #[test]
     fn cas_result_is_success() {
-        let success: crate::CasResult<i32> = crate::CasResult::Success(42);
+        let success: CasResult<i32> = CasResult::Success(42);
         assert!(success.is_success());
 
-        let failure: crate::CasResult<i32> = crate::CasResult::Failure(42);
+        let failure: CasResult<i32> = CasResult::Failure(42);
         assert!(!failure.is_success());
     }
 
     #[test]
     fn cow_snapshot_creation() {
         let data = vec![("a", 1), ("b", 2)];
-        let snap = crate::CowSnapshot::new(data, 1);
+        let snap = CowSnapshot::new(data, 1);
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.version(), 1);
     }
 
     #[test]
     fn quorum_config_majority() {
-        let config = crate::QuorumConfig::majority(5);
+        let config = QuorumConfig::majority(5);
         assert!(config.is_valid());
         assert_eq!(config.write_quorum, 3);
     }
 
     #[test]
     fn quorum_config_strict() {
-        let config = crate::QuorumConfig::strict(3);
+        let config = QuorumConfig::strict(3);
         assert!(config.is_valid());
         assert_eq!(config.write_quorum, 3);
         assert_eq!(config.read_quorum, 3);
@@ -363,7 +386,7 @@ mod tests {
     #[test]
     fn isolated_snapshot() {
         let data = vec![("a", 1), ("b", 2)];
-        let snap = crate::IsolatedSnapshot::new(1, data);
+        let snap = IsolatedSnapshot::new(1, data);
         assert_eq!(snap.version(), 1);
         assert_eq!(snap.len(), 2);
         assert!(snap.age() >= std::time::Duration::ZERO);
