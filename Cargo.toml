@@ -15,7 +15,7 @@ resolver = "3"
 exclude = ["/examples/*", "/tests/*"]
 
 [dependencies]
-hashbrown = { version = "0.16", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 rustc-hash = "2.1"
 rayon = { version = "1.11", optional = true }
 tokio = { version = "1.49", optional = true, default-features = false, features = ["sync", "rt-multi-thread"] }
