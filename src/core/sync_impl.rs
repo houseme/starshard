@@ -123,6 +123,125 @@ where
     }
 
     #[inline]
+    fn previous_shard_index(&self, key: &K) -> Option<usize> {
+        let prev_count = self.previous_shard_count.load(Ordering::Relaxed);
+        if prev_count == 0 {
+            None
+        } else {
+            Some((self.hasher.hash_one(key) % prev_count as u64) as usize)
+        }
+    }
+
+    fn previous_get(&self, key: &K) -> Option<V> {
+        let idx = self.previous_shard_index(key)?;
+        let prev = std_read_guard(&self.previous_shards, "previous_shards_read");
+        let shards = prev.as_ref()?;
+        let shard = shards.get(idx)?.as_ref()?.clone();
+        let guard = std_read_guard(&shard, "previous_shard_read");
+        guard.get(key).cloned()
+    }
+
+    fn previous_contains(&self, key: &K) -> bool {
+        self.previous_get(key).is_some()
+    }
+
+    fn previous_remove(&self, key: &K) -> Option<V> {
+        let idx = self.previous_shard_index(key)?;
+        let prev = std_write_guard(&self.previous_shards, "previous_shards_write");
+        let shards = prev.as_ref()?;
+        let shard = shards.get(idx)?.as_ref()?.clone();
+        drop(prev);
+        let mut guard = std_write_guard(&shard, "previous_shard_write");
+        guard.remove(key)
+    }
+
+    /// Start an online incremental rebalance.
+    ///
+    /// Writes route to the new active shard epoch immediately; reads fallback to previous
+    /// shards until migration is fully advanced via `advance_rebalance`.
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn start_rebalance_online(&self, new_shard_count: usize) -> Result<(), ShardCountError> {
+        let _rebalance_guard = self.rebalance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
+        if self.rebalance_status().state == "migrating" {
+            return Ok(());
+        }
+        let current = self.shard_count();
+        if target == current {
+            return Ok(());
+        }
+
+        let mut active = std_write_guard(&self.shards, "start_online_rebalance_active");
+        let old_active = std::mem::replace(&mut *active, vec![None; target]);
+        let total_shards = old_active.len();
+        {
+            let mut prev = std_write_guard(&self.previous_shards, "start_online_rebalance_prev");
+            *prev = Some(old_active);
+        }
+        self.previous_shard_count.store(current, Ordering::Relaxed);
+        self.shard_count.store(target, Ordering::Relaxed);
+        self.rebalance_tracker.begin(total_shards);
+        Ok(())
+    }
+
+    /// Advance online rebalance by up to `max_shards` source shards.
+    ///
+    /// Returns number of source shards processed in this call.
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn advance_rebalance(&self, max_shards: usize) -> usize {
+        if max_shards == 0 || self.rebalance_status().state != "migrating" {
+            return 0;
+        }
+
+        let mut processed = 0usize;
+        for _ in 0..max_shards {
+            let status = self.rebalance_tracker.snapshot();
+            if status.state != "migrating" || status.moved_shards >= status.total_shards {
+                break;
+            }
+            let idx = status.moved_shards;
+            let source_shard = {
+                let mut prev = std_write_guard(&self.previous_shards, "advance_rebalance_prev_take");
+                let Some(shards) = prev.as_mut() else {
+                    break;
+                };
+                if idx >= shards.len() {
+                    break;
+                }
+                shards[idx].take()
+            };
+
+            if let Some(shard) = source_shard {
+                let snapshot: Vec<(K, V)> = {
+                    let guard = std_read_guard(&shard, "advance_rebalance_source_read");
+                    guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                };
+                for (k, v) in snapshot {
+                    let target_idx = self.shard_index(&k);
+                    let target = self.get_or_init_shard(target_idx);
+                    let mut guard = std_write_guard(&target, "advance_rebalance_target_write");
+                    guard.entry(k).or_insert(v);
+                }
+            }
+
+            self.rebalance_tracker.step();
+            processed += 1;
+        }
+
+        let status = self.rebalance_tracker.snapshot();
+        if status.state == "migrating" && status.moved_shards >= status.total_shards {
+            {
+                let mut prev = std_write_guard(&self.previous_shards, "advance_rebalance_finish_prev");
+                *prev = None;
+            }
+            self.previous_shard_count.store(0, Ordering::Relaxed);
+            self.rebalance_tracker.finish();
+        }
+
+        processed
+    }
+
+    #[inline]
     #[tracing::instrument(skip(self, key), level = "trace")]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count() as u64) as usize
@@ -283,13 +402,20 @@ where
     ///
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
+        let previous_old = self.previous_get(&key);
         let shard = self.get_or_init_shard(self.shard_index(&key));
-        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
-        let old = guard.insert(key, value);
+        let old = {
+            let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
+            guard.insert(key, value)
+        };
         if old.is_none() {
-            self.total_len.fetch_add(1, Ordering::Relaxed);
+            if previous_old.is_none() {
+                self.total_len.fetch_add(1, Ordering::Relaxed);
+            }
+            previous_old
+        } else {
+            old
         }
-        old
     }
 
     /// Fetch cloned value.
@@ -304,7 +430,12 @@ where
     pub fn get(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
         let guard: StdReadGuard<'_, HashMap<K, V, S>> = std_read_guard(&shard, "shard");
-        guard.get(key).cloned()
+        if let Some(v) = guard.get(key) {
+            Some(v.clone())
+        } else {
+            drop(guard);
+            self.previous_get(key)
+        }
     }
 
     /// Check if a key exists (returns bool without cloning the value).
@@ -319,7 +450,12 @@ where
     pub fn contains(&self, key: &K) -> bool {
         let shard = self.get_or_init_shard(self.shard_index(key));
         let guard: StdReadGuard<'_, HashMap<K, V, S>> = std_read_guard(&shard, "shard");
-        guard.contains_key(key)
+        if guard.contains_key(key) {
+            true
+        } else {
+            drop(guard);
+            self.previous_contains(key)
+        }
     }
 
     /// Remove key, returning previous value.
@@ -333,12 +469,21 @@ where
     #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn remove(&self, key: &K) -> Option<V> {
         let shard = self.get_or_init_shard(self.shard_index(key));
-        let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
-        let old = guard.remove(key);
-        if old.is_some() {
+        let old = {
+            let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
+            guard.remove(key)
+        };
+        if let Some(old_val) = old {
             self.total_len.fetch_sub(1, Ordering::Relaxed);
+            let _ = self.previous_remove(key);
+            Some(old_val)
+        } else {
+            let prev = self.previous_remove(key);
+            if prev.is_some() {
+                self.total_len.fetch_sub(1, Ordering::Relaxed);
+            }
+            prev
         }
-        old
     }
 
     /// Length (cached atomic).

@@ -591,6 +591,37 @@ mod tests {
         assert_eq!(status_after.moved_shards, 0);
     }
 
+    #[test]
+    fn sync_online_rebalance_incremental_migration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..120 {
+            m.insert(format!("k{i}"), i);
+        }
+        assert_eq!(m.len(), 120);
+        m.start_rebalance_online(16)
+            .expect("online rebalance start should succeed");
+        assert_eq!(m.rebalance_status().state, "migrating");
+        assert_eq!(m.get(&"k3".to_string()), Some(3));
+
+        assert_eq!(m.remove(&"k42".to_string()), Some(42));
+        assert_eq!(m.insert("hot".to_string(), 777), None);
+
+        while m.rebalance_status().state == "migrating" {
+            let advanced = m.advance_rebalance(2);
+            assert!(advanced <= 2);
+            if advanced == 0 {
+                break;
+            }
+        }
+
+        let status = m.rebalance_status();
+        assert_eq!(status.state, "idle");
+        assert_eq!(m.shard_count(), 16);
+        assert_eq!(m.get(&"k42".to_string()), None);
+        assert_eq!(m.get(&"hot".to_string()), Some(777));
+        assert_eq!(m.len(), 120);
+    }
+
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_basic() {
@@ -740,6 +771,39 @@ mod tests {
         assert_eq!(status_after.state, "idle");
         assert_eq!(status_after.total_shards, 0);
         assert_eq!(status_after.moved_shards, 0);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_online_rebalance_incremental_migration() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..120 {
+            m.insert(format!("k{i}"), i).await;
+        }
+        assert_eq!(m.len().await, 120);
+        m.start_rebalance_online(32)
+            .await
+            .expect("online rebalance start should succeed");
+        assert_eq!(m.rebalance_status().state, "migrating");
+        assert_eq!(m.get(&"k3".to_string()).await, Some(3));
+
+        assert_eq!(m.remove(&"k42".to_string()).await, Some(42));
+        assert_eq!(m.insert("hot".to_string(), 888).await, None);
+
+        while m.rebalance_status().state == "migrating" {
+            let advanced = m.advance_rebalance(2).await;
+            assert!(advanced <= 2);
+            if advanced == 0 {
+                break;
+            }
+        }
+
+        let status = m.rebalance_status();
+        assert_eq!(status.state, "idle");
+        assert_eq!(m.shard_count(), 32);
+        assert_eq!(m.get(&"k42".to_string()).await, None);
+        assert_eq!(m.get(&"hot".to_string()).await, Some(888));
+        assert_eq!(m.len().await, 120);
     }
 
     #[cfg(feature = "serde")]
