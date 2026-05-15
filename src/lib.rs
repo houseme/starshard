@@ -67,14 +67,15 @@ Hasher Choice
 Limitations
 ------------
 - No dynamic shard rebalancing / rehash across shards yet.
-- No eviction / TTL (can be layered externally).
+- Lifecycle features currently provide introspection/utilities (e.g. per-shard load, drain, memory stats),
+  but do not implement a built-in autonomous TTL eviction engine.
 - Iteration allocates temporary vectors proportional to initialized shards (to snapshot).
 - Not lock-free; large writer pressure can still cause convoying on hot shards.
 
 Future Extension Ideas
 -----------------------
 - Optional background shard growth / rebalancing.
-- Configurable eviction: LRU per shard / clock / segmented queue.
+- Built-in configurable eviction scheduler integration (LRU per shard / clock / segmented queue).
 - Metrics hooks (pre/post op).
 - Batched mutation (multi-insert with single lock acquisition per target shard).
 - Optional copy-on-write snapshots for near-zero iteration locking windows.
@@ -1029,7 +1030,7 @@ where
         }
 
         let total = slots.len();
-        let empty = initialized - loads.iter().filter(|&&l| l == 0).count();
+        let empty = loads.iter().filter(|&&l| l == 0).count();
         let max_load = loads.iter().max().copied().unwrap_or(0);
         let avg_load = if initialized > 0 {
             loads.iter().sum::<usize>() as f64 / initialized as f64
@@ -1075,6 +1076,54 @@ where
             }
         }
         stats
+    }
+
+    /// Returns current memory-oriented shard statistics.
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn memory_stats(&self) -> MemoryStats {
+        let slots = std_read_guard(&self.shards, "shards");
+        let mut shards_allocated = 0;
+        let mut total_capacity = 0usize;
+        let mut total_entries = 0usize;
+
+        for shard in slots.iter().flatten() {
+            shards_allocated += 1;
+            let guard = std_read_guard(shard, "shard");
+            total_capacity += guard.capacity();
+            total_entries += guard.len();
+        }
+
+        let load_factor = if total_capacity > 0 {
+            total_entries as f64 / total_capacity as f64
+        } else {
+            0.0
+        };
+
+        MemoryStats {
+            shards_allocated,
+            total_capacity,
+            load_factor,
+        }
+    }
+
+    /// Drains all entries from the map and returns them as an iterator.
+    ///
+    /// Shard allocations are retained.
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn drain(&self) -> DrainIterator<K, V> {
+        let slots = std_read_guard(&self.shards, "shards");
+        let mut items = Vec::new();
+
+        for shard in slots.iter().flatten() {
+            let mut guard = std_write_guard(shard, "shard");
+            items.extend(guard.drain());
+        }
+
+        self.total_len.store(0, Ordering::Relaxed);
+
+        DrainIterator { items, index: 0 }
     }
 }
 
@@ -2028,7 +2077,7 @@ where
         }
 
         let total = slots.len();
-        let empty = initialized - loads.iter().filter(|&&l| l == 0).count();
+        let empty = loads.iter().filter(|&&l| l == 0).count();
         let max_load = loads.iter().max().copied().unwrap_or(0);
         let avg_load = if initialized > 0 {
             loads.iter().sum::<usize>() as f64 / initialized as f64
@@ -2054,6 +2103,75 @@ where
     pub async fn shard_utilization(&self) -> f64 {
         let stats = self.shard_stats().await;
         stats.utilization_percent()
+    }
+
+    /// Returns load statistics for each initialized shard (async).
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn per_shard_load(&self) -> Vec<PerShardLoad> {
+        let slots = self.shards.read().await;
+        let mut stats = Vec::new();
+
+        for (i, shard_opt) in slots.iter().enumerate() {
+            if let Some(shard) = shard_opt {
+                let guard = shard.read().await;
+                stats.push(PerShardLoad {
+                    shard_idx: i,
+                    entry_count: guard.len(),
+                    capacity: guard.capacity(),
+                });
+            }
+        }
+
+        stats
+    }
+
+    /// Returns current memory-oriented shard statistics (async).
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn memory_stats(&self) -> MemoryStats {
+        let slots = self.shards.read().await;
+        let mut shards_allocated = 0;
+        let mut total_capacity = 0usize;
+        let mut total_entries = 0usize;
+
+        for shard in slots.iter().flatten() {
+            shards_allocated += 1;
+            let guard = shard.read().await;
+            total_capacity += guard.capacity();
+            total_entries += guard.len();
+        }
+
+        let load_factor = if total_capacity > 0 {
+            total_entries as f64 / total_capacity as f64
+        } else {
+            0.0
+        };
+
+        MemoryStats {
+            shards_allocated,
+            total_capacity,
+            load_factor,
+        }
+    }
+
+    /// Drains all entries from the map and returns them as an iterator (async).
+    ///
+    /// Shard allocations are retained.
+    #[cfg(feature = "lifecycle")]
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn drain(&self) -> DrainIterator<K, V> {
+        let slots = self.shards.read().await;
+        let mut items = Vec::new();
+
+        for shard in slots.iter().flatten() {
+            let mut guard = shard.write().await;
+            items.extend(guard.drain());
+        }
+
+        self.total_len.store(0, Ordering::Relaxed);
+
+        DrainIterator { items, index: 0 }
     }
 }
 
@@ -2337,6 +2455,17 @@ mod tests {
     }
 
     #[test]
+    fn shard_stats_empty_count() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("k".into(), 1);
+        m.remove(&"k".into());
+
+        let stats = m.shard_stats();
+        assert_eq!(stats.initialized, 1);
+        assert_eq!(stats.empty, 1);
+    }
+
+    #[test]
     fn shard_utilization() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
         m.insert("a".into(), 1);
@@ -2447,5 +2576,56 @@ mod tests {
         let stats = m.shard_stats().await;
         assert_eq!(stats.total, 4);
         assert!(stats.initialized > 0);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_shard_stats_empty_count() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("k".into(), 1).await;
+        m.remove(&"k".into()).await;
+
+        let stats = m.shard_stats().await;
+        assert_eq!(stats.initialized, 1);
+        assert_eq!(stats.empty, 1);
+    }
+
+    #[cfg(feature = "lifecycle")]
+    #[test]
+    fn lifecycle_memory_stats_and_drain() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+        m.insert("c".into(), 3);
+
+        let memory = m.memory_stats();
+        assert!(memory.shards_allocated > 0);
+        assert!(memory.total_capacity > 0);
+        assert!(memory.load_factor > 0.0);
+
+        let drained: Vec<_> = m.drain().collect();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(m.len(), 0);
+    }
+
+    #[cfg(all(feature = "async", feature = "lifecycle"))]
+    #[tokio::test]
+    async fn async_lifecycle_memory_load_and_drain() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+        m.insert("c".into(), 3).await;
+
+        let loads = m.per_shard_load().await;
+        assert!(!loads.is_empty());
+
+        let memory = m.memory_stats().await;
+        assert!(memory.shards_allocated > 0);
+        assert!(memory.total_capacity > 0);
+        assert!(memory.load_factor > 0.0);
+
+        let drained: Vec<_> = m.drain().await.collect();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(m.len().await, 0);
     }
 }
