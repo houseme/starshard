@@ -16,7 +16,7 @@ English | [简体中文](README_CN.md)
 
 ## Status
 
-Production-ready (v1.0+). API stability prioritized.
+Production-ready (v1.2+). API stability prioritized.
 
 ## Motivation
 
@@ -44,7 +44,7 @@ Starshard focuses on:
 | `async`     | Adds `AsyncShardedHashMap` (Tokio `RwLock`)          | Independent of `rayon`         |
 | `rayon`     | Parallel snapshot flatten for large iteration        | Used internally; API unchanged |
 | `serde`     | Serialize/Deserialize (sync) + async snapshot helper | Hasher not persisted           |
-| `lifecycle` | TTL, Eviction, Metrics, Advanced Iteration           | Consolidated v0.9 features     |
+| `lifecycle` | Lifecycle utilities + primitives (`per_shard_load`, `memory_stats`, `drain`, metrics/eviction config types) | Consolidated v0.9+ features |
 | `advanced`  | Transactions, CAS, Replication, Diagnostics          | Consolidated v1.0 features     |
 | (none)      | Pure sync core + Batch Ops                           | Lowest dependency surface      |
 
@@ -61,9 +61,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "1.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # or minimal:
-# starshard = "1.0"
+# starshard = "1.2"
 ```
 
 `serde_json` (tests / examples):
@@ -276,10 +276,42 @@ println!("Utilization: {:.1}%", util);
 
 Enable via `features = ["lifecycle"]`.
 
-- **TTL & Eviction**: LRU/LFU/custom eviction policies with background cleanup
-- **Metrics Hooks**: Production observability with hit rates, latency tracking
-- **Advanced Iteration**: Filter + limit + parallel control builders
-- **Drain Operations**: Efficient bulk removal
+- **Per-shard introspection**: `per_shard_load()` (sync + async)
+- **Memory-oriented stats**: `memory_stats()` (sync + async)
+- **Bulk drain**: `drain()` (sync + async)
+- **Lifecycle primitives**: `EvictionConfig`, `EvictionPolicy`, `AtomicMetrics`, `IterBuilder`
+
+```rust
+#[cfg(feature = "lifecycle")]
+{
+    use starshard::ShardedHashMap;
+    let map: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
+    map.insert("a".into(), 1);
+    map.insert("b".into(), 2);
+
+    let _loads = map.per_shard_load();
+    let _memory = map.memory_stats();
+    let drained: Vec<_> = map.drain().collect();
+    assert_eq!(drained.len(), 2);
+}
+```
+
+```rust
+#[cfg(all(feature = "async", feature = "lifecycle"))]
+#[tokio::main]
+async fn main() {
+    use starshard::AsyncShardedHashMap;
+    let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(16);
+    map.insert("a".into(), 1).await;
+
+    let _loads = map.per_shard_load().await;
+    let _memory = map.memory_stats().await;
+    let drained: Vec<_> = map.drain().await.collect();
+    assert_eq!(drained.len(), 1);
+}
+```
+
+Note: lifecycle currently exposes utility APIs and configuration primitives; it does not yet provide a built-in autonomous TTL eviction scheduler.
 
 ---
 
@@ -305,8 +337,8 @@ Enable via `features = ["advanced"]`.
 | Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | Stable          |
 | Conditional Operations     | -    | ✅    | ✅    | ✅    | Stable          |
 | Batch operations           | -    | ✅    | ✅    | ✅    | Stable          |
-| TTL/Eviction               | -    | -    | ✅    | ✅    | Stable (lifecycle) |
-| Metrics                    | -    | -    | ✅    | ✅    | Stable (lifecycle) |
+| Lifecycle utilities        | -    | -    | ✅    | ✅    | Stable (lifecycle) |
+| Eviction/metrics primitives| -    | -    | ✅    | ✅    | Stable (lifecycle) |
 | Transactions               | -    | -    | -    | ✅    | Stable (advanced) |
 | CAS operations             | -    | -    | -    | ✅    | Stable (advanced) |
 | Replication                | -    | -    | -    | ✅    | Stable (advanced) |

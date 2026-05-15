@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-15
+
+### Added
+
+- **Lifecycle API completion**:
+    - Added `memory_stats()` for `ShardedHashMap` and `AsyncShardedHashMap` under `lifecycle`.
+    - Added `drain()` for `ShardedHashMap` and `AsyncShardedHashMap` under `lifecycle`.
+    - Added async `per_shard_load()` for `AsyncShardedHashMap` under `lifecycle`.
+- **Tests**:
+    - Added regression tests for shard empty-count accounting.
+    - Added lifecycle tests for memory stats and drain behavior (sync + async).
+
+### Fixed
+
+- **Shard statistics correctness**:
+    - Fixed `ShardStats.empty` calculation in both sync and async `shard_stats()` implementations.
+
+### Documentation
+
+- Updated `README.md` lifecycle section to match current implementation and added examples for:
+    - `per_shard_load()` (sync + async)
+    - `memory_stats()` (sync + async)
+    - `drain()` (sync + async)
+
 ## [1.1.0] - 2026-02-03
 
 ### Added

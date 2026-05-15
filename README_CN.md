@@ -16,7 +16,7 @@
 
 ## 状态
 
-生产就绪 (v1.0+)。API 稳定性优先。
+生产就绪 (v1.2+)。API 稳定性优先。
 
 ## 为什么需要它
 
@@ -44,7 +44,7 @@ Starshard 目标：
 | `async`     | 提供 `AsyncShardedHashMap`（Tokio `RwLock`） | 独立启用        |
 | `rayon`     | 大体量迭代时分片快照并行扁平化                          | 内部加速        |
 | `serde`     | 同步版序列化/反序列化；异步版提供快照封装                    | 不持久化 hasher |
-| `lifecycle` | TTL、淘汰、指标、高级迭代                           | 整合 v0.9 特性  |
+| `lifecycle` | 生命周期工具与原语（`per_shard_load`、`memory_stats`、`drain`、指标/淘汰配置类型） | 整合 v0.9+ 特性 |
 | `advanced`  | 事务、CAS、复制、诊断                             | 整合 v1.0 特性  |
 | （空）         | 仅同步核心 + 批量操作                             | 依赖面最小       |
 
@@ -61,9 +61,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "1.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小：
-# starshard = "1.0"
+# starshard = "1.2"
 ```
 
 开发/测试:
@@ -274,10 +274,42 @@ println!("Utilization: {:.1}%", util);
 
 通过 `features = ["lifecycle"]` 启用。
 
-- **TTL & 淘汰**: LRU/LFU/自定义淘汰策略，带后台清理
-- **指标钩子**: 生产级可观测性，命中率、延迟跟踪
-- **高级迭代**: 过滤器 + 限制 + 并行控制构建器
-- **Drain 操作**: 高效批量移除
+- **分片内省**: `per_shard_load()`（同步 + 异步）
+- **内存导向统计**: `memory_stats()`（同步 + 异步）
+- **批量排空**: `drain()`（同步 + 异步）
+- **生命周期原语**: `EvictionConfig`、`EvictionPolicy`、`AtomicMetrics`、`IterBuilder`
+
+```rust
+#[cfg(feature = "lifecycle")]
+{
+    use starshard::ShardedHashMap;
+    let map: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
+    map.insert("a".into(), 1);
+    map.insert("b".into(), 2);
+
+    let _loads = map.per_shard_load();
+    let _memory = map.memory_stats();
+    let drained: Vec<_> = map.drain().collect();
+    assert_eq!(drained.len(), 2);
+}
+```
+
+```rust
+#[cfg(all(feature = "async", feature = "lifecycle"))]
+#[tokio::main]
+async fn main() {
+    use starshard::AsyncShardedHashMap;
+    let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(16);
+    map.insert("a".into(), 1).await;
+
+    let _loads = map.per_shard_load().await;
+    let _memory = map.memory_stats().await;
+    let drained: Vec<_> = map.drain().await.collect();
+    assert_eq!(drained.len(), 1);
+}
+```
+
+说明：`lifecycle` 当前提供的是实用 API 与配置原语，尚未内置自动化 TTL 淘汰调度器。
 
 ---
 
@@ -303,8 +335,8 @@ println!("Utilization: {:.1}%", util);
 | Serde (反)序列化           | ✅    | ✅    | ✅    | ✅    | 稳定              |
 | 条件操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
 | 批量操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
-| TTL/淘汰                 | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
-| 指标                     | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
+| 生命周期工具                | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
+| 淘汰/指标原语               | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
 | 事务                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
 | CAS 操作                 | -    | -    | -    | ✅    | 稳定 (advanced)  |
 | 复制                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
