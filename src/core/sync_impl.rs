@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 impl<K, V> ShardedHashMap<K, V, FxBuildHasher>
 where
@@ -23,9 +24,13 @@ where
         let shards = vec![None; count];
         Self {
             shards: Arc::new(StdRwLock::new(shards)),
+            previous_shards: Arc::new(StdRwLock::new(None)),
             hasher,
-            shard_count: count,
+            shard_count: Arc::new(AtomicUsize::new(count)),
+            previous_shard_count: Arc::new(AtomicUsize::new(0)),
             total_len: Arc::new(AtomicUsize::new(0)),
+            rebalance_lock: Arc::new(StdMutex::new(())),
+            rebalance_tracker: Arc::new(RebalanceTracker::new()),
             #[cfg(feature = "advanced")]
             version: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "advanced")]
@@ -101,7 +106,7 @@ where
     /// Current configured shard slots.
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn shard_count(&self) -> usize {
-        self.shard_count
+        self.shard_count.load(Ordering::Relaxed)
     }
 
     /// Number of shards actually initialized (allocated).
@@ -111,10 +116,16 @@ where
         g.iter().filter(|o| o.is_some()).count()
     }
 
+    /// Current rebalance status snapshot.
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn rebalance_status(&self) -> RebalanceStatus {
+        self.rebalance_tracker.snapshot()
+    }
+
     #[inline]
     #[tracing::instrument(skip(self, key), level = "trace")]
     fn shard_index(&self, key: &K) -> usize {
-        (self.hasher.hash_one(key) % self.shard_count as u64) as usize
+        (self.hasher.hash_one(key) % self.shard_count() as u64) as usize
     }
 
     #[inline]
@@ -145,7 +156,7 @@ where
         I: IntoIterator<Item = (K, V)>,
     {
         let iter = entries.into_iter();
-        let estimated = iter.size_hint().0.min(self.shard_count);
+        let estimated = iter.size_hint().0.min(self.shard_count());
         let mut buckets: HashMap<usize, Vec<(K, V)>, FxBuildHasher> =
             HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
         for (k, v) in iter {
@@ -161,7 +172,7 @@ where
         I: IntoIterator<Item = K>,
     {
         let iter = keys.into_iter();
-        let estimated = iter.size_hint().0.min(self.shard_count);
+        let estimated = iter.size_hint().0.min(self.shard_count());
         let mut buckets: HashMap<usize, Vec<K>, FxBuildHasher> =
             HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
         for k in iter {
@@ -176,7 +187,7 @@ where
         &self,
         keys: &'a [K],
     ) -> HashMap<usize, Vec<(usize, &'a K)>, FxBuildHasher> {
-        let estimated = keys.len().min(self.shard_count);
+        let estimated = keys.len().min(self.shard_count());
         let mut buckets: HashMap<usize, Vec<(usize, &'a K)>, FxBuildHasher> =
             HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
         for (idx, key) in keys.iter().enumerate() {
@@ -184,6 +195,77 @@ where
             buckets.entry(shard_idx).or_default().push((idx, key));
         }
         buckets
+    }
+
+    /// Rebalance to a new shard count using stop-the-world full migration.
+    ///
+    /// During migration, operations are blocked by holding the shard-vector write lock.
+    #[tracing::instrument(skip(self, options), level = "trace")]
+    pub fn rebalance_to(
+        &self,
+        new_shard_count: usize,
+        options: RebalanceOptions,
+    ) -> Result<RebalanceReport, ShardCountError> {
+        let _rebalance_guard = self.rebalance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
+        let current = self.shard_count();
+        if target == current {
+            return Ok(RebalanceReport {
+                from_shards: current,
+                to_shards: target,
+                moved_entries: 0,
+                elapsed_ms: 0,
+            });
+        }
+
+        let started = Instant::now();
+        let mut old_slots = std_write_guard(&self.shards, "rebalance_shards");
+        self.rebalance_tracker.begin(old_slots.len());
+        let mut new_slots: Vec<Option<StdShard<K, V, S>>> = vec![None; target];
+        let mut moved_entries = 0usize;
+
+        for shard in old_slots.iter().flatten() {
+            let guard = std_read_guard(shard, "rebalance_source_shard");
+            for (k, v) in guard.iter() {
+                let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
+                if new_slots[new_idx].is_none() {
+                    let map = StdShardMap::with_hasher(self.hasher.clone());
+                    new_slots[new_idx] = Some(Arc::new(StdRwLock::new(map)));
+                }
+                if let Some(dest) = new_slots[new_idx].as_ref() {
+                    let mut dest_guard = std_write_guard(dest, "rebalance_target_shard");
+                    dest_guard.insert(k.clone(), v.clone());
+                    moved_entries += 1;
+                }
+            }
+            self.rebalance_tracker.step();
+        }
+
+        *old_slots = new_slots;
+        {
+            let mut prev = std_write_guard(&self.previous_shards, "rebalance_previous_shards");
+            *prev = None;
+        }
+        self.previous_shard_count.store(0, Ordering::Relaxed);
+        self.shard_count.store(target, Ordering::Relaxed);
+        self.rebalance_tracker.finish();
+
+        tracing::info!(
+            from_shards = current,
+            to_shards = target,
+            moved_entries,
+            background = options.background,
+            batch_size = options.batch_size,
+            max_pause_ns = options.max_pause_ns,
+            "sync stop-the-world rebalance completed"
+        );
+
+        Ok(RebalanceReport {
+            from_shards: current,
+            to_shards: target,
+            moved_entries,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
     }
 
     /// Insert key/value. Returns previous value if existed.
