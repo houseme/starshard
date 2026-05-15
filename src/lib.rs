@@ -143,6 +143,7 @@ use hashbrown::HashMap;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
     Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
@@ -186,6 +187,44 @@ pub(crate) use crate::core::ReplicaList;
 
 /// Default shard count (power-of-two not required; hashing modulo used).
 pub const DEFAULT_SHARDS: usize = 64;
+
+/// Default hard cap for shard slots in infallible constructors.
+///
+/// This guards against accidental or attacker-influenced oversized allocations.
+/// If you need a different cap, use `with_shards_and_hasher_capped(...)` or
+/// `try_with_shards_and_hasher_capped(...)`.
+pub const MAX_SHARDS: usize = 262_144;
+
+/// Error returned by strict shard-count constructors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardCountError {
+    requested: usize,
+    max_allowed: usize,
+}
+
+impl ShardCountError {
+    /// Returns the requested effective shard count (after zero-normalization).
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    /// Returns the maximum allowed shard count used for validation.
+    pub fn max_allowed(&self) -> usize {
+        self.max_allowed
+    }
+}
+
+impl fmt::Display for ShardCountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "requested shard_count {} exceeds max allowed {}",
+            self.requested, self.max_allowed
+        )
+    }
+}
+
+impl std::error::Error for ShardCountError {}
 
 /// Statistics about shard distribution and utilization.
 ///
@@ -300,6 +339,33 @@ mod tests {
     }
 
     #[test]
+    fn sync_constructor_clamps_to_default_cap() {
+        let m: ShardedHashMap<String, i32> =
+            ShardedHashMap::with_shards_and_hasher(usize::MAX, FxBuildHasher);
+        assert_eq!(m.shard_count(), MAX_SHARDS);
+    }
+
+    #[test]
+    fn sync_constructor_supports_custom_cap() {
+        let m: ShardedHashMap<String, i32> =
+            ShardedHashMap::with_shards_and_hasher_capped(10_000, FxBuildHasher, 128);
+        assert_eq!(m.shard_count(), 128);
+    }
+
+    #[test]
+    fn sync_try_constructor_rejects_oversized_shards() {
+        let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher(
+            MAX_SHARDS + 1,
+            FxBuildHasher,
+        ) {
+            Ok(_) => panic!("expected oversized shard_count to return error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), MAX_SHARDS + 1);
+        assert_eq!(err.max_allowed(), MAX_SHARDS);
+    }
+
+    #[test]
     fn sync_contains() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
         assert!(!m.contains(&"a".into()));
@@ -331,6 +397,36 @@ mod tests {
         assert_eq!(m.len().await, 1);
         assert_eq!(m.remove(&"a".into()).await, Some(1));
         assert!(m.is_empty().await);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_constructor_clamps_to_default_cap() {
+        let m: AsyncShardedHashMap<String, i32> =
+            AsyncShardedHashMap::with_shards_and_hasher(usize::MAX, FxBuildHasher);
+        assert_eq!(m.shard_count(), MAX_SHARDS);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_constructor_supports_custom_cap() {
+        let m: AsyncShardedHashMap<String, i32> =
+            AsyncShardedHashMap::with_shards_and_hasher_capped(10_000, FxBuildHasher, 256);
+        assert_eq!(m.shard_count(), 256);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_try_constructor_rejects_oversized_shards() {
+        let err = match AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher(
+            MAX_SHARDS + 1,
+            FxBuildHasher,
+        ) {
+            Ok(_) => panic!("expected oversized shard_count to return error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), MAX_SHARDS + 1);
+        assert_eq!(err.max_allowed(), MAX_SHARDS);
     }
 
     #[cfg(feature = "async")]

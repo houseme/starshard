@@ -376,6 +376,17 @@ Lazy fill of inner `Option` slot when first key hashes into shard.
 | Serde snapshot (sync) | `serde_json::to_string(&map)`   |
 | Async serde snapshot  | `async_snapshot_serializable()` |
 | Custom hasher         | `with_shards_and_hasher(..)`    |
+| Custom shard cap      | `with_shards_and_hasher_capped(..)` |
+| Strict validation     | `try_with_shards_and_hasher(..)` |
+
+---
+
+## Shard Count Safety
+
+- Infallible constructors now enforce a default cap via `MAX_SHARDS` to prevent oversized allocations.
+- For custom limits, use `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`.
+- For strict validation (no clamping), use `try_with_shards_and_hasher(..)` or
+  `try_with_shards_and_hasher_capped(..)`, which return `ShardCountError`.
 
 ---
 

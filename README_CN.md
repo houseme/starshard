@@ -370,6 +370,18 @@ Arc -> RwLock<Vec<Option<Arc<RwLock<HashMap<K,V,S>>>>>> + AtomicUsize(len)
 | Serde 同步   | `serde_json::to_string(&map)`   |
 | 异步快照序列化    | `async_snapshot_serializable()` |
 | 自定义 hasher | `with_shards_and_hasher`        |
+| 自定义分片上限    | `with_shards_and_hasher_capped` |
+| 严格校验构造      | `try_with_shards_and_hasher`    |
+
+---
+
+## 分片数量安全策略
+
+- 不抛错构造函数默认使用 `MAX_SHARDS` 上限，避免超大分配导致内存风险。
+- 如需自定义上限，可使用 `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`。
+- 如需严格模式（不裁剪，超限直接报错），使用
+  `try_with_shards_and_hasher(..)` 或 `try_with_shards_and_hasher_capped(..)`，
+  返回 `ShardCountError`。
 
 ---
 

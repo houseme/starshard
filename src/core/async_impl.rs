@@ -20,14 +20,8 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync,
 {
-    /// Create with custom hasher.
-    #[tracing::instrument(skip(hasher), level = "trace")]
-    pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
-        let count = if shard_count == 0 {
-            DEFAULT_SHARDS
-        } else {
-            shard_count
-        };
+    #[inline]
+    fn build_with_count(count: usize, hasher: S) -> Self {
         Self {
             shards: Arc::new(TokioRwLock::new(vec![None; count])),
             hasher,
@@ -42,6 +36,65 @@ where
             #[cfg(feature = "advanced")]
             quorum_config: Arc::new(StdRwLock::new(None)),
         }
+    }
+
+    /// Create with custom hasher.
+    ///
+    /// This preserves backward compatibility while enforcing the default
+    /// safety cap (`MAX_SHARDS`) to avoid oversized allocations.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
+        let requested = normalized_shard_count(shard_count);
+        let count = capped_shard_count(requested, MAX_SHARDS);
+        if requested != count {
+            tracing::warn!(
+                requested_shards = requested,
+                capped_shards = count,
+                max_shards = MAX_SHARDS,
+                "requested shard_count exceeded default cap and was clamped"
+            );
+        }
+        Self::build_with_count(count, hasher)
+    }
+
+    /// Create with custom hasher and a custom cap.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn with_shards_and_hasher_capped(shard_count: usize, hasher: S, max_shards: usize) -> Self {
+        let effective_max = max_shards.max(1);
+        let requested = normalized_shard_count(shard_count);
+        let count = capped_shard_count(requested, effective_max);
+        if requested != count {
+            tracing::warn!(
+                requested_shards = requested,
+                capped_shards = count,
+                max_shards = effective_max,
+                "requested shard_count exceeded configured cap and was clamped"
+            );
+        }
+        Self::build_with_count(count, hasher)
+    }
+
+    /// Strict constructor with custom hasher.
+    ///
+    /// Returns an error when the requested shard count exceeds `MAX_SHARDS`.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn try_with_shards_and_hasher(
+        shard_count: usize,
+        hasher: S,
+    ) -> Result<Self, ShardCountError> {
+        Self::try_with_shards_and_hasher_capped(shard_count, hasher, MAX_SHARDS)
+    }
+
+    /// Strict constructor with custom hasher and caller-provided cap.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn try_with_shards_and_hasher_capped(
+        shard_count: usize,
+        hasher: S,
+        max_shards: usize,
+    ) -> Result<Self, ShardCountError> {
+        let effective_max = max_shards.max(1);
+        let count = strict_shard_count(shard_count, effective_max)?;
+        Ok(Self::build_with_count(count, hasher))
     }
 
     /// Configured shard capacity.
