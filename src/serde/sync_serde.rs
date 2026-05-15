@@ -1,6 +1,6 @@
 use super::DEFAULT_SHARDS;
 use super::ShardedHashMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use ::serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::hash::{BuildHasher, Hash};
 
 // Transit representation

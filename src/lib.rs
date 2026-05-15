@@ -176,10 +176,6 @@ pub use advanced::{
     ReplicationOp, Transaction, TransactionResult, TxnOp,
 };
 
-/* ======================== Serde Imports ======================== */
-#[cfg(feature = "serde")]
-use serde::Serialize;
-
 pub(crate) use crate::core::StdShardVecArc;
 
 #[cfg(feature = "async")]
@@ -256,7 +252,7 @@ mod core;
 /* ---------------------- Serde for ShardedHashMap ------------------------ */
 
 #[cfg(feature = "serde")]
-mod serde_impl;
+mod serde;
 
 /* ============================== Async Map =============================== */
 
@@ -285,7 +281,7 @@ where
 }
 
 #[cfg(all(feature = "async", feature = "serde"))]
-pub use core::async_impl::AsyncShardedHashMapSnapshot;
+pub use serde::AsyncShardedHashMapSnapshot;
 
 /* ================================ Tests ================================ */
 
