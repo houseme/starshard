@@ -66,7 +66,7 @@ Hasher Choice
 
 Limitations
 ------------
-- No dynamic shard rebalancing / rehash across shards yet.
+- Supports stop-the-world shard rebalancing via `rebalance_to(...)`; online incremental migration is not implemented yet.
 - Lifecycle features currently provide introspection/utilities (e.g. per-shard load, drain, memory stats),
   but do not implement a built-in autonomous TTL eviction engine.
 - Iteration allocates temporary vectors proportional to initialized shards (to snapshot).
@@ -146,12 +146,15 @@ use rustc_hash::FxBuildHasher;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
-    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
+    Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
+    RwLockWriteGuard as StdWriteGuard,
     atomic::{AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "async")]
-use tokio::sync::{RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard};
+use tokio::sync::{
+    Mutex as TokioMutex, RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard,
+};
 
 /* ======================== Module Declarations ======================== */
 
@@ -264,6 +267,115 @@ impl ShardStats {
     }
 }
 
+/// Rebalance execution options.
+#[derive(Clone, Debug)]
+pub struct RebalanceOptions {
+    /// Reserved for future online/background mode.
+    pub background: bool,
+    /// Reserved for future batched migration mode.
+    pub batch_size: usize,
+    /// Reserved for future pause-budget mode.
+    pub max_pause_ns: u64,
+}
+
+impl Default for RebalanceOptions {
+    fn default() -> Self {
+        Self {
+            background: false,
+            batch_size: 1024,
+            max_pause_ns: 0,
+        }
+    }
+}
+
+/// Rebalance execution report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebalanceReport {
+    /// Previous shard slot count.
+    pub from_shards: usize,
+    /// New shard slot count.
+    pub to_shards: usize,
+    /// Number of moved entries.
+    pub moved_entries: usize,
+    /// Elapsed time in milliseconds.
+    pub elapsed_ms: u128,
+}
+
+/// Rebalance runtime status snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RebalanceStatus {
+    /// Current state label: `idle` or `migrating`.
+    pub state: &'static str,
+    /// Progress in range `[0.0, 1.0]`.
+    pub progress: f64,
+    /// Number of completed shard migrations.
+    pub moved_shards: usize,
+    /// Number of total source shards for current migration.
+    pub total_shards: usize,
+}
+
+const REBALANCE_STATE_IDLE: usize = 0;
+const REBALANCE_STATE_MIGRATING: usize = 1;
+
+#[derive(Debug)]
+struct RebalanceTracker {
+    state: AtomicUsize,
+    moved_shards: AtomicUsize,
+    total_shards: AtomicUsize,
+}
+
+impl RebalanceTracker {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(REBALANCE_STATE_IDLE),
+            moved_shards: AtomicUsize::new(0),
+            total_shards: AtomicUsize::new(0),
+        }
+    }
+
+    fn begin(&self, total_shards: usize) {
+        self.total_shards.store(total_shards, Ordering::Relaxed);
+        self.moved_shards.store(0, Ordering::Relaxed);
+        self.state
+            .store(REBALANCE_STATE_MIGRATING, Ordering::Relaxed);
+    }
+
+    fn step(&self) {
+        self.moved_shards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_migrating(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == REBALANCE_STATE_MIGRATING
+    }
+
+    fn finish(&self) {
+        self.state.store(REBALANCE_STATE_IDLE, Ordering::Relaxed);
+        self.total_shards.store(0, Ordering::Relaxed);
+        self.moved_shards.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RebalanceStatus {
+        let state_num = self.state.load(Ordering::Relaxed);
+        let moved = self.moved_shards.load(Ordering::Relaxed);
+        let total = self.total_shards.load(Ordering::Relaxed);
+        let progress = if total == 0 {
+            0.0
+        } else {
+            moved as f64 / total as f64
+        };
+        RebalanceStatus {
+            state: if state_num == REBALANCE_STATE_MIGRATING {
+                "migrating"
+            } else {
+                "idle"
+            },
+            progress,
+            moved_shards: moved,
+            total_shards: total,
+        }
+    }
+}
+
 /* ============================== Sync Map =============================== */
 
 /// Sharded concurrent HashMap (synchronous).
@@ -277,9 +389,13 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     shards: StdShardVecArc<K, V, S>,
+    previous_shards: Arc<StdRwLock<Option<crate::core::StdShardVec<K, V, S>>>>,
     hasher: S,
-    shard_count: usize,
+    shard_count: Arc<AtomicUsize>,
+    previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
+    rebalance_lock: Arc<StdMutex<()>>,
+    rebalance_tracker: Arc<RebalanceTracker>,
     #[cfg(feature = "advanced")]
     version: Arc<AtomicUsize>,
     #[cfg(feature = "advanced")]
@@ -306,9 +422,13 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     shards: AsyncShardVecArc<K, V, S>,
+    previous_shards: Arc<TokioRwLock<Option<crate::core::AsyncShardVec<K, V, S>>>>,
     hasher: S,
-    shard_count: usize,
+    shard_count: Arc<AtomicUsize>,
+    previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
+    rebalance_lock: Arc<TokioMutex<()>>,
+    rebalance_tracker: Arc<RebalanceTracker>,
     #[cfg(feature = "advanced")]
     version: Arc<AtomicUsize>,
     #[cfg(feature = "advanced")]
@@ -366,6 +486,44 @@ mod tests {
     }
 
     #[test]
+    fn sync_try_constructor_custom_cap_success_and_rejection() {
+        let ok =
+            ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(32, FxBuildHasher, 64)
+                .expect("expected shard_count within custom cap to succeed");
+        assert_eq!(ok.shard_count(), 32);
+
+        let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            65,
+            FxBuildHasher,
+            64,
+        ) {
+            Ok(_) => panic!("expected shard_count above custom cap to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), 65);
+        assert_eq!(err.max_allowed(), 64);
+    }
+
+    #[test]
+    fn sync_try_constructor_custom_cap_zero_normalizes_to_one() {
+        let ok =
+            ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(1, FxBuildHasher, 0)
+                .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
+        assert_eq!(ok.shard_count(), 1);
+
+        let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            2,
+            FxBuildHasher,
+            0,
+        ) {
+            Ok(_) => panic!("expected shard_count=2 to fail when cap=0 normalizes to 1"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), 2);
+        assert_eq!(err.max_allowed(), 1);
+    }
+
+    #[test]
     fn sync_contains() {
         let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
         assert!(!m.contains(&"a".into()));
@@ -386,6 +544,114 @@ mod tests {
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn sync_rebalance_stop_the_world() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i);
+        }
+        let before_len = m.len();
+        let report = m
+            .rebalance_to(32, RebalanceOptions::default())
+            .expect("sync rebalance should succeed");
+        assert_eq!(report.from_shards, 4);
+        assert_eq!(report.to_shards, 32);
+        assert_eq!(report.moved_entries, before_len);
+        assert_eq!(m.shard_count(), 32);
+        assert_eq!(m.len(), before_len);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")), Some(i));
+        }
+    }
+
+    #[test]
+    fn sync_rebalance_rejects_oversized_target() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        let err = m
+            .rebalance_to(MAX_SHARDS + 1, RebalanceOptions::default())
+            .expect_err("oversized rebalance target should fail");
+        assert_eq!(err.requested(), MAX_SHARDS + 1);
+        assert_eq!(err.max_allowed(), MAX_SHARDS);
+    }
+
+    #[test]
+    fn sync_rebalance_status_is_idle_after_rebalance() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("k".into(), 1);
+        let status_before = m.rebalance_status();
+        assert_eq!(status_before.state, "idle");
+        m.rebalance_to(8, RebalanceOptions::default())
+            .expect("rebalance should succeed");
+        let status_after = m.rebalance_status();
+        assert_eq!(status_after.state, "idle");
+        assert_eq!(status_after.total_shards, 0);
+        assert_eq!(status_after.moved_shards, 0);
+    }
+
+    #[test]
+    fn sync_online_rebalance_incremental_migration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..120 {
+            m.insert(format!("k{i}"), i);
+        }
+        assert_eq!(m.len(), 120);
+        m.start_rebalance_online(16)
+            .expect("online rebalance start should succeed");
+        assert_eq!(m.rebalance_status().state, "migrating");
+        assert_eq!(m.get(&"k3".to_string()), Some(3));
+
+        assert_eq!(m.remove(&"k42".to_string()), Some(42));
+        assert_eq!(m.insert("hot".to_string(), 777), None);
+
+        while m.rebalance_status().state == "migrating" {
+            let advanced = m.advance_rebalance(2);
+            assert!(advanced <= 2);
+            if advanced == 0 {
+                break;
+            }
+        }
+
+        let status = m.rebalance_status();
+        assert_eq!(status.state, "idle");
+        assert_eq!(m.shard_count(), 16);
+        assert_eq!(m.get(&"k42".to_string()), None);
+        assert_eq!(m.get(&"hot".to_string()), Some(777));
+        assert_eq!(m.len(), 120);
+    }
+
+    #[test]
+    fn sync_rebalance_to_while_online_migrating_keeps_all_data() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i);
+        }
+        m.start_rebalance_online(16)
+            .expect("online rebalance start should succeed");
+        m.insert("hot".to_string(), 900);
+        let report = m
+            .rebalance_to(32, RebalanceOptions::default())
+            .expect("stop-the-world rebalance should succeed");
+        assert_eq!(report.to_shards, 32);
+        assert_eq!(m.rebalance_status().state, "idle");
+        assert_eq!(m.len(), 201);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")), Some(i));
+        }
+        assert_eq!(m.get(&"hot".to_string()), Some(900));
+    }
+
+    #[test]
+    fn sync_clear_removes_previous_fallback_entries_during_migration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("k".to_string(), 1);
+        m.start_rebalance_online(8)
+            .expect("online rebalance start should succeed");
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.get(&"k".to_string()), None);
+        assert_eq!(m.rebalance_status().state, "idle");
     }
 
     #[cfg(feature = "async")]
@@ -431,6 +697,52 @@ mod tests {
 
     #[cfg(feature = "async")]
     #[tokio::test]
+    async fn async_try_constructor_custom_cap_success_and_rejection() {
+        let ok = AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            48,
+            FxBuildHasher,
+            64,
+        )
+        .expect("expected shard_count within custom cap to succeed");
+        assert_eq!(ok.shard_count(), 48);
+
+        let err = match AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            65,
+            FxBuildHasher,
+            64,
+        ) {
+            Ok(_) => panic!("expected shard_count above custom cap to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), 65);
+        assert_eq!(err.max_allowed(), 64);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_try_constructor_custom_cap_zero_normalizes_to_one() {
+        let ok = AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            1,
+            FxBuildHasher,
+            0,
+        )
+        .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
+        assert_eq!(ok.shard_count(), 1);
+
+        let err = match AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
+            2,
+            FxBuildHasher,
+            0,
+        ) {
+            Ok(_) => panic!("expected shard_count=2 to fail when cap=0 normalizes to 1"),
+            Err(err) => err,
+        };
+        assert_eq!(err.requested(), 2);
+        assert_eq!(err.max_allowed(), 1);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
     async fn async_contains() {
         let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
         assert!(!m.contains(&"a".into()).await);
@@ -441,6 +753,127 @@ mod tests {
         m.remove(&"a".into()).await;
         assert!(!m.contains(&"a".into()).await);
         assert!(m.contains(&"b".into()).await);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_rebalance_stop_the_world() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i).await;
+        }
+        let before_len = m.len().await;
+        let report = m
+            .rebalance_to(64, RebalanceOptions::default())
+            .await
+            .expect("async rebalance should succeed");
+        assert_eq!(report.from_shards, 4);
+        assert_eq!(report.to_shards, 64);
+        assert_eq!(report.moved_entries, before_len);
+        assert_eq!(m.shard_count(), 64);
+        assert_eq!(m.len().await, before_len);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")).await, Some(i));
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_rebalance_rejects_oversized_target() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        let err = m
+            .rebalance_to(MAX_SHARDS + 1, RebalanceOptions::default())
+            .await
+            .expect_err("oversized rebalance target should fail");
+        assert_eq!(err.requested(), MAX_SHARDS + 1);
+        assert_eq!(err.max_allowed(), MAX_SHARDS);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_rebalance_status_is_idle_after_rebalance() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("k".into(), 1).await;
+        let status_before = m.rebalance_status();
+        assert_eq!(status_before.state, "idle");
+        m.rebalance_to(16, RebalanceOptions::default())
+            .await
+            .expect("rebalance should succeed");
+        let status_after = m.rebalance_status();
+        assert_eq!(status_after.state, "idle");
+        assert_eq!(status_after.total_shards, 0);
+        assert_eq!(status_after.moved_shards, 0);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_online_rebalance_incremental_migration() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..120 {
+            m.insert(format!("k{i}"), i).await;
+        }
+        assert_eq!(m.len().await, 120);
+        m.start_rebalance_online(32)
+            .await
+            .expect("online rebalance start should succeed");
+        assert_eq!(m.rebalance_status().state, "migrating");
+        assert_eq!(m.get(&"k3".to_string()).await, Some(3));
+
+        assert_eq!(m.remove(&"k42".to_string()).await, Some(42));
+        assert_eq!(m.insert("hot".to_string(), 888).await, None);
+
+        while m.rebalance_status().state == "migrating" {
+            let advanced = m.advance_rebalance(2).await;
+            assert!(advanced <= 2);
+            if advanced == 0 {
+                break;
+            }
+        }
+
+        let status = m.rebalance_status();
+        assert_eq!(status.state, "idle");
+        assert_eq!(m.shard_count(), 32);
+        assert_eq!(m.get(&"k42".to_string()).await, None);
+        assert_eq!(m.get(&"hot".to_string()).await, Some(888));
+        assert_eq!(m.len().await, 120);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_rebalance_to_while_online_migrating_keeps_all_data() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i).await;
+        }
+        m.start_rebalance_online(16)
+            .await
+            .expect("online rebalance start should succeed");
+        m.insert("hot".to_string(), 901).await;
+        let report = m
+            .rebalance_to(32, RebalanceOptions::default())
+            .await
+            .expect("stop-the-world rebalance should succeed");
+        assert_eq!(report.to_shards, 32);
+        assert_eq!(m.rebalance_status().state, "idle");
+        assert_eq!(m.len().await, 201);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")).await, Some(i));
+        }
+        assert_eq!(m.get(&"hot".to_string()).await, Some(901));
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_clear_removes_previous_fallback_entries_during_migration() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("k".to_string(), 1).await;
+        m.start_rebalance_online(8)
+            .await
+            .expect("online rebalance start should succeed");
+        m.clear().await;
+        assert_eq!(m.len().await, 0);
+        assert_eq!(m.get(&"k".to_string()).await, None);
+        assert_eq!(m.rebalance_status().state, "idle");
     }
 
     #[cfg(feature = "serde")]
@@ -454,6 +887,20 @@ mod tests {
         let de: ShardedHashMap<String, u32> = serde_json::from_str(&s).unwrap();
         assert_eq!(de.len(), 2);
         assert_eq!(de.get(&"x".into()), Some(10));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_deserialize_oversized_shard_count_is_clamped() {
+        use serde_json;
+        let json = format!(
+            r#"{{"shard_count":{},"entries":[["k",1]]}}"#,
+            MAX_SHARDS + 1024
+        );
+        let de: ShardedHashMap<String, u32> =
+            serde_json::from_str(&json).expect("oversized shard_count JSON should deserialize");
+        assert_eq!(de.shard_count(), MAX_SHARDS);
+        assert_eq!(de.get(&"k".into()), Some(1));
     }
 
     #[cfg(all(feature = "async", feature = "serde"))]
