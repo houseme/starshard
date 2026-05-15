@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-05-15
+
+### Added
+
+- **Adaptive rebalance APIs (sync + async)**:
+    - Added stop-the-world rebalance:
+      - `ShardedHashMap::rebalance_to(...)`
+      - `AsyncShardedHashMap::rebalance_to(...).await`
+    - Added online incremental rebalance lifecycle:
+      - `start_rebalance_online(...)`
+      - `advance_rebalance(...)`
+    - Added status snapshot API:
+      - `rebalance_status() -> RebalanceStatus`
+    - Added data models:
+      - `RebalanceOptions`
+      - `RebalanceReport`
+      - `RebalanceStatus`
+
+### Changed
+
+- **Routing internals for shard expansion**:
+    - Reworked internal shard-count storage to allow safe runtime shard-count transitions.
+    - Added previous-epoch shard storage for online migration fallback reads.
+    - Updated read/write paths so online migration follows active-first, previous-fallback semantics.
+
+### Tests
+
+- Added rebalance test coverage for:
+    - stop-the-world sync/async migration correctness
+    - status lifecycle correctness
+    - online incremental sync/async migration path
+
 ## [2.0.0] - 2026-05-15
 
 ### Changed

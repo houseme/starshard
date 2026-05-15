@@ -16,7 +16,7 @@ English | [简体中文](README_CN.md)
 
 ## Status
 
-Production-ready (v2.0+). API stability prioritized.
+Production-ready (v2.1+). API stability prioritized.
 
 ## Motivation
 
@@ -55,7 +55,7 @@ Enable all in docs.rs via:
 all-features = true
 ```
 
-Internal layout in `v2.0.0`:
+Internal layout in `v2.1.0`:
 
 - `src/core/sync_impl.rs`
 - `src/core/async_impl.rs`
@@ -70,9 +70,9 @@ Internal layout in `v2.0.0`:
 
 ```toml
 [dependencies]
-starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # or minimal:
-# starshard = "2.0.0"
+# starshard = "2.1.0"
 ```
 
 `serde_json` (tests / examples):
@@ -119,6 +119,36 @@ async fn main() {
     let m: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(64);
     m.insert("x".into(), 42).await;
     assert_eq!(m.get(&"x".into()).await, Some(42));
+}
+```
+
+## Adaptive Rebalance (`v2.1+`)
+
+Sync:
+
+```rust
+use starshard::{RebalanceOptions, ShardedHashMap};
+
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+```
+
+Online incremental (sync):
+
+```rust
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+m.start_rebalance_online(32).unwrap();
+while m.rebalance_status().state == "migrating" {
+    m.advance_rebalance(2);
+}
+```
+
+Async:
+
+```rust
+#[cfg(feature = "async")]
+async fn rebalance_async(m: &starshard::AsyncShardedHashMap<String, i32>) {
+    m.rebalance_to(32, starshard::RebalanceOptions::default()).await.unwrap();
 }
 ```
 
@@ -183,6 +213,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | Large snapshot iteration with `rayon` (100k+)         | 3-4x speedup flattening      |
 | Sparse shard usage                                    | Only touched shards allocate |
 | Batch Insert/Remove                                   | Single lock per shard group + sparse grouping in v2.0.0 |
+| Online rebalance                                      | Incremental shard migration with active-first reads |
 
 Do benchmark with your own key/value distribution and CPU topology.
 
@@ -199,7 +230,7 @@ Do benchmark with your own key/value distribution and CPU topology.
 
 ## Limitations
 
-- No dynamic shard rebalancing.
+- Dynamic shard rebalancing supports stop-the-world + online incremental modes (`v2.1`).
 - Snapshot iteration allocates intermediate vectors.
 - Hasher state not serialized.
 - No lock-free progress guarantees.
@@ -208,7 +239,7 @@ Do benchmark with your own key/value distribution and CPU topology.
 
 ## Roadmap (Potential)
 
-- Optional adaptive shard expansion / rebalancing.
+- Extended rebalance telemetry and cancellation controls.
 - Zero-copy or COW snapshot mode.
 
 ---
