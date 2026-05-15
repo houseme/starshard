@@ -155,6 +155,10 @@ where
         guard.remove(key)
     }
 
+    fn previous_take(&self, key: &K) -> Option<V> {
+        self.previous_remove(key)
+    }
+
     /// Start an online incremental rebalance.
     ///
     /// Writes route to the new active shard epoch immediately; reads fallback to previous
@@ -339,32 +343,55 @@ where
 
         let started = Instant::now();
         let mut old_slots = std_write_guard(&self.shards, "rebalance_shards");
-        self.rebalance_tracker.begin(old_slots.len());
+        let mut prev_slots = std_write_guard(&self.previous_shards, "rebalance_previous_shards");
+        let total_prev = prev_slots.as_ref().map_or(0, Vec::len);
+        self.rebalance_tracker.begin(old_slots.len() + total_prev);
         let mut new_slots: Vec<Option<StdShard<K, V, S>>> = vec![None; target];
         let mut moved_entries = 0usize;
 
-        for shard in old_slots.iter().flatten() {
-            let guard = std_read_guard(shard, "rebalance_source_shard");
-            for (k, v) in guard.iter() {
-                let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
-                if new_slots[new_idx].is_none() {
-                    let map = StdShardMap::with_hasher(self.hasher.clone());
-                    new_slots[new_idx] = Some(Arc::new(StdRwLock::new(map)));
-                }
-                if let Some(dest) = new_slots[new_idx].as_ref() {
-                    let mut dest_guard = std_write_guard(dest, "rebalance_target_shard");
-                    dest_guard.insert(k.clone(), v.clone());
-                    moved_entries += 1;
+        for shard_opt in old_slots.iter() {
+            if let Some(shard) = shard_opt {
+                let guard = std_read_guard(shard, "rebalance_source_shard");
+                for (k, v) in guard.iter() {
+                    let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
+                    if new_slots[new_idx].is_none() {
+                        let map = StdShardMap::with_hasher(self.hasher.clone());
+                        new_slots[new_idx] = Some(Arc::new(StdRwLock::new(map)));
+                    }
+                    if let Some(dest) = new_slots[new_idx].as_ref() {
+                        let mut dest_guard = std_write_guard(dest, "rebalance_target_shard");
+                        dest_guard.insert(k.clone(), v.clone());
+                        moved_entries += 1;
+                    }
                 }
             }
             self.rebalance_tracker.step();
         }
 
-        *old_slots = new_slots;
-        {
-            let mut prev = std_write_guard(&self.previous_shards, "rebalance_previous_shards");
-            *prev = None;
+        if let Some(prev_vec) = prev_slots.as_ref() {
+            for shard_opt in prev_vec {
+                if let Some(shard) = shard_opt {
+                    let guard = std_read_guard(shard, "rebalance_previous_source_shard");
+                    for (k, v) in guard.iter() {
+                        let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
+                        if new_slots[new_idx].is_none() {
+                            let map = StdShardMap::with_hasher(self.hasher.clone());
+                            new_slots[new_idx] = Some(Arc::new(StdRwLock::new(map)));
+                        }
+                        if let Some(dest) = new_slots[new_idx].as_ref() {
+                            let mut dest_guard = std_write_guard(dest, "rebalance_previous_target_shard");
+                            if dest_guard.insert(k.clone(), v.clone()).is_none() {
+                                moved_entries += 1;
+                            }
+                        }
+                    }
+                }
+                self.rebalance_tracker.step();
+            }
         }
+
+        *old_slots = new_slots;
+        *prev_slots = None;
         self.previous_shard_count.store(0, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.finish();
@@ -402,13 +429,14 @@ where
     ///
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
-        let previous_old = self.previous_get(&key);
+        let lookup_key = key.clone();
         let shard = self.get_or_init_shard(self.shard_index(&key));
         let old = {
             let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
             guard.insert(key, value)
         };
         if old.is_none() {
+            let previous_old = self.previous_take(&lookup_key);
             if previous_old.is_none() {
                 self.total_len.fetch_add(1, Ordering::Relaxed);
             }
@@ -520,6 +548,21 @@ where
             let mut g = std_write_guard(shard, "shard");
             g.clear();
         }
+        {
+            let prev = std_write_guard(&self.previous_shards, "clear_previous_shards");
+            if let Some(prev_shards) = prev.as_ref() {
+                for shard in prev_shards.iter().flatten() {
+                    let mut g = std_write_guard(shard, "previous_shard");
+                    g.clear();
+                }
+            }
+        }
+        {
+            let mut prev = std_write_guard(&self.previous_shards, "clear_previous_shards_reset");
+            *prev = None;
+        }
+        self.previous_shard_count.store(0, Ordering::Relaxed);
+        self.rebalance_tracker.finish();
         self.total_len.store(0, Ordering::Relaxed);
     }
 
@@ -584,6 +627,16 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let mut inserted = 0usize;
+            for (k, v) in entries {
+                if self.insert(k, v).is_none() {
+                    inserted += 1;
+                }
+            }
+            return inserted;
+        }
+
         let buckets = self.bucketize_entries(entries);
         let mut count = 0;
         for (shard_idx, pairs) in buckets {
@@ -614,6 +667,16 @@ where
     where
         I: IntoIterator<Item = K>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let mut removed = 0usize;
+            for k in keys {
+                if self.remove(&k).is_some() {
+                    removed += 1;
+                }
+            }
+            return removed;
+        }
+
         let buckets = self.bucketize_keys(keys);
         let mut count = 0;
         for (shard_idx, keys) in buckets {
@@ -641,6 +704,10 @@ where
     ///
     #[tracing::instrument(skip(self, keys), level = "trace")]
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        if self.rebalance_tracker.is_migrating() {
+            return keys.iter().map(|k| self.get(k)).collect();
+        }
+
         let mut results = vec![None; keys.len()];
         let buckets = self.bucketize_key_refs(keys);
         for (shard_idx, items) in buckets {
@@ -669,6 +736,17 @@ where
     where
         F: FnOnce(&V) -> Option<V>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let current = self.get(key)?;
+            if let Some(new_val) = f(&current) {
+                let result = new_val.clone();
+                let _ = self.insert(key.clone(), new_val);
+                return Some(result);
+            }
+            let _ = self.remove(key);
+            return None;
+        }
+
         let shard = self.get_or_init_shard(self.shard_index(key));
         let mut guard = std_write_guard(&shard, "shard");
 
@@ -702,6 +780,15 @@ where
     where
         F: FnOnce() -> V,
     {
+        if self.rebalance_tracker.is_migrating() {
+            if let Some(existing) = self.get(&key) {
+                return existing;
+            }
+            let new_v = f();
+            let _ = self.insert(key, new_v.clone());
+            return new_v;
+        }
+
         let shard = self.get_or_init_shard(self.shard_index(&key));
         let mut guard = std_write_guard(&shard, "shard");
 

@@ -343,6 +343,10 @@ impl RebalanceTracker {
         self.moved_shards.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn is_migrating(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == REBALANCE_STATE_MIGRATING
+    }
+
     fn finish(&self) {
         self.state.store(REBALANCE_STATE_IDLE, Ordering::Relaxed);
         self.total_shards.store(0, Ordering::Relaxed);
@@ -622,6 +626,39 @@ mod tests {
         assert_eq!(m.len(), 120);
     }
 
+    #[test]
+    fn sync_rebalance_to_while_online_migrating_keeps_all_data() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i);
+        }
+        m.start_rebalance_online(16)
+            .expect("online rebalance start should succeed");
+        m.insert("hot".to_string(), 900);
+        let report = m
+            .rebalance_to(32, RebalanceOptions::default())
+            .expect("stop-the-world rebalance should succeed");
+        assert_eq!(report.to_shards, 32);
+        assert_eq!(m.rebalance_status().state, "idle");
+        assert_eq!(m.len(), 201);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")), Some(i));
+        }
+        assert_eq!(m.get(&"hot".to_string()), Some(900));
+    }
+
+    #[test]
+    fn sync_clear_removes_previous_fallback_entries_during_migration() {
+        let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+        m.insert("k".to_string(), 1);
+        m.start_rebalance_online(8)
+            .expect("online rebalance start should succeed");
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.get(&"k".to_string()), None);
+        assert_eq!(m.rebalance_status().state, "idle");
+    }
+
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_basic() {
@@ -804,6 +841,44 @@ mod tests {
         assert_eq!(m.get(&"k42".to_string()).await, None);
         assert_eq!(m.get(&"hot".to_string()).await, Some(888));
         assert_eq!(m.len().await, 120);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_rebalance_to_while_online_migrating_keeps_all_data() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        for i in 0..200 {
+            m.insert(format!("k{i}"), i).await;
+        }
+        m.start_rebalance_online(16)
+            .await
+            .expect("online rebalance start should succeed");
+        m.insert("hot".to_string(), 901).await;
+        let report = m
+            .rebalance_to(32, RebalanceOptions::default())
+            .await
+            .expect("stop-the-world rebalance should succeed");
+        assert_eq!(report.to_shards, 32);
+        assert_eq!(m.rebalance_status().state, "idle");
+        assert_eq!(m.len().await, 201);
+        for i in 0..200 {
+            assert_eq!(m.get(&format!("k{i}")).await, Some(i));
+        }
+        assert_eq!(m.get(&"hot".to_string()).await, Some(901));
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_clear_removes_previous_fallback_entries_during_migration() {
+        let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+        m.insert("k".to_string(), 1).await;
+        m.start_rebalance_online(8)
+            .await
+            .expect("online rebalance start should succeed");
+        m.clear().await;
+        assert_eq!(m.len().await, 0);
+        assert_eq!(m.get(&"k".to_string()).await, None);
+        assert_eq!(m.rebalance_status().state, "idle");
     }
 
     #[cfg(feature = "serde")]

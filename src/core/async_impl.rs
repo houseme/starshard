@@ -155,6 +155,10 @@ where
         guard.remove(key)
     }
 
+    async fn previous_take(&self, key: &K) -> Option<V> {
+        self.previous_remove(key).await
+    }
+
     /// Start an online incremental rebalance.
     ///
     /// Writes route to the new active shard epoch immediately; reads fallback to previous
@@ -342,32 +346,55 @@ where
 
         let started = Instant::now();
         let mut old_slots = self.shards.write().await;
-        self.rebalance_tracker.begin(old_slots.len());
+        let mut prev_slots = self.previous_shards.write().await;
+        let total_prev = prev_slots.as_ref().map_or(0, Vec::len);
+        self.rebalance_tracker.begin(old_slots.len() + total_prev);
         let mut new_slots: Vec<Option<AsyncShard<K, V, S>>> = vec![None; target];
         let mut moved_entries = 0usize;
 
-        for shard in old_slots.iter().flatten() {
-            let guard = shard.read().await;
-            for (k, v) in guard.iter() {
-                let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
-                if new_slots[new_idx].is_none() {
-                    let map = AsyncShardMap::with_hasher(self.hasher.clone());
-                    new_slots[new_idx] = Some(Arc::new(TokioRwLock::new(map)));
-                }
-                if let Some(dest) = new_slots[new_idx].as_ref() {
-                    let mut dest_guard = dest.write().await;
-                    dest_guard.insert(k.clone(), v.clone());
-                    moved_entries += 1;
+        for shard_opt in old_slots.iter() {
+            if let Some(shard) = shard_opt {
+                let guard = shard.read().await;
+                for (k, v) in guard.iter() {
+                    let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
+                    if new_slots[new_idx].is_none() {
+                        let map = AsyncShardMap::with_hasher(self.hasher.clone());
+                        new_slots[new_idx] = Some(Arc::new(TokioRwLock::new(map)));
+                    }
+                    if let Some(dest) = new_slots[new_idx].as_ref() {
+                        let mut dest_guard = dest.write().await;
+                        dest_guard.insert(k.clone(), v.clone());
+                        moved_entries += 1;
+                    }
                 }
             }
             self.rebalance_tracker.step();
         }
 
-        *old_slots = new_slots;
-        {
-            let mut prev = self.previous_shards.write().await;
-            *prev = None;
+        if let Some(prev_vec) = prev_slots.as_ref() {
+            for shard_opt in prev_vec {
+                if let Some(shard) = shard_opt {
+                    let guard = shard.read().await;
+                    for (k, v) in guard.iter() {
+                        let new_idx = (self.hasher.hash_one(k) % target as u64) as usize;
+                        if new_slots[new_idx].is_none() {
+                            let map = AsyncShardMap::with_hasher(self.hasher.clone());
+                            new_slots[new_idx] = Some(Arc::new(TokioRwLock::new(map)));
+                        }
+                        if let Some(dest) = new_slots[new_idx].as_ref() {
+                            let mut dest_guard = dest.write().await;
+                            if dest_guard.insert(k.clone(), v.clone()).is_none() {
+                                moved_entries += 1;
+                            }
+                        }
+                    }
+                }
+                self.rebalance_tracker.step();
+            }
         }
+
+        *old_slots = new_slots;
+        *prev_slots = None;
         self.previous_shard_count.store(0, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.finish();
@@ -401,13 +428,14 @@ where
     ///
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub async fn insert(&self, key: K, value: V) -> Option<V> {
-        let previous_old = self.previous_get(&key).await;
+        let lookup_key = key.clone();
         let shard = self.get_or_init_shard(self.shard_index(&key)).await;
         let old = {
             let mut guard: TokioWriteGuard<'_, HashMap<K, V, S>> = shard.write().await;
             guard.insert(key, value)
         };
         if old.is_none() {
+            let previous_old = self.previous_take(&lookup_key).await;
             if previous_old.is_none() {
                 self.total_len.fetch_add(1, Ordering::Relaxed);
             }
@@ -527,6 +555,21 @@ where
             let mut g = shard.write().await;
             g.clear();
         }
+        {
+            let prev = self.previous_shards.write().await;
+            if let Some(prev_shards) = prev.as_ref() {
+                for shard in prev_shards.iter().flatten() {
+                    let mut g = shard.write().await;
+                    g.clear();
+                }
+            }
+        }
+        {
+            let mut prev = self.previous_shards.write().await;
+            *prev = None;
+        }
+        self.previous_shard_count.store(0, Ordering::Relaxed);
+        self.rebalance_tracker.finish();
         self.total_len.store(0, Ordering::Relaxed);
     }
 
@@ -589,6 +632,16 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let mut inserted = 0usize;
+            for (k, v) in entries {
+                if self.insert(k, v).await.is_none() {
+                    inserted += 1;
+                }
+            }
+            return inserted;
+        }
+
         let buckets = self.bucketize_entries(entries);
         let mut count = 0;
         for (shard_idx, pairs) in buckets {
@@ -619,6 +672,16 @@ where
     where
         I: IntoIterator<Item = K>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let mut removed = 0usize;
+            for k in keys {
+                if self.remove(&k).await.is_some() {
+                    removed += 1;
+                }
+            }
+            return removed;
+        }
+
         let buckets = self.bucketize_keys(keys);
         let mut count = 0;
         for (shard_idx, keys) in buckets {
@@ -646,6 +709,14 @@ where
     ///
     #[tracing::instrument(skip(self, keys), level = "trace")]
     pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        if self.rebalance_tracker.is_migrating() {
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                out.push(self.get(k).await);
+            }
+            return out;
+        }
+
         let mut results = vec![None; keys.len()];
         let buckets = self.bucketize_key_refs(keys);
         for (shard_idx, items) in buckets {
@@ -674,6 +745,17 @@ where
     where
         F: FnOnce(V) -> Option<V>,
     {
+        if self.rebalance_tracker.is_migrating() {
+            let current = self.get(key).await?;
+            if let Some(new_v) = f(current) {
+                let result = new_v.clone();
+                let _ = self.insert(key.clone(), new_v).await;
+                return Some(result);
+            }
+            let _ = self.remove(key).await;
+            return None;
+        }
+
         let shard = self.get_or_init_shard(self.shard_index(key)).await;
         let mut guard = shard.write().await;
 
@@ -703,6 +785,15 @@ where
     where
         F: FnOnce() -> V,
     {
+        if self.rebalance_tracker.is_migrating() {
+            if let Some(existing) = self.get(&key).await {
+                return existing;
+            }
+            let new_v = f();
+            let _ = self.insert(key, new_v.clone()).await;
+            return new_v;
+        }
+
         let shard = self.get_or_init_shard(self.shard_index(&key)).await;
         let mut guard = shard.write().await;
 
