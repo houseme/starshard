@@ -87,6 +87,44 @@ jobs:
           toolchain: stable
       - name: Run cargo test
         run: cargo test --all-features
+  feature_matrix:
+    name: Feature Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Run feature matrix
+        run: ./scripts/verify_feature_matrix.sh
+  doc_tests:
+    name: Doc Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Run doctests
+        run: cargo test --doc --all-features
   publish_on_crates_io:
     name: Publish on crates.io
     runs-on: ubuntu-latest
@@ -96,6 +134,8 @@ jobs:
       - rust_fmt_check
       - clippy_check
       - test
+      - feature_matrix
+      - doc_tests
     steps:
       - name: Checkout code
         uses: actions/checkout@v6

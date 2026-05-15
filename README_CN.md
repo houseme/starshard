@@ -16,7 +16,7 @@
 
 ## 状态
 
-生产就绪 (v1.2+)。API 稳定性优先。
+生产就绪 (v2.0+)。API 稳定性优先。
 
 ## 为什么需要它
 
@@ -55,15 +55,24 @@ Starshard 目标：
 all-features = true
 ```
 
+`v2.0.0` 当前内部结构：
+
+- `src/core/sync_impl.rs`
+- `src/core/async_impl.rs`
+- `src/core/types.rs`
+- `src/core/helpers.rs`
+- `src/serde/sync_serde.rs`
+- `src/serde/async_snapshot.rs`
+
 ---
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "1.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小：
-# starshard = "1.2"
+# starshard = "2.0.0"
 ```
 
 开发/测试:
@@ -171,7 +180,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | 读多写少 vs 全局单锁     | 写冲突显著下降               |
 | 大量快照迭代 + `rayon` | 3~4 倍扁平化速度 (100k+ 元素) |
 | 稀疏访问             | 仅访问分片分配内存             |
-| 批量插入/移除          | 每个分片组仅一次锁获取           |
+| 批量插入/移除          | 每个分片组仅一次锁获取，`v2.0.0` 使用稀疏分桶降低额外内存开销 |
 
 请基准测试你的真实负载（键分布、核心数、缓存行为）。
 
@@ -327,19 +336,19 @@ async fn main() {
 
 ## 特性矩阵
 
-| 特性                     | v0.7 | v0.8 | v0.9 | v1.0 | 状态              |
-|------------------------|------|------|------|------|-----------------|
-| 分片 HashMap (同步)      | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 异步 (Tokio)             | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 并行迭代 (rayon)           | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| Serde (反)序列化           | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 条件操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
-| 批量操作                   | -    | ✅    | ✅    | ✅    | 稳定              |
-| 生命周期工具                | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
-| 淘汰/指标原语               | -    | -    | ✅    | ✅    | 稳定 (lifecycle) |
-| 事务                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
-| CAS 操作                 | -    | -    | -    | ✅    | 稳定 (advanced)  |
-| 复制                     | -    | -    | -    | ✅    | 稳定 (advanced)  |
+| 特性                     | v0.7 | v0.8 | v0.9 | v1.0 | v2.0 | 状态              |
+|------------------------|------|------|------|------|------|-----------------|
+| 分片 HashMap (同步)      | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 异步 (Tokio)             | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 并行迭代 (rayon)           | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| Serde (反)序列化           | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 条件操作                   | -    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 批量操作                   | -    | ✅    | ✅    | ✅    | ✅    | 稳定              |
+| 生命周期工具                | -    | -    | ✅    | ✅    | ✅    | 稳定 (lifecycle) |
+| 淘汰/指标原语               | -    | -    | ✅    | ✅    | ✅    | 稳定 (lifecycle) |
+| 事务                     | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
+| CAS 操作                 | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
+| 复制                     | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
 
 ---
 
@@ -361,6 +370,18 @@ Arc -> RwLock<Vec<Option<Arc<RwLock<HashMap<K,V,S>>>>>> + AtomicUsize(len)
 | Serde 同步   | `serde_json::to_string(&map)`   |
 | 异步快照序列化    | `async_snapshot_serializable()` |
 | 自定义 hasher | `with_shards_and_hasher`        |
+| 自定义分片上限    | `with_shards_and_hasher_capped` |
+| 严格校验构造      | `try_with_shards_and_hasher`    |
+
+---
+
+## 分片数量安全策略
+
+- 不抛错构造函数默认使用 `MAX_SHARDS` 上限，避免超大分配导致内存风险。
+- 如需自定义上限，可使用 `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`。
+- 如需严格模式（不裁剪，超限直接报错），使用
+  `try_with_shards_and_hasher(..)` 或 `try_with_shards_and_hasher_capped(..)`，
+  返回 `ShardCountError`。
 
 ---
 
