@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-05-15
+
+### Added
+
+- **Adaptive rebalance APIs (sync + async)**:
+    - Added stop-the-world rebalance:
+      - `ShardedHashMap::rebalance_to(...)`
+      - `AsyncShardedHashMap::rebalance_to(...).await`
+    - Added online incremental rebalance lifecycle:
+      - `start_rebalance_online(...)`
+      - `advance_rebalance(...)`
+    - Added status snapshot API:
+      - `rebalance_status() -> RebalanceStatus`
+    - Added data models:
+      - `RebalanceOptions`
+      - `RebalanceReport`
+      - `RebalanceStatus`
+
+### Changed
+
+- **Routing internals for shard expansion**:
+    - Reworked internal shard-count storage to allow safe runtime shard-count transitions.
+    - Added previous-epoch shard storage for online migration fallback reads.
+    - Updated read/write paths so online migration follows active-first, previous-fallback semantics.
+
+### Tests
+
+- Added rebalance test coverage for:
+    - stop-the-world sync/async migration correctness
+    - status lifecycle correctness
+    - online incremental sync/async migration path
+
 ## [2.0.0] - 2026-05-15
 
 ### Changed
@@ -11,12 +43,22 @@ All notable changes to this project will be documented in this file.
 - **Version bump**:
     - Crate version updated from `1.2.0` to `2.0.0`.
 
-- **Internal architecture refactor (API unchanged)**:
+- **Shard safety hardening (public API + behavior update)**:
+    - Added `MAX_SHARDS` default hard cap to guard infallible constructors against oversized allocations.
+    - Added `ShardCountError` and strict constructors:
+      `try_with_shards_and_hasher(...)` and `try_with_shards_and_hasher_capped(...)`
+      for both sync and async maps.
+    - Added capped constructors:
+      `with_shards_and_hasher_capped(...)` for both sync and async maps.
+    - Updated constructor behavior so oversized requests are clamped (infallible constructors)
+      or rejected (strict constructors) instead of allocating unbounded shard vectors.
+
+- **Internal architecture refactor**:
     - Split core sync implementation out of `src/lib.rs` into `src/core/sync_impl.rs`.
     - Split core async implementation out of `src/lib.rs` into `src/core/async_impl.rs`.
     - Extracted serde implementation into `src/serde/sync_serde.rs` and `src/serde/async_snapshot.rs`.
     - Added core internal split files: `src/core/types.rs` and `src/core/helpers.rs`.
-    - Kept public API surface and feature behavior stable while reducing `lib.rs` complexity.
+    - Reduced `lib.rs` complexity by moving implementation details into focused modules.
 
 - **Batch-path performance optimization**:
     - Reworked sync/async `batch_insert`, `batch_remove`, and `batch_get` grouping to sparse per-touched-shard buckets.
@@ -27,7 +69,7 @@ All notable changes to this project will be documented in this file.
 
 - **Refactor guardrails and verification scripts**:
     - Added `scripts/export_api_surface.sh` for API-surface snapshot/export.
-    - Added `scripts/verify_feature_matrix.sh` for repeatable feature-matrix + doctest validation.
+    - Added `scripts/verify_feature_matrix.sh` for repeatable feature-matrix validation.
 
 - **CI hardening**:
     - Added dedicated feature matrix job in GitHub Actions.
