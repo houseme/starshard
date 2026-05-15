@@ -11,12 +11,22 @@ All notable changes to this project will be documented in this file.
 - **Version bump**:
     - Crate version updated from `1.2.0` to `2.0.0`.
 
-- **Internal architecture refactor (API unchanged)**:
+- **Shard safety hardening (public API + behavior update)**:
+    - Added `MAX_SHARDS` default hard cap to guard infallible constructors against oversized allocations.
+    - Added `ShardCountError` and strict constructors:
+      `try_with_shards_and_hasher(...)` and `try_with_shards_and_hasher_capped(...)`
+      for both sync and async maps.
+    - Added capped constructors:
+      `with_shards_and_hasher_capped(...)` for both sync and async maps.
+    - Updated constructor behavior so oversized requests are clamped (infallible constructors)
+      or rejected (strict constructors) instead of allocating unbounded shard vectors.
+
+- **Internal architecture refactor**:
     - Split core sync implementation out of `src/lib.rs` into `src/core/sync_impl.rs`.
     - Split core async implementation out of `src/lib.rs` into `src/core/async_impl.rs`.
     - Extracted serde implementation into `src/serde/sync_serde.rs` and `src/serde/async_snapshot.rs`.
     - Added core internal split files: `src/core/types.rs` and `src/core/helpers.rs`.
-    - Kept public API surface and feature behavior stable while reducing `lib.rs` complexity.
+    - Reduced `lib.rs` complexity by moving implementation details into focused modules.
 
 - **Batch-path performance optimization**:
     - Reworked sync/async `batch_insert`, `batch_remove`, and `batch_get` grouping to sparse per-touched-shard buckets.
@@ -27,7 +37,7 @@ All notable changes to this project will be documented in this file.
 
 - **Refactor guardrails and verification scripts**:
     - Added `scripts/export_api_surface.sh` for API-surface snapshot/export.
-    - Added `scripts/verify_feature_matrix.sh` for repeatable feature-matrix + doctest validation.
+    - Added `scripts/verify_feature_matrix.sh` for repeatable feature-matrix validation.
 
 - **CI hardening**:
     - Added dedicated feature matrix job in GitHub Actions.
