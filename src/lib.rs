@@ -148,7 +148,7 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::{
     Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
     RwLockWriteGuard as StdWriteGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "async")]
@@ -181,9 +181,15 @@ pub use advanced::{
 };
 
 pub(crate) use crate::core::StdShardVecArc;
+type StdCowShard<K, V, S> = Arc<StdRwLock<Arc<HashMap<K, V, S>>>>;
+type StdCowShardVecArc<K, V, S> = Arc<StdRwLock<Vec<Option<StdCowShard<K, V, S>>>>>;
 
 #[cfg(feature = "async")]
 pub(crate) use crate::core::AsyncShardVecArc;
+#[cfg(feature = "async")]
+type AsyncCowShard<K, V, S> = Arc<TokioRwLock<Arc<HashMap<K, V, S>>>>;
+#[cfg(feature = "async")]
+type AsyncCowShardVecArc<K, V, S> = Arc<TokioRwLock<Vec<Option<AsyncCowShard<K, V, S>>>>>;
 
 #[cfg(all(feature = "async", feature = "advanced"))]
 pub(crate) use crate::core::ReplicaList;
@@ -197,6 +203,18 @@ pub const DEFAULT_SHARDS: usize = 64;
 /// If you need a different cap, use `with_shards_and_hasher_capped(...)` or
 /// `try_with_shards_and_hasher_capped(...)`.
 pub const MAX_SHARDS: usize = 262_144;
+
+/// Snapshot construction mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Always rebuild snapshot content on demand.
+    #[default]
+    Clone,
+    /// Reuse snapshot cache while no writes happen.
+    Cached,
+    /// Use per-shard copy-on-write versions for snapshot reads.
+    Cow,
+}
 
 /// Error returned by strict shard-count constructors.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,12 +406,17 @@ where
     V: Clone + Send + Sync,
     S: BuildHasher + Clone + Send + Sync,
 {
+    snapshot_mode: SnapshotMode,
     shards: StdShardVecArc<K, V, S>,
+    cow_shards: StdCowShardVecArc<K, V, S>,
     previous_shards: Arc<StdRwLock<Option<crate::core::StdShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,
     previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
+    write_epoch: Arc<AtomicU64>,
+    snapshot_cache: Arc<StdRwLock<Option<Arc<Vec<(K, V)>>>>>,
+    snapshot_cache_epoch: Arc<AtomicU64>,
     rebalance_lock: Arc<StdMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
     #[cfg(feature = "advanced")]
@@ -421,12 +444,17 @@ where
     V: Clone + Send + Sync,
     S: BuildHasher + Clone + Send + Sync,
 {
+    snapshot_mode: SnapshotMode,
     shards: AsyncShardVecArc<K, V, S>,
+    cow_shards: AsyncCowShardVecArc<K, V, S>,
     previous_shards: Arc<TokioRwLock<Option<crate::core::AsyncShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,
     previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
+    write_epoch: Arc<AtomicU64>,
+    snapshot_cache: Arc<TokioRwLock<Option<Arc<Vec<(K, V)>>>>>,
+    snapshot_cache_epoch: Arc<AtomicU64>,
     rebalance_lock: Arc<TokioMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
     #[cfg(feature = "advanced")]
@@ -1242,5 +1270,76 @@ mod tests {
         let drained: Vec<_> = m.drain().await.collect();
         assert_eq!(drained.len(), 3);
         assert_eq!(m.len().await, 0);
+    }
+
+    #[test]
+    fn sync_cached_snapshot_cache_invalidation() {
+        let m: ShardedHashMap<String, i32> =
+            ShardedHashMap::with_snapshot_mode(4, SnapshotMode::Cached);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+
+        let first = m.iter().collect::<Vec<_>>();
+        let second = m.iter().collect::<Vec<_>>();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+        let epoch = m.write_epoch.load(Ordering::Relaxed);
+        assert_eq!(m.snapshot_cache_epoch.load(Ordering::Relaxed), epoch);
+
+        m.insert("c".into(), 3);
+        let cache = m.snapshot_cache.read().unwrap_or_else(|e| e.into_inner());
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn sync_cow_mode_iter_matches_writes() {
+        let m: ShardedHashMap<String, i32> =
+            ShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
+        m.insert("a".into(), 1);
+        m.insert("b".into(), 2);
+        m.remove(&"a".into());
+
+        let mut values = m.iter().map(|(_, v)| v).collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![2]);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_cached_snapshot_cache_invalidation() {
+        let m: AsyncShardedHashMap<String, i32> =
+            AsyncShardedHashMap::with_snapshot_mode(4, SnapshotMode::Cached);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+
+        let first = m.iter().await;
+        let second = m.iter().await;
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+        let epoch = m.write_epoch.load(Ordering::Relaxed);
+        assert_eq!(m.snapshot_cache_epoch.load(Ordering::Relaxed), epoch);
+
+        m.insert("c".into(), 3).await;
+        let cache = m.snapshot_cache.read().await;
+        assert!(cache.is_none());
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_cow_mode_iter_matches_writes() {
+        let m: AsyncShardedHashMap<String, i32> =
+            AsyncShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
+        m.insert("a".into(), 1).await;
+        m.insert("b".into(), 2).await;
+        m.remove(&"a".into()).await;
+
+        let mut values = m
+            .iter()
+            .await
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![2]);
     }
 }
