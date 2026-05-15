@@ -55,15 +55,24 @@ Starshard 目标：
 all-features = true
 ```
 
+`v2.0.0` 当前内部结构：
+
+- `src/core/sync_impl.rs`
+- `src/core/async_impl.rs`
+- `src/core/types.rs`
+- `src/core/helpers.rs`
+- `src/serde/sync_serde.rs`
+- `src/serde/async_snapshot.rs`
+
 ---
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小：
-# starshard = "2.0"
+# starshard = "2.0.0"
 ```
 
 开发/测试:
@@ -171,7 +180,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | 读多写少 vs 全局单锁     | 写冲突显著下降               |
 | 大量快照迭代 + `rayon` | 3~4 倍扁平化速度 (100k+ 元素) |
 | 稀疏访问             | 仅访问分片分配内存             |
-| 批量插入/移除          | 每个分片组仅一次锁获取，v2.0 降低分组阶段额外开销 |
+| 批量插入/移除          | 每个分片组仅一次锁获取，`v2.0.0` 使用稀疏分桶降低额外内存开销 |
 
 请基准测试你的真实负载（键分布、核心数、缓存行为）。
 

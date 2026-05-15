@@ -55,15 +55,24 @@ Enable all in docs.rs via:
 all-features = true
 ```
 
+Internal layout in `v2.0.0`:
+
+- `src/core/sync_impl.rs`
+- `src/core/async_impl.rs`
+- `src/core/types.rs`
+- `src/core/helpers.rs`
+- `src/serde/sync_serde.rs`
+- `src/serde/async_snapshot.rs`
+
 ---
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # or minimal:
-# starshard = "2.0"
+# starshard = "2.0.0"
 ```
 
 `serde_json` (tests / examples):
@@ -173,7 +182,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | Read-heavy mixed workload vs global `RwLock<HashMap>` | Reduced contention           |
 | Large snapshot iteration with `rayon` (100k+)         | 3-4x speedup flattening      |
 | Sparse shard usage                                    | Only touched shards allocate |
-| Batch Insert/Remove                                   | Single lock per shard group + lower grouping overhead in v2.0 |
+| Batch Insert/Remove                                   | Single lock per shard group + sparse grouping in v2.0.0 |
 
 Do benchmark with your own key/value distribution and CPU topology.
 

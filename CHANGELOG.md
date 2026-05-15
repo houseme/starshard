@@ -12,15 +12,16 @@ All notable changes to this project will be documented in this file.
     - Crate version updated from `1.2.0` to `2.0.0`.
 
 - **Internal architecture refactor (API unchanged)**:
-    - Split core sync implementation out of `src/lib.rs` into `src/sync_impl.rs`.
-    - Split core async implementation out of `src/lib.rs` into `src/async_impl.rs`.
-    - Extracted serde implementation into `src/serde_impl.rs`.
+    - Split core sync implementation out of `src/lib.rs` into `src/core/sync_impl.rs`.
+    - Split core async implementation out of `src/lib.rs` into `src/core/async_impl.rs`.
+    - Extracted serde implementation into `src/serde/sync_serde.rs` and `src/serde/async_snapshot.rs`.
+    - Added core internal split files: `src/core/types.rs` and `src/core/helpers.rs`.
     - Kept public API surface and feature behavior stable while reducing `lib.rs` complexity.
 
 - **Batch-path performance optimization**:
-    - Reworked sync/async `batch_insert`, `batch_remove`, and `batch_get` grouping from per-call
-      `HashMap<usize, Vec<_>>` to indexed shard buckets.
-    - Reduced grouping overhead and extra hashing work on hot paths while preserving semantics.
+    - Reworked sync/async `batch_insert`, `batch_remove`, and `batch_get` grouping to sparse per-touched-shard buckets.
+    - Eliminated shard-count-sized per-call bucket preallocation in batch grouping paths.
+    - Improved async `compute_if_present` to evaluate closure before removal, aligning sync/async behavior and avoiding unnecessary remove+reinsert work.
 
 ### Added
 
