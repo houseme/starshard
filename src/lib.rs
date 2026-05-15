@@ -180,27 +180,13 @@ pub use advanced::{
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
-/* -------------------------------------------------------------------------- */
-/* Internal Type Aliases (reduce visible complexity & silence Clippy)         */
-/* -------------------------------------------------------------------------- */
-
-type StdShardMap<K, V, S> = HashMap<K, V, S>;
-type StdShard<K, V, S> = Arc<StdRwLock<StdShardMap<K, V, S>>>;
-type StdShardVec<K, V, S> = Vec<Option<StdShard<K, V, S>>>;
-type StdShardVecArc<K, V, S> = Arc<StdRwLock<StdShardVec<K, V, S>>>;
+pub(crate) use crate::core::StdShardVecArc;
 
 #[cfg(feature = "async")]
-type AsyncShardMap<K, V, S> = HashMap<K, V, S>;
-#[cfg(feature = "async")]
-type AsyncShard<K, V, S> = Arc<TokioRwLock<AsyncShardMap<K, V, S>>>;
-#[cfg(feature = "async")]
-type AsyncShardVec<K, V, S> = Vec<Option<AsyncShard<K, V, S>>>;
-#[cfg(feature = "async")]
-type AsyncShardVecArc<K, V, S> = Arc<TokioRwLock<AsyncShardVec<K, V, S>>>;
+pub(crate) use crate::core::AsyncShardVecArc;
 
-/// Type alias for replica list to reduce type complexity
 #[cfg(all(feature = "async", feature = "advanced"))]
-type ReplicaList<K, V> = Arc<StdRwLock<Vec<Arc<dyn advanced::Replica<K, V>>>>>;
+pub(crate) use crate::core::ReplicaList;
 
 /// Default shard count (power-of-two not required; hashing modulo used).
 pub const DEFAULT_SHARDS: usize = 64;
@@ -239,32 +225,6 @@ impl ShardStats {
             0.0
         } else {
             (self.initialized as f64 / self.total as f64) * 100.0
-        }
-    }
-}
-
-/* -------------------------------------------------------------------------- */
-/* Sync Lock Helpers (poisoned lock fallback + logging)                       */
-/* -------------------------------------------------------------------------- */
-
-#[inline]
-fn std_read_guard<'a, T>(lock: &'a StdRwLock<T>, context: &'static str) -> StdReadGuard<'a, T> {
-    match lock.read() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            tracing::error!(context = %context, "std rwlock poisoned (read)");
-            poisoned.into_inner()
-        }
-    }
-}
-
-#[inline]
-fn std_write_guard<'a, T>(lock: &'a StdRwLock<T>, context: &'static str) -> StdWriteGuard<'a, T> {
-    match lock.write() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            tracing::error!(context = %context, "std rwlock poisoned (write)");
-            poisoned.into_inner()
         }
     }
 }
