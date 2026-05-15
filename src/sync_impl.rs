@@ -80,6 +80,42 @@ where
         }
     }
 
+    #[inline]
+    fn bucketize_entries<I>(&self, entries: I) -> Vec<Vec<(K, V)>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut buckets = vec![Vec::new(); self.shard_count];
+        for (k, v) in entries {
+            let shard_idx = self.shard_index(&k);
+            buckets[shard_idx].push((k, v));
+        }
+        buckets
+    }
+
+    #[inline]
+    fn bucketize_keys<I>(&self, keys: I) -> Vec<Vec<K>>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut buckets = vec![Vec::new(); self.shard_count];
+        for k in keys {
+            let shard_idx = self.shard_index(&k);
+            buckets[shard_idx].push(k);
+        }
+        buckets
+    }
+
+    #[inline]
+    fn bucketize_key_refs<'a>(&self, keys: &'a [K]) -> Vec<Vec<(usize, &'a K)>> {
+        let mut buckets = vec![Vec::new(); self.shard_count];
+        for (idx, key) in keys.iter().enumerate() {
+            let shard_idx = self.shard_index(key);
+            buckets[shard_idx].push((idx, key));
+        }
+        buckets
+    }
+
     /// Insert key/value. Returns previous value if existed.
     ///
     /// Complexity: O(1) expected.
@@ -251,16 +287,12 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        let mut grouped: std::collections::HashMap<usize, Vec<(K, V)>> =
-            std::collections::HashMap::default();
-
-        for (k, v) in entries {
-            let shard_idx = self.shard_index(&k);
-            grouped.entry(shard_idx).or_default().push((k, v));
-        }
-
+        let buckets = self.bucketize_entries(entries);
         let mut count = 0;
-        for (shard_idx, pairs) in grouped {
+        for (shard_idx, pairs) in buckets.into_iter().enumerate() {
+            if pairs.is_empty() {
+                continue;
+            }
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
             for (k, v) in pairs {
@@ -288,16 +320,12 @@ where
     where
         I: IntoIterator<Item = K>,
     {
-        let mut grouped: std::collections::HashMap<usize, Vec<K>> =
-            std::collections::HashMap::default();
-
-        for k in keys {
-            let shard_idx = self.shard_index(&k);
-            grouped.entry(shard_idx).or_default().push(k);
-        }
-
+        let buckets = self.bucketize_keys(keys);
         let mut count = 0;
-        for (shard_idx, keys) in grouped {
+        for (shard_idx, keys) in buckets.into_iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
             for k in keys {
@@ -323,15 +351,11 @@ where
     #[tracing::instrument(skip(self, keys), level = "trace")]
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = vec![None; keys.len()];
-        let mut grouped: std::collections::HashMap<usize, Vec<(usize, &K)>> =
-            std::collections::HashMap::default();
-
-        for (idx, key) in keys.iter().enumerate() {
-            let shard_idx = self.shard_index(key);
-            grouped.entry(shard_idx).or_default().push((idx, key));
-        }
-
-        for (shard_idx, items) in grouped {
+        let buckets = self.bucketize_key_refs(keys);
+        for (shard_idx, items) in buckets.into_iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
             let shard = self.get_or_init_shard(shard_idx);
             let guard = std_read_guard(&shard, "shard");
             for (idx, key) in items {
