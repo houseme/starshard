@@ -81,37 +81,48 @@ where
     }
 
     #[inline]
-    fn bucketize_entries<I>(&self, entries: I) -> Vec<Vec<(K, V)>>
+    fn bucketize_entries<I>(&self, entries: I) -> HashMap<usize, Vec<(K, V)>, FxBuildHasher>
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        let mut buckets = vec![Vec::new(); self.shard_count];
-        for (k, v) in entries {
+        let iter = entries.into_iter();
+        let estimated = iter.size_hint().0.min(self.shard_count);
+        let mut buckets: HashMap<usize, Vec<(K, V)>, FxBuildHasher> =
+            HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
+        for (k, v) in iter {
             let shard_idx = self.shard_index(&k);
-            buckets[shard_idx].push((k, v));
+            buckets.entry(shard_idx).or_default().push((k, v));
         }
         buckets
     }
 
     #[inline]
-    fn bucketize_keys<I>(&self, keys: I) -> Vec<Vec<K>>
+    fn bucketize_keys<I>(&self, keys: I) -> HashMap<usize, Vec<K>, FxBuildHasher>
     where
         I: IntoIterator<Item = K>,
     {
-        let mut buckets = vec![Vec::new(); self.shard_count];
-        for k in keys {
+        let iter = keys.into_iter();
+        let estimated = iter.size_hint().0.min(self.shard_count);
+        let mut buckets: HashMap<usize, Vec<K>, FxBuildHasher> =
+            HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
+        for k in iter {
             let shard_idx = self.shard_index(&k);
-            buckets[shard_idx].push(k);
+            buckets.entry(shard_idx).or_default().push(k);
         }
         buckets
     }
 
     #[inline]
-    fn bucketize_key_refs<'a>(&self, keys: &'a [K]) -> Vec<Vec<(usize, &'a K)>> {
-        let mut buckets = vec![Vec::new(); self.shard_count];
+    fn bucketize_key_refs<'a>(
+        &self,
+        keys: &'a [K],
+    ) -> HashMap<usize, Vec<(usize, &'a K)>, FxBuildHasher> {
+        let estimated = keys.len().min(self.shard_count);
+        let mut buckets: HashMap<usize, Vec<(usize, &'a K)>, FxBuildHasher> =
+            HashMap::with_capacity_and_hasher(estimated, FxBuildHasher);
         for (idx, key) in keys.iter().enumerate() {
             let shard_idx = self.shard_index(key);
-            buckets[shard_idx].push((idx, key));
+            buckets.entry(shard_idx).or_default().push((idx, key));
         }
         buckets
     }
@@ -289,10 +300,7 @@ where
     {
         let buckets = self.bucketize_entries(entries);
         let mut count = 0;
-        for (shard_idx, pairs) in buckets.into_iter().enumerate() {
-            if pairs.is_empty() {
-                continue;
-            }
+        for (shard_idx, pairs) in buckets {
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
             for (k, v) in pairs {
@@ -322,10 +330,7 @@ where
     {
         let buckets = self.bucketize_keys(keys);
         let mut count = 0;
-        for (shard_idx, keys) in buckets.into_iter().enumerate() {
-            if keys.is_empty() {
-                continue;
-            }
+        for (shard_idx, keys) in buckets {
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
             for k in keys {
@@ -352,10 +357,7 @@ where
     pub fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
         let mut results = vec![None; keys.len()];
         let buckets = self.bucketize_key_refs(keys);
-        for (shard_idx, items) in buckets.into_iter().enumerate() {
-            if items.is_empty() {
-                continue;
-            }
+        for (shard_idx, items) in buckets {
             let shard = self.get_or_init_shard(shard_idx);
             let guard = std_read_guard(&shard, "shard");
             for (idx, key) in items {
