@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use starshard::ShardedHashMap;
+use starshard::{ShardedHashMap, SnapshotMode};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
@@ -60,5 +60,100 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_insert, bench_get, bench_concurrent_mixed);
+fn bench_snapshot_modes_low_write_high_snapshot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_mode_low_write_high_snapshot");
+    let modes = [
+        ("clone", SnapshotMode::Clone),
+        ("cached", SnapshotMode::Cached),
+        ("cow", SnapshotMode::Cow),
+    ];
+
+    for (name, mode) in modes {
+        group.bench_function(name, |b| {
+            let map: ShardedHashMap<String, i32> = ShardedHashMap::with_snapshot_mode(64, mode);
+            for i in 0..50_000 {
+                map.insert(format!("key_{i}"), i);
+            }
+            let mut write_tick = 0usize;
+            b.iter(|| {
+                for _ in 0..200 {
+                    let snapshot_len = map.iter().count();
+                    black_box(snapshot_len);
+                }
+                let key = format!("warm_key_{}", write_tick % 1024);
+                map.insert(key, write_tick as i32);
+                write_tick += 1;
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_snapshot_modes_mid_write_mid_snapshot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_mode_mid_write_mid_snapshot");
+    let modes = [
+        ("clone", SnapshotMode::Clone),
+        ("cached", SnapshotMode::Cached),
+        ("cow", SnapshotMode::Cow),
+    ];
+
+    for (name, mode) in modes {
+        group.bench_function(name, |b| {
+            let map: ShardedHashMap<String, i32> = ShardedHashMap::with_snapshot_mode(64, mode);
+            for i in 0..50_000 {
+                map.insert(format!("key_{i}"), i);
+            }
+            let mut tick = 0usize;
+            b.iter(|| {
+                for _ in 0..20 {
+                    for _ in 0..20 {
+                        let key = format!("rw_key_{}", tick % 10_000);
+                        map.insert(key, tick as i32);
+                        tick += 1;
+                    }
+                    black_box(map.iter().count());
+                }
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_snapshot_modes_high_write_low_snapshot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_mode_high_write_low_snapshot");
+    let modes = [
+        ("clone", SnapshotMode::Clone),
+        ("cached", SnapshotMode::Cached),
+        ("cow", SnapshotMode::Cow),
+    ];
+
+    for (name, mode) in modes {
+        group.bench_function(name, |b| {
+            let map: ShardedHashMap<String, i32> = ShardedHashMap::with_snapshot_mode(64, mode);
+            for i in 0..50_000 {
+                map.insert(format!("key_{i}"), i);
+            }
+            let mut tick = 0usize;
+            b.iter(|| {
+                for _ in 0..2_000 {
+                    let key = format!("hot_key_{}", tick % 20_000);
+                    map.insert(key, tick as i32);
+                    tick += 1;
+                }
+                black_box(map.iter().count());
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_insert,
+    bench_get,
+    bench_concurrent_mixed,
+    bench_snapshot_modes_low_write_high_snapshot,
+    bench_snapshot_modes_mid_write_mid_snapshot,
+    bench_snapshot_modes_high_write_low_snapshot
+);
 criterion_main!(benches);

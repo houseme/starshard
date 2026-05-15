@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-05-15
+
+### Added
+
+- **Snapshot mode APIs (sync + async)**:
+    - Added `SnapshotMode::{Clone, Cached, Cow}`.
+    - Added constructors:
+      - `with_snapshot_mode(...)`
+      - `with_shards_and_hasher_and_snapshot_mode(...)`
+      - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
+    - Added write epoch + snapshot cache flow for repeated snapshot reads.
+    - Added COW snapshot shard path for snapshot-heavy workloads.
+    - Added snapshot mode benchmark groups in `benches/bench_main.rs`.
+    - Added snapshot mode examples:
+      - `snapshot_mode_clone_demo`
+      - `snapshot_mode_cached_demo`
+      - `snapshot_mode_cow_demo`
+      - `mixed_workload_snapshot_tradeoff_demo`
+
+### Changed
+
+- **Snapshot concurrency hardening**:
+    - Eliminated snapshot cache race windows in sync/async paths.
+    - Strengthened COW snapshot + rebalance interaction consistency under concurrent writes.
+    - Refined snapshot/rebalance internal flow to reduce patch-on-patch branching in hot paths.
+
+### Documentation
+
+- Updated release documentation and roadmap status to `v2.2.0`.
+- Refreshed snapshot mode guidance and runnable examples in `README.md` and `README_CN.md`.
+
 ## [2.1.0] - 2026-05-15
 
 ### Added

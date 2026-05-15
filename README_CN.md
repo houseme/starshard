@@ -8,450 +8,219 @@
 
 [English](README.md) | 简体中文
 
-<b>Starshard</b>：高性能、延迟初始化分片的并发 HashMap
+Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
-<code>同步 + 异步 + 可选 Rayon 并行 + 可选 Serde 序列化 + 生命周期管理 + 高级特性</code>
+它面向真实生产场景，重点解决：
+- 单全局锁在混合读写下的竞争问题，
+- 同步/异步代码路径的一致能力，
+- 扩容重平衡与快照策略的可控取舍。
 
----
+## 当前状态
 
-## 状态
+已达到生产可用（`v2.2.0`）。
 
-生产就绪 (v2.1+)。API 稳定性优先。
-
-## 为什么需要它
-
-常见方案与痛点：
-
-- 全局 `RwLock<HashMap<..>>`：中高写入并发时锁冲突放大。
-- 复杂无锁结构：实现/调试/内存开销较高。
-- 固定分片 + 延迟创建：在低接触分片场景节省内存，控制复杂度。
-
-Starshard 目标：
-
-1. 降低写冲突（分片 + 精短锁区间）。
-2. 延迟分片分配（避免冷启动全量内存）。
-3. 原子长度缓存（`len()` O(1)）。
-4. 可并行快照迭代（`rayon`）。
-5. 同步 / 异步接口语义一致。
-6. 架构可拓展（生命周期管理、高级并发）。
-
----
-
-## 特性 (features)
-
-| Feature     | 说明                                       | 备注          |
-|-------------|------------------------------------------|-------------|
-| `async`     | 提供 `AsyncShardedHashMap`（Tokio `RwLock`） | 独立启用        |
-| `rayon`     | 大体量迭代时分片快照并行扁平化                          | 内部加速        |
-| `serde`     | 同步版序列化/反序列化；异步版提供快照封装                    | 不持久化 hasher |
-| `lifecycle` | 生命周期工具与原语（`per_shard_load`、`memory_stats`、`drain`、指标/淘汰配置类型） | 整合 v0.9+ 特性 |
-| `advanced`  | 事务、CAS、复制、诊断                             | 整合 v1.0 特性  |
-| （空）         | 仅同步核心 + 批量操作                             | 依赖面最小       |
-
-`docs.rs` 展示全部：
-
-```toml
-[package.metadata.docs.rs]
-all-features = true
-```
-
-`v2.1.0` 当前内部结构：
-
-- `src/core/sync_impl.rs`
-- `src/core/async_impl.rs`
-- `src/core/types.rs`
-- `src/core/helpers.rs`
-- `src/serde/sync_serde.rs`
-- `src/serde/async_snapshot.rs`
-
----
+`v2.2.0` 已交付的 Roadmap 主能力：
+- 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
+- 快照模式（`Clone` / `Cached` / `Cow`）及基于 epoch 的缓存失效机制。
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "2.1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
-# 最小：
-# starshard = "2.1.0"
+starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+# 最小依赖：
+# starshard = "2.2.0"
 ```
 
-开发/测试:
+## 5 分钟上手路径
 
-```toml
-[dev-dependencies]
-serde_json = "1"
-```
+1. 先用默认同步 map：`ShardedHashMap::new(64)`。
+2. 如果在 Tokio 运行时内，切换到 `AsyncShardedHashMap`。
+3. 如果快照调用频繁，先尝试 `SnapshotMode::Cached`，再评估 `SnapshotMode::Cow`。
+4. 如果分片数量来自用户输入或外部配置，优先用严格构造器（`try_with_*`）。
 
----
+迁移说明：
+- [1.x 到 2.x 使用差异](MIGRATION-1X-TO-2X_CN.md)
+
+## 特性开关
+
+| Feature | 能力 | 典型场景 |
+|---|---|---|
+| `async` | `AsyncShardedHashMap`（Tokio `RwLock`） | 异步服务与任务系统 |
+| `rayon` | 快照迭代并行扁平化 | 大规模扫描/导出 |
+| `serde` | 同步版序列化/反序列化 + 异步快照序列化辅助 | 持久化与数据导出 |
+| `lifecycle` | `per_shard_load`、`memory_stats`、`drain` 等 | 运维观测与维护 |
+| `advanced` | 事务/CAS/复制/诊断 API | 高级并发控制与控制面 |
 
 ## 快速上手（同步）
 
 ```rust
 use starshard::ShardedHashMap;
-use rustc_hash::FxBuildHasher;
 
-let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(64);
-map.insert("a".into(), 1);
-assert_eq!(map.get(&"a".into()), Some(1));
-assert_eq!(map.len(), 1);
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+m.insert("k1".into(), 10);
+assert_eq!(m.get(&"k1".into()), Some(10));
+assert_eq!(m.len(), 1);
 ```
 
-### 自定义 Hasher（对抗恶意键）
-
-```rust
-use starshard::ShardedHashMap;
-use std::collections::hash_map::RandomState;
-
-let secure = ShardedHashMap::<String,u64,RandomState>
-::with_shards_and_hasher(128, RandomState::default ());
-secure.insert("k".into(), 7);
-```
-
----
-
-## 异步示例
+## 快速上手（异步）
 
 ```rust
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() {
     use starshard::AsyncShardedHashMap;
-    let m: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(64);
-    m.insert("x".into(), 42).await;
-    assert_eq!(m.get(&"x".into()).await, Some(42));
+
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(64);
+    m.insert("k1".into(), 10).await;
+    assert_eq!(m.get(&"k1".into()).await, Some(10));
 }
 ```
 
-## 自适应重平衡（`v2.1+`）
+## 常用操作速查
 
-同步：
+| 目标 | 同步 API | 异步 API |
+|---|---|---|
+| 插入/更新 | `insert(k, v)` | `insert(k, v).await` |
+| 读取 | `get(&k)` | `get(&k).await` |
+| 删除 | `remove(&k)` | `remove(&k).await` |
+| 批量插入 | `batch_insert(items)` | `batch_insert(items).await` |
+| 批量读取 | `batch_get(&keys)` | `batch_get(&keys).await` |
+| 条件更新 | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
+| 条件插入 | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
+| 指标/内省 | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+## 构造器选型
+
+按“安全边界 + 控制度”选择：
+
+- 兼容型（超限自动钳制）：
+  - `with_shards_and_hasher(...)`
+  - `with_shards_and_hasher_capped(...)`
+- 严格型（超限返回 `ShardCountError`）：
+  - `try_with_shards_and_hasher(...)`
+  - `try_with_shards_and_hasher_capped(...)`
+- 带快照模式：
+  - `with_snapshot_mode(...)`
+  - `with_shards_and_hasher_and_snapshot_mode(...)`
+  - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
+
+## 自适应重平衡（`v2.2.0`）
+
+### 停顿式重平衡
 
 ```rust
 use starshard::{RebalanceOptions, ShardedHashMap};
 
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
-m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+let report = m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+assert_eq!(report.from_shards, 8);
+assert_eq!(report.to_shards, 32);
 ```
 
-在线渐进迁移（同步）：
+### 在线渐进迁移
 
 ```rust
+use starshard::ShardedHashMap;
+
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
 m.start_rebalance_online(32).unwrap();
+
 while m.rebalance_status().state == "migrating" {
     m.advance_rebalance(2);
 }
+
+assert_eq!(m.rebalance_status().state, "idle");
 ```
 
----
+语义说明：
+- 写入立即路由到新 active 分片。
+- 迁移期间读取走 active 优先，miss 后回退 previous。
+- 所有源分片迁移完成后，状态回到 `idle`。
 
-## 并行迭代 (`rayon`)
+## 快照模式（`v2.2.0`）
+
+`SnapshotMode` 支持按负载选择：
+
+- `Clone`：每次重建快照（默认，写路径开销最低）。
+- `Cached`：无写入时复用快照缓存。
+- `Cow`：分片级 COW 快照视图，适合高频快照读取。
 
 ```rust
-#[cfg(feature = "rayon")]
-{
-use starshard::ShardedHashMap;
-let m: ShardedHashMap<String,u32> = ShardedHashMap::new(32);
-for i in 0..50_000 {
-m.insert(format ! ("k{i}"), i);
-}
-let count = m.iter().count();
-assert_eq!(count, 50_000);
-}
+use starshard::{ShardedHashMap, SnapshotMode};
+
+let clone_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Clone);
+let cached_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cached);
+let cow_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cow);
 ```
 
----
+### 模式选择建议
 
-## Serde 语义
-
-同步：
-
-- 结构：`{ shard_count: usize, entries: [[K,V], ...] }`
-- 不持久化 hasher 状态；反序列化使用 `S::default()`
-- 约束：`K: Eq + Hash + Clone + Serialize + Deserialize`，`V: Clone + Serialize + Deserialize`，
-  `S: BuildHasher + Default + Clone`
-
-异步：
-
-```rust
-#[cfg(all(feature = "async", feature = "serde"))]
-{
-let snap = async_map.async_snapshot_serializable().await;
-let json = serde_json::to_string( & snap).unwrap();
-}
-```
-
-恢复：新建空异步 map 后逐条插入。
-
----
+| 负载画像 | 推荐模式 |
+|---|---|
+| 高写入 + 低快照频率 | `Clone` |
+| 中写入 + 中快照频率 | `Cached` |
+| 低写入 + 高频快照读取 | `Cow` 或 `Cached` |
 
 ## 一致性模型
 
-- 分片内操作线性化。
-- 全局迭代：按“获取该分片锁”时刻的快照；不保证全局原子视图。
-- `len()` 为结构性更新后的原子值；进行中的未完成操作不可见。
-- 迭代时并发新增/删除，可能部分缺失或包含旧值（跨分片）。
+- 分片内操作是线性化可见的。
+- 全局迭代/快照是“分片级快照拼接”，不是全局串行化事务。
+- 在线迁移期间，通过 active-first + previous-fallback 保证 key 可达性。
 
----
+## 性能建议
 
-## 性能提示（示意）
+- 相比单全局 `RwLock<HashMap<..>>`，分片模型在混合负载下通常能降低竞争。
+- 延迟分片初始化可让内存更接近“按访问付费”。
+- 大规模扫描场景建议启用 `rayon`。
+- 快照密集型服务建议按真实键分布对比 `Cached` 与 `Cow`。
 
-| 场景               | 说明                    |
-|------------------|-----------------------|
-| 读多写少 vs 全局单锁     | 写冲突显著下降               |
-| 大量快照迭代 + `rayon` | 3~4 倍扁平化速度 (100k+ 元素) |
-| 稀疏访问             | 仅访问分片分配内存             |
-| 批量插入/移除          | 每个分片组仅一次锁获取，`v2.0.0` 使用稀疏分桶降低额外内存开销 |
-| 在线重平衡             | 支持按分片渐进迁移，读路径 active 优先 |
+## Serde 语义
 
-请基准测试你的真实负载（键分布、核心数、缓存行为）。
+- 同步 map 支持直接 `Serialize` / `Deserialize`。
+- 不持久化 hasher 内部状态；反序列化时使用 `S::default()`。
+- 异步 map 使用 `async_snapshot_serializable().await` 进行序列化。
 
----
+## 示例与基准
 
-## 并发 / 安全
+示例：
+- `examples/v210_rebalance.rs`
+- `examples/snapshot_mode_clone_demo.rs`
+- `examples/snapshot_mode_cached_demo.rs`
+- `examples/snapshot_mode_cow_demo.rs`
+- `examples/mixed_workload_snapshot_tradeoff_demo.rs`
 
-- 不做多分片级联锁，避免死锁。
-- 快照迭代引入短读锁 + 克隆，减少长持锁。
-- 高热点单分片写压力仍会形成竞争瓶颈。
-- 非 lock-free；但结构更简单、可预测。
+基准入口：
+- `benches/bench_main.rs`
 
----
+## 验证建议
 
-## 局限
-
-- 已支持停顿式与在线渐进分片重平衡（`v2.1`）。
-- 迭代需分配临时 `Vec`。
-- Hasher 状态不序列化。
-- 大量写倾斜仍可能产生热点锁。
-
----
-
-## Roadmap（潜在）
-
-- 更细粒度的重平衡可观测与取消控制
-- 更低拷贝成本的 COW 快照
-
----
-
-## 核心特性 (v0.8+)
-
-### 条件操作 (基于方法，高效)
-
-```rust
-use starshard::ShardedHashMap;
-
-let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
-
-// 仅当键存在时更新；单分片锁
-map.compute_if_present( & "counter".into(), | v| Some(v + 1));
-
-// 仅当键不存在时插入；单分片锁
-let val = map.compute_if_absent("new_key".into(), | | 42);
-
-// 条件删除
-map.compute_if_present( & "key".into(), | _v| None);
-```
-
-### 批量操作 (已优化)
-
-```rust
-// 批量插入 (分摊分片锁获取成本 - 每个分片组仅一次锁)
-let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
-let inserted = map.batch_insert(entries);
-
-// 批量移除
-let removed = map.batch_remove(vec!["a".into(), "b".into()]);
-
-// 批量获取
-let keys = vec!["a", "b", "c"];
-let results = map.batch_get( & keys);
-```
-
-### 集合视图与过滤
-
-```rust
-// 迭代所有键
-let all_keys: Vec<_ > = map.keys().collect();
-
-// 迭代所有值
-let all_values: Vec<_ > = map.values().collect();
-
-// 标准迭代
-for (k, v) in map.iter() {
-println ! ("{}: {}", k, v);
-}
-
-// 保留过滤
-map.retain( | k, v| v > & 10);  // 仅保留 v > 10 的条目
-```
-
-### 分片内省
-
-```rust
-// 获取分片分布统计
-let stats = map.shard_stats();
-println!("Total slots: {}", stats.total);
-println!("Initialized shards: {}", stats.initialized);
-println!("Avg load: {:.2}", stats.avg_load);
-
-// 获取利用率百分比
-let util = map.shard_utilization();
-println!("Utilization: {:.1}%", util);
-```
-
----
-
-## 生命周期特性 (v0.9+)
-
-通过 `features = ["lifecycle"]` 启用。
-
-- **分片内省**: `per_shard_load()`（同步 + 异步）
-- **内存导向统计**: `memory_stats()`（同步 + 异步）
-- **批量排空**: `drain()`（同步 + 异步）
-- **生命周期原语**: `EvictionConfig`、`EvictionPolicy`、`AtomicMetrics`、`IterBuilder`
-
-```rust
-#[cfg(feature = "lifecycle")]
-{
-    use starshard::ShardedHashMap;
-    let map: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
-    map.insert("a".into(), 1);
-    map.insert("b".into(), 2);
-
-    let _loads = map.per_shard_load();
-    let _memory = map.memory_stats();
-    let drained: Vec<_> = map.drain().collect();
-    assert_eq!(drained.len(), 2);
-}
-```
-
-```rust
-#[cfg(all(feature = "async", feature = "lifecycle"))]
-#[tokio::main]
-async fn main() {
-    use starshard::AsyncShardedHashMap;
-    let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(16);
-    map.insert("a".into(), 1).await;
-
-    let _loads = map.per_shard_load().await;
-    let _memory = map.memory_stats().await;
-    let drained: Vec<_> = map.drain().await.collect();
-    assert_eq!(drained.len(), 1);
-}
-```
-
-说明：`lifecycle` 当前提供的是实用 API 与配置原语，尚未内置自动化 TTL 淘汰调度器。
-
----
-
-## 高级特性 (v1.0+)
-
-通过 `features = ["advanced"]` 启用。
-
-- **MVCC 事务**: 带冲突检测的原子多键操作
-- **比较并交换 (CAS)**: 无锁协调原语
-- **写时复制快照**: 最小化争用的读取优化
-- **分布式复制**: 基于 Quorum 的一致性框架
-- **锁诊断**: 分片级争用分析
-
----
-
-## 特性矩阵
-
-| 特性                     | v0.7 | v0.8 | v0.9 | v1.0 | v2.0 | 状态              |
-|------------------------|------|------|------|------|------|-----------------|
-| 分片 HashMap (同步)      | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 异步 (Tokio)             | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 并行迭代 (rayon)           | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| Serde (反)序列化           | ✅    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 条件操作                   | -    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 批量操作                   | -    | ✅    | ✅    | ✅    | ✅    | 稳定              |
-| 生命周期工具                | -    | -    | ✅    | ✅    | ✅    | 稳定 (lifecycle) |
-| 淘汰/指标原语               | -    | -    | ✅    | ✅    | ✅    | 稳定 (lifecycle) |
-| 事务                     | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
-| CAS 操作                 | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
-| 复制                     | -    | -    | -    | ✅    | ✅    | 稳定 (advanced)  |
-
----
-
-## 结构示意
-
-```
-Arc -> RwLock<Vec<Option<Arc<RwLock<HashMap<K,V,S>>>>>> + AtomicUsize(len)
-```
-
----
-
-## 示例索引
-
-| 目标         | 代码                              |
-|------------|---------------------------------|
-| 基础插入/读取    | 快速上手                            |
-| 异步操作       | 异步示例                            |
-| 并行迭代       | 并行迭代                            |
-| Serde 同步   | `serde_json::to_string(&map)`   |
-| 异步快照序列化    | `async_snapshot_serializable()` |
-| 自定义 hasher | `with_shards_and_hasher`        |
-| 自定义分片上限    | `with_shards_and_hasher_capped` |
-| 严格校验构造      | `try_with_shards_and_hasher`    |
-
----
-
-## 分片数量安全策略
-
-- 不抛错构造函数默认使用 `MAX_SHARDS` 上限，避免超大分配导致内存风险。
-- 如需自定义上限，可使用 `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`。
-- 如需严格模式（不裁剪，超限直接报错），使用
-  `try_with_shards_and_hasher(..)` 或 `try_with_shards_and_hasher_capped(..)`，
-  返回 `ShardCountError`。
-
----
-
-## 许可
-
-[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) 双许可。
-
----
-
-## 贡献
-
-欢迎 Issue / PR：
+发布前或升级后建议执行：
 
 ```bash
-cargo clippy --all-features -- -D warnings
+cargo fmt --all
 cargo test --all-features
+cargo check --all-features
 ```
 
-提交前确保：
+## 当前边界
 
-- 新特性具文档与测试
-- 不破坏现有语义（或在 CHANGELOG 中注明）
+- 不是 lock-free；热点分片写压力仍可能串行化。
+- 快照输出仍需物化为 `Vec<(K, V)>`。
+- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.0` 中为前向兼容预留参数。
 
----
+## License
 
-## 全特性简例
+双许可证：
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)
 
-```rust
-use starshard::{ShardedHashMap, AsyncShardedHashMap};
-#[cfg(feature = "async")]
-#[tokio::main]
-async fn main() {
-    let sync_map: ShardedHashMap<u64, u64> = ShardedHashMap::new(32);
-    sync_map.insert(1, 10);
-
-    #[cfg(feature = "serde")]
-    {
-        let json = serde_json::to_string(&sync_map).unwrap();
-        let _de: ShardedHashMap<u64, u64> = serde_json::from_str(&json).unwrap();
-    }
-
-    let async_map: AsyncShardedHashMap<u64, u64> = AsyncShardedHashMap::new(32);
-    async_map.insert(2, 20).await;
-}
-```
-
----
+你可以任选其一。
 
 ## 免责声明
 
-性能数据仅作参考；生产使用请结合自身压测验证。
+- README 中的基准和性能描述仅作参考，不构成性能承诺。
+- 生产使用前请务必基于真实负载完成延迟、吞吐与内存验证。

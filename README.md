@@ -8,460 +8,220 @@
 
 English | [简体中文](README_CN.md)
 
-<b>Starshard</b>: a high-performance, lazily sharded concurrent HashMap for Rust.
+Starshard is a high-performance, lazily sharded concurrent `HashMap` for Rust.
 
-<code>Sync + Async + Optional Rayon + Optional Serde + Lifecycle + Advanced Features</code>
-
----
+It is designed for real production workloads where you need:
+- predictable lock behavior,
+- lower write contention than a single global lock,
+- optional async parity,
+- and explicit control over rebalance and snapshot trade-offs.
 
 ## Status
 
-Production-ready (v2.1+). API stability prioritized.
+Production-ready (`v2.2.0`).
 
-## Motivation
-
-You often need a fast concurrent map:
-
-- Standard single `RwLock<HashMap<..>>` becomes contended under mixed read/write load.
-- Fully lock-free or CHM designs can add memory + complexity cost.
-- Sharding with lazy initialization offers a pragmatic middle ground.
-
-Starshard focuses on:
-
-1. Minimal uncontended overhead.
-2. Lazy shard allocation (memory proportional to actually touched shards).
-3. Atomic cached length.
-4. Snapshot iteration (parallel if `rayon`).
-5. Symmetric sync / async APIs.
-6. Extensible design (lifecycle management, advanced concurrency).
-
----
-
-## Features
-
-| Feature     | Description                                          | Notes                          |
-|-------------|------------------------------------------------------|--------------------------------|
-| `async`     | Adds `AsyncShardedHashMap` (Tokio `RwLock`)          | Independent of `rayon`         |
-| `rayon`     | Parallel snapshot flatten for large iteration        | Used internally; API unchanged |
-| `serde`     | Serialize/Deserialize (sync) + async snapshot helper | Hasher not persisted           |
-| `lifecycle` | Lifecycle utilities + primitives (`per_shard_load`, `memory_stats`, `drain`, metrics/eviction config types) | Consolidated v0.9+ features |
-| `advanced`  | Transactions, CAS, Replication, Diagnostics          | Consolidated v1.0 features     |
-| (none)      | Pure sync core + Batch Ops                           | Lowest dependency surface      |
-
-Enable all in docs.rs via:
-
-```toml
-[package.metadata.docs.rs]
-all-features = true
-```
-
-Internal layout in `v2.1.0`:
-
-- `src/core/sync_impl.rs`
-- `src/core/async_impl.rs`
-- `src/core/types.rs`
-- `src/core/helpers.rs`
-- `src/serde/sync_serde.rs`
-- `src/serde/async_snapshot.rs`
-
----
+Roadmap capabilities shipped in `v2.2.0`:
+- Adaptive shard expansion and rebalance (stop-the-world + online incremental).
+- Snapshot modes (`Clone`, `Cached`, `Cow`) with epoch-based cache invalidation.
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "2.1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
-# or minimal:
-# starshard = "2.1.0"
+starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+# minimal:
+# starshard = "2.2.0"
 ```
 
-`serde_json` (tests / examples):
+## 5-Minute Path
 
-```toml
-[dev-dependencies]
-serde_json = "1"
-```
+1. Start with default sync map: `ShardedHashMap::new(64)`.
+2. If you are in Tokio runtime, switch to `AsyncShardedHashMap`.
+3. If snapshots are frequent, try `SnapshotMode::Cached` first, then `SnapshotMode::Cow`.
+4. If shard count is user-driven or external-input-driven, use strict constructors (`try_with_*`).
 
----
+Migration guide:
+- [1.x to 2.x Usage Differences](MIGRATION-1X-TO-2X.md)
+
+## Feature Flags
+
+| Feature | What you get | Typical use |
+|---|---|---|
+| `async` | `AsyncShardedHashMap` (Tokio `RwLock`) | async services and workers |
+| `rayon` | parallel snapshot flatten in iteration | large snapshot/scan workloads |
+| `serde` | sync serialize/deserialize + async serializable snapshot helper | persistence/export |
+| `lifecycle` | `per_shard_load`, `memory_stats`, `drain`, lifecycle structs | observability and maintenance |
+| `advanced` | transaction/CAS/replication/diagnostic APIs | advanced concurrency and control planes |
 
 ## Quick Start (Sync)
 
 ```rust
 use starshard::ShardedHashMap;
-use rustc_hash::FxBuildHasher;
 
-let map: ShardedHashMap<String, i32, FxBuildHasher> = ShardedHashMap::new(64);
-map.insert("a".into(), 1);
-assert_eq!(map.get(&"a".into()), Some(1));
-assert_eq!(map.len(), 1);
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
+m.insert("k1".into(), 10);
+assert_eq!(m.get(&"k1".into()), Some(10));
+assert_eq!(m.len(), 1);
 ```
 
-### Custom Hasher (defense against adversarial keys)
-
-```rust
-use starshard::ShardedHashMap;
-use std::collections::hash_map::RandomState;
-
-let secure = ShardedHashMap::<String, u64, RandomState>
-::with_shards_and_hasher(128, RandomState::default ());
-secure.insert("k".into(), 7);
-```
-
----
-
-## Async Usage
+## Quick Start (Async)
 
 ```rust
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() {
     use starshard::AsyncShardedHashMap;
-    let m: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(64);
-    m.insert("x".into(), 42).await;
-    assert_eq!(m.get(&"x".into()).await, Some(42));
+
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(64);
+    m.insert("k1".into(), 10).await;
+    assert_eq!(m.get(&"k1".into()).await, Some(10));
 }
 ```
 
-## Adaptive Rebalance (`v2.1+`)
+## Common Operations (Cheat Sheet)
 
-Sync:
+| Goal | Sync API | Async API |
+|---|---|---|
+| insert/update | `insert(k, v)` | `insert(k, v).await` |
+| read | `get(&k)` | `get(&k).await` |
+| delete | `remove(&k)` | `remove(&k).await` |
+| batch insert | `batch_insert(items)` | `batch_insert(items).await` |
+| batch read | `batch_get(&keys)` | `batch_get(&keys).await` |
+| conditional update | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
+| conditional insert | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
+| metrics/introspection | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+## Constructor Strategy
+
+Choose by strictness and control level:
+
+- Backward-compatible clamping:
+  - `with_shards_and_hasher(...)`
+  - `with_shards_and_hasher_capped(...)`
+- Strict validation (returns `ShardCountError`):
+  - `try_with_shards_and_hasher(...)`
+  - `try_with_shards_and_hasher_capped(...)`
+- Snapshot mode aware:
+  - `with_snapshot_mode(...)`
+  - `with_shards_and_hasher_and_snapshot_mode(...)`
+  - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
+
+## Adaptive Rebalance (`v2.2.0`)
+
+### Stop-the-world rebalance
 
 ```rust
 use starshard::{RebalanceOptions, ShardedHashMap};
 
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
-m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+let report = m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+assert_eq!(report.from_shards, 8);
+assert_eq!(report.to_shards, 32);
 ```
 
-Online incremental (sync):
+### Online incremental rebalance
 
 ```rust
+use starshard::ShardedHashMap;
+
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
 m.start_rebalance_online(32).unwrap();
+
 while m.rebalance_status().state == "migrating" {
     m.advance_rebalance(2);
 }
+
+assert_eq!(m.rebalance_status().state, "idle");
 ```
 
-Async:
+Semantics:
+- writes route to active shards immediately,
+- reads fall back to previous shards while migration is in progress,
+- migration is finalized when `advance_rebalance(...)` drains all source shards.
+
+## Snapshot Modes (`v2.2.0`)
+
+`SnapshotMode` lets you pick snapshot behavior per workload:
+
+- `Clone`: always rebuild snapshot entries (default, lowest write-path overhead).
+- `Cached`: reuse cached snapshot while no writes occur.
+- `Cow`: maintain per-shard COW snapshot views for snapshot-heavy workloads.
 
 ```rust
-#[cfg(feature = "async")]
-async fn rebalance_async(m: &starshard::AsyncShardedHashMap<String, i32>) {
-    m.rebalance_to(32, starshard::RebalanceOptions::default()).await.unwrap();
-}
+use starshard::{ShardedHashMap, SnapshotMode};
+
+let clone_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Clone);
+let cached_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cached);
+let cow_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cow);
 ```
 
----
+### Mode selection guide
 
-## Parallel Iteration (`rayon`)
-
-```rust
-#[cfg(feature = "rayon")]
-{
-use starshard::ShardedHashMap;
-let m: ShardedHashMap<String, u32> = ShardedHashMap::new(32);
-for i in 0..50_000 {
-m.insert(format ! ("k{i}"), i);
-}
-let count = m.iter().count(); // internal parallel flatten
-assert_eq!(count, 50_000);
-}
-```
-
----
-
-## Serde Semantics
-
-Sync:
-
-- Serialized shape: `{ "shard_count": usize, "entries": [[K,V], ...] }`.
-- Hasher internal state not preserved; recreated with `S::default()`.
-- Requirements: `K: Eq + Hash + Clone + Serialize + Deserialize`, `V: Clone + Serialize + Deserialize`,
-  `S: BuildHasher + Default + Clone`.
-
-Async:
-
-- No direct `Serialize`; call:
-
-```rust
-#[cfg(all(feature = "async", feature = "serde"))]
-{
-let snap = async_map.async_snapshot_serializable().await;
-let json = serde_json::to_string( & snap).unwrap();
-}
-```
-
-- To reconstruct: create a new async map and bulk insert.
-
----
+| Workload profile | Recommended mode |
+|---|---|
+| high write + low snapshot frequency | `Clone` |
+| medium write + medium snapshot frequency | `Cached` |
+| low write + high snapshot frequency | `Cow` or `Cached` |
 
 ## Consistency Model
 
-- Per-shard ops are linearizable w.r.t that shard.
-- Global iteration builds a per-shard snapshot as each shard lock is taken (not a fully atomic global view).
-- `len()` is maintained atomically (structural insert/remove only).
-- Iteration after concurrent writes may omit late inserts performed after a shard snapshot was captured.
+- Per-shard operations are linearizable for that shard.
+- Global iteration/snapshot is shard-snapshot based, not a global serializable transaction.
+- During online rebalance, active-first + previous-fallback keeps key reachability.
 
----
+## Performance Notes
 
-## Performance Notes (Indicative)
+- Sharding reduces contention versus a single `RwLock<HashMap<..>>` under mixed load.
+- Lazy shard allocation keeps memory proportional to touched shards.
+- `rayon` improves large snapshot flatten throughput when scan size is high.
+- For snapshot-heavy services, test `Cached` and `Cow` with your real key distribution.
 
-| Scenario                                              | Observation (relative)       |
-|-------------------------------------------------------|------------------------------|
-| Read-heavy mixed workload vs global `RwLock<HashMap>` | Reduced contention           |
-| Large snapshot iteration with `rayon` (100k+)         | 3-4x speedup flattening      |
-| Sparse shard usage                                    | Only touched shards allocate |
-| Batch Insert/Remove                                   | Single lock per shard group + sparse grouping in v2.0.0 |
-| Online rebalance                                      | Incremental shard migration with active-first reads |
+## Serde Semantics
 
-Do benchmark with your own key/value distribution and CPU topology.
+- Sync map supports direct `Serialize` / `Deserialize`.
+- Hasher state is not persisted; rebuild uses `S::default()`.
+- Async map uses `async_snapshot_serializable().await` helper for serialization.
 
----
+## Examples and Benchmarks
 
-## Safety / Concurrency
+Examples:
+- `examples/v210_rebalance.rs`
+- `examples/snapshot_mode_clone_demo.rs`
+- `examples/snapshot_mode_cached_demo.rs`
+- `examples/snapshot_mode_cow_demo.rs`
+- `examples/mixed_workload_snapshot_tradeoff_demo.rs`
 
-- No nested multi-shard lock ordering -> avoids deadlocks.
-- Each shard single `RwLock`; iteration snapshots avoid long-lived global blocking.
-- Cloning values required (trade memory for contention isolation).
-- Not lock-free: intense write focus on one shard can still serialize.
+Benchmark entry:
+- `benches/bench_main.rs`
 
----
+## Validation
 
-## Limitations
+Before release or upgrade verification:
 
-- Dynamic shard rebalancing supports stop-the-world + online incremental modes (`v2.1`).
-- Snapshot iteration allocates intermediate vectors.
-- Hasher state not serialized.
-- No lock-free progress guarantees.
-
----
-
-## Roadmap (Potential)
-
-- Extended rebalance telemetry and cancellation controls.
-- Zero-copy or COW snapshot mode.
-
----
-
-## Core Features (v0.8+)
-
-### Conditional Operations (Method-based, highly efficient)
-
-```rust
-use starshard::ShardedHashMap;
-
-let map: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
-
-// Update only if key exists; single shard lock
-map.compute_if_present( & "counter".into(), | v| Some(v + 1));
-
-// Insert only if key absent; single shard lock
-let val = map.compute_if_absent("new_key".into(), | | 42);
-
-// Conditional deletion
-map.compute_if_present( & "key".into(), | _v| None);
+```bash
+cargo fmt --all
+cargo test --all-features
+cargo check --all-features
 ```
 
-### Batch Operations (Optimized)
+## Current Limits
 
-```rust
-// Batch insert (amortizes shard lock acquisition - single lock per shard)
-let entries = vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)];
-let inserted = map.batch_insert(entries);
-
-// Batch remove
-let removed = map.batch_remove(vec!["a".into(), "b".into()]);
-
-// Batch get
-let keys = vec!["a", "b", "c"];
-let results = map.batch_get( & keys);
-```
-
-### Collection Views & Filtering
-
-```rust
-// Iterate all keys
-let all_keys: Vec<_ > = map.keys().collect();
-
-// Iterate all values
-let all_values: Vec<_ > = map.values().collect();
-
-// Standard iteration
-for (k, v) in map.iter() {
-println ! ("{}: {}", k, v);
-}
-
-// Retention filtering
-map.retain( | k, v| v > & 10);  // Keep only entries where v > 10
-```
-
-### Shard Introspection
-
-```rust
-// Get shard distribution statistics
-let stats = map.shard_stats();
-println!("Total slots: {}", stats.total);
-println!("Initialized shards: {}", stats.initialized);
-println!("Avg load: {:.2}", stats.avg_load);
-
-// Get utilization percentage
-let util = map.shard_utilization();
-println!("Utilization: {:.1}%", util);
-```
-
----
-
-## Lifecycle Features (v0.9+)
-
-Enable via `features = ["lifecycle"]`.
-
-- **Per-shard introspection**: `per_shard_load()` (sync + async)
-- **Memory-oriented stats**: `memory_stats()` (sync + async)
-- **Bulk drain**: `drain()` (sync + async)
-- **Lifecycle primitives**: `EvictionConfig`, `EvictionPolicy`, `AtomicMetrics`, `IterBuilder`
-
-```rust
-#[cfg(feature = "lifecycle")]
-{
-    use starshard::ShardedHashMap;
-    let map: ShardedHashMap<String, i32> = ShardedHashMap::new(16);
-    map.insert("a".into(), 1);
-    map.insert("b".into(), 2);
-
-    let _loads = map.per_shard_load();
-    let _memory = map.memory_stats();
-    let drained: Vec<_> = map.drain().collect();
-    assert_eq!(drained.len(), 2);
-}
-```
-
-```rust
-#[cfg(all(feature = "async", feature = "lifecycle"))]
-#[tokio::main]
-async fn main() {
-    use starshard::AsyncShardedHashMap;
-    let map: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(16);
-    map.insert("a".into(), 1).await;
-
-    let _loads = map.per_shard_load().await;
-    let _memory = map.memory_stats().await;
-    let drained: Vec<_> = map.drain().await.collect();
-    assert_eq!(drained.len(), 1);
-}
-```
-
-Note: lifecycle currently exposes utility APIs and configuration primitives; it does not yet provide a built-in autonomous TTL eviction scheduler.
-
----
-
-## Advanced Features (v1.0+)
-
-Enable via `features = ["advanced"]`.
-
-- **MVCC Transactions**: Atomic multi-key operations with conflict detection
-- **Compare-And-Swap**: Lock-free coordination primitives
-- **Copy-On-Write Snapshots**: Minimal-contention read optimization
-- **Distributed Replication**: Quorum-based consistency framework
-- **Lock Diagnostics**: Per-shard contention profiling
-
----
-
-## Feature Matrix
-
-| Feature                    | v0.7 | v0.8 | v0.9 | v1.0 | v2.0 | Status          |
-|----------------------------|------|------|------|------|------|-----------------|
-| Sharded HashMap (sync)     | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Conditional Operations     | -    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Batch operations           | -    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Lifecycle utilities        | -    | -    | ✅    | ✅    | ✅    | Stable (lifecycle) |
-| Eviction/metrics primitives| -    | -    | ✅    | ✅    | ✅    | Stable (lifecycle) |
-| Transactions               | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
-| CAS operations             | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
-| Replication                | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
-
----
-
-## Design Sketch
-
-```
-
-Arc -> RwLock<Vec<Option<Arc<RwLock<HashMap<K,V,S>>>>>> + AtomicUsize(len)
-
-```
-
-Lazy fill of inner `Option` slot when first key hashes into shard.
-
----
-
-## Examples Summary
-
-| Goal                  | Snippet                         |
-|-----------------------|---------------------------------|
-| Basic sync            | see Quick Start                 |
-| Async insert/get      | see Async Usage                 |
-| Parallel iterate      | enable `rayon`                  |
-| Serde snapshot (sync) | `serde_json::to_string(&map)`   |
-| Async serde snapshot  | `async_snapshot_serializable()` |
-| Custom hasher         | `with_shards_and_hasher(..)`    |
-| Custom shard cap      | `with_shards_and_hasher_capped(..)` |
-| Strict validation     | `try_with_shards_and_hasher(..)` |
-
----
-
-## Shard Count Safety
-
-- Infallible constructors now enforce a default cap via `MAX_SHARDS` to prevent oversized allocations.
-- For custom limits, use `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`.
-- For strict validation (no clamping), use `try_with_shards_and_hasher(..)` or
-  `try_with_shards_and_hasher_capped(..)`, which return `ShardCountError`.
-
----
+- Not lock-free; hot-shard writer pressure can still serialize.
+- Snapshot operations still materialize `Vec<(K, V)>` as output format.
+- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.0`.
 
 ## License
 
-Dual license: [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) (choose either).
+Dual license:
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)
 
----
-
-## Contribution
-
-PRs welcome: focus on correctness (tests), simplicity, and documentation clarity.  
-Run:
-
-```bash
-cargo clippy --all-features -- -D warnings
-cargo test --all-features
-```
-
----
-
-## Minimal Example (All Features)
-
-```rust
-use starshard::{ShardedHashMap, AsyncShardedHashMap};
-#[cfg(feature = "async")]
-#[tokio::main]
-async fn main() {
-    let sync_map: ShardedHashMap<u64, u64> = ShardedHashMap::new(32);
-    sync_map.insert(1, 10);
-
-    #[cfg(feature = "serde")]
-    {
-        let json = serde_json::to_string(&sync_map).unwrap();
-        let _de: ShardedHashMap<u64, u64> = serde_json::from_str(&json).unwrap();
-    }
-
-    let async_map: AsyncShardedHashMap<u64, u64> = AsyncShardedHashMap::new(32);
-    async_map.insert(2, 20).await;
-}
-```
-
----
+You may choose either license.
 
 ## Disclaimer
 
-Benchmarks and behavior notes are indicative only; validate under production load patterns.
+- Benchmarks and throughput notes in this README are indicative, not guaranteed.
+- Always validate behavior, latency, and memory usage under your own workload before production rollout.

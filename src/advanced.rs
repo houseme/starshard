@@ -140,6 +140,12 @@ impl<K: Clone, V: Clone> CowSnapshot<K, V> {
         }
     }
 
+    /// Create snapshot from pre-built shared data.
+    #[tracing::instrument(skip(data), level = "trace")]
+    pub fn from_arc(data: std::sync::Arc<Vec<(K, V)>>, version: u64) -> Self {
+        Self { data, version }
+    }
+
     /// Get snapshot version
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn version(&self) -> u64 {

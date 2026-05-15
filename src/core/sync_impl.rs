@@ -11,6 +11,12 @@ where
     pub fn new(shard_count: usize) -> Self {
         Self::with_shards_and_hasher(shard_count, FxBuildHasher)
     }
+
+    /// Create with default hasher and explicit snapshot mode.
+    #[tracing::instrument(level = "trace")]
+    pub fn with_snapshot_mode(shard_count: usize, mode: SnapshotMode) -> Self {
+        Self::with_shards_and_hasher_and_snapshot_mode(shard_count, FxBuildHasher, mode)
+    }
 }
 
 impl<K, V, S> ShardedHashMap<K, V, S>
@@ -20,15 +26,20 @@ where
     S: BuildHasher + Clone + Send + Sync,
 {
     #[inline]
-    fn build_with_count(count: usize, hasher: S) -> Self {
+    fn build_with_count(count: usize, hasher: S, snapshot_mode: SnapshotMode) -> Self {
         let shards = vec![None; count];
         Self {
+            snapshot_mode,
             shards: Arc::new(StdRwLock::new(shards)),
+            cow_shards: Arc::new(StdRwLock::new(vec![None; count])),
             previous_shards: Arc::new(StdRwLock::new(None)),
             hasher,
             shard_count: Arc::new(AtomicUsize::new(count)),
             previous_shard_count: Arc::new(AtomicUsize::new(0)),
             total_len: Arc::new(AtomicUsize::new(0)),
+            write_epoch: Arc::new(AtomicU64::new(0)),
+            snapshot_cache: Arc::new(StdRwLock::new(None)),
+            snapshot_cache_epoch: Arc::new(AtomicU64::new(0)),
             rebalance_lock: Arc::new(StdMutex::new(())),
             rebalance_tracker: Arc::new(RebalanceTracker::new()),
             #[cfg(feature = "advanced")]
@@ -44,6 +55,16 @@ where
     /// safety cap (`MAX_SHARDS`) to avoid oversized allocations.
     #[tracing::instrument(skip(hasher), level = "trace")]
     pub fn with_shards_and_hasher(shard_count: usize, hasher: S) -> Self {
+        Self::with_shards_and_hasher_and_snapshot_mode(shard_count, hasher, SnapshotMode::Clone)
+    }
+
+    /// Create with explicit hasher and snapshot mode.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn with_shards_and_hasher_and_snapshot_mode(
+        shard_count: usize,
+        hasher: S,
+        mode: SnapshotMode,
+    ) -> Self {
         let requested = normalized_shard_count(shard_count);
         let count = capped_shard_count(requested, MAX_SHARDS);
         if requested != count {
@@ -54,7 +75,7 @@ where
                 "requested shard_count exceeded default cap and was clamped"
             );
         }
-        Self::build_with_count(count, hasher)
+        Self::build_with_count(count, hasher, mode)
     }
 
     /// Create with explicit hasher and a custom cap.
@@ -63,6 +84,22 @@ where
     /// workload-specific memory/performance trade-offs.
     #[tracing::instrument(skip(hasher), level = "trace")]
     pub fn with_shards_and_hasher_capped(shard_count: usize, hasher: S, max_shards: usize) -> Self {
+        Self::with_shards_and_hasher_capped_and_snapshot_mode(
+            shard_count,
+            hasher,
+            max_shards,
+            SnapshotMode::Clone,
+        )
+    }
+
+    /// Create with explicit hasher, custom cap and snapshot mode.
+    #[tracing::instrument(skip(hasher), level = "trace")]
+    pub fn with_shards_and_hasher_capped_and_snapshot_mode(
+        shard_count: usize,
+        hasher: S,
+        max_shards: usize,
+        mode: SnapshotMode,
+    ) -> Self {
         let effective_max = max_shards.max(1);
         let requested = normalized_shard_count(shard_count);
         let count = capped_shard_count(requested, effective_max);
@@ -74,7 +111,7 @@ where
                 "requested shard_count exceeded configured cap and was clamped"
             );
         }
-        Self::build_with_count(count, hasher)
+        Self::build_with_count(count, hasher, mode)
     }
 
     /// Strict constructor with explicit hasher.
@@ -100,7 +137,7 @@ where
     ) -> Result<Self, ShardCountError> {
         let effective_max = max_shards.max(1);
         let count = strict_shard_count(shard_count, effective_max)?;
-        Ok(Self::build_with_count(count, hasher))
+        Ok(Self::build_with_count(count, hasher, SnapshotMode::Clone))
     }
 
     /// Current configured shard slots.
@@ -159,6 +196,160 @@ where
         self.previous_remove(key)
     }
 
+    #[inline]
+    fn cache_enabled(&self) -> bool {
+        !matches!(self.snapshot_mode, SnapshotMode::Clone)
+    }
+
+    #[inline]
+    fn cow_enabled(&self) -> bool {
+        matches!(self.snapshot_mode, SnapshotMode::Cow)
+    }
+
+    fn invalidate_snapshot_cache(&self) {
+        if !self.cache_enabled() {
+            return;
+        }
+        let mut cache = std_write_guard(&self.snapshot_cache, "snapshot_cache");
+        *cache = None;
+    }
+
+    fn on_structural_write(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Relaxed);
+        self.invalidate_snapshot_cache();
+    }
+
+    fn publish_write_for_touched_shards<I>(&self, touched: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        if self.cow_enabled() {
+            for idx in touched {
+                self.sync_cow_shard_from_active(idx);
+            }
+        }
+        self.on_structural_write();
+    }
+
+    fn publish_write_for_all_shards(&self) {
+        if self.cow_enabled() {
+            self.sync_all_cow_shards_from_active();
+        }
+        self.on_structural_write();
+    }
+
+    fn sync_all_cow_shards_from_active(&self) {
+        let count = self.shard_count();
+        let active_slots: Vec<Option<StdShard<K, V, S>>> = {
+            let slots = std_read_guard(&self.shards, "cow_sync_all_active_slots");
+            slots.iter().cloned().collect()
+        };
+        let mut merged_shards: Vec<HashMap<K, V, S>> = Vec::with_capacity(count);
+        for idx in 0..count {
+            let base = match active_slots
+                .get(idx)
+                .and_then(|slot| slot.as_ref())
+                .cloned()
+            {
+                Some(shard) => {
+                    let guard = std_read_guard(&shard, "cow_sync_all_active_shard");
+                    guard.clone()
+                }
+                None => HashMap::with_hasher(self.hasher.clone()),
+            };
+            merged_shards.push(base);
+        }
+
+        if self.rebalance_tracker.is_migrating() {
+            let prev = std_read_guard(&self.previous_shards, "cow_sync_all_previous");
+            if let Some(prev_shards) = prev.as_ref() {
+                for prev_shard in prev_shards.iter().flatten() {
+                    let prev_guard = std_read_guard(prev_shard, "cow_sync_all_previous_shard");
+                    for (k, v) in prev_guard.iter() {
+                        let idx = (self.hasher.hash_one(k) % count as u64) as usize;
+                        merged_shards[idx]
+                            .entry(k.clone())
+                            .or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+
+        for (idx, merged) in merged_shards.into_iter().enumerate() {
+            let snapshot = Arc::new(merged);
+            let cow_shard = self.get_or_init_cow_shard(idx);
+            let mut cow_guard = std_write_guard(&cow_shard, "cow_sync_all_target");
+            *cow_guard = snapshot;
+        }
+    }
+
+    fn get_or_init_cow_shard(&self, index: usize) -> StdCowShard<K, V, S> {
+        let mut shards = std_write_guard(&self.cow_shards, "cow_shards");
+        if index >= shards.len() {
+            shards.resize_with(index + 1, || None);
+        }
+        let slot = &mut shards[index];
+        match slot {
+            Some(existing) => existing.clone(),
+            None => {
+                let shard = Arc::new(StdRwLock::new(Arc::new(HashMap::with_hasher(
+                    self.hasher.clone(),
+                ))));
+                *slot = Some(shard.clone());
+                shard
+            }
+        }
+    }
+
+    fn sync_cow_shard_from_active(&self, index: usize) {
+        if !self.cow_enabled() {
+            return;
+        }
+        let source = self.get_or_init_shard(index);
+        let guard = std_read_guard(&source, "cow_sync_source");
+        let mut merged = guard.clone();
+        drop(guard);
+
+        // During online rebalance, unmigrated entries still live in previous shards.
+        // Keep COW views complete by merging fallback entries that route to this active shard.
+        if self.rebalance_tracker.is_migrating() {
+            let prev = std_read_guard(&self.previous_shards, "cow_sync_previous");
+            if let Some(prev_shards) = prev.as_ref() {
+                for prev_shard in prev_shards.iter().flatten() {
+                    let prev_guard = std_read_guard(prev_shard, "cow_sync_previous_shard");
+                    for (k, v) in prev_guard.iter() {
+                        if self.shard_index(k) == index {
+                            merged.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let snapshot = Arc::new(merged);
+        let cow_shard = self.get_or_init_cow_shard(index);
+        let mut cow_guard = std_write_guard(&cow_shard, "cow_sync_target");
+        *cow_guard = snapshot;
+    }
+
+    fn cow_shard_snapshot(&self, index: usize) -> Arc<HashMap<K, V, S>> {
+        let cow_shard = self.get_or_init_cow_shard(index);
+        {
+            let cow_guard = std_read_guard(&cow_shard, "cow_shard_read");
+            if !cow_guard.is_empty() {
+                return cow_guard.clone();
+            }
+        }
+
+        let source = self.get_or_init_shard(index);
+        let source_guard = std_read_guard(&source, "cow_shard_seed");
+        let seeded = Arc::new(source_guard.clone());
+        drop(source_guard);
+        let mut cow_guard = std_write_guard(&cow_shard, "cow_shard_seed_write");
+        *cow_guard = seeded.clone();
+        seeded
+    }
+
     /// Start an online incremental rebalance.
     ///
     /// Writes route to the new active shard epoch immediately; reads fallback to previous
@@ -188,6 +379,8 @@ where
         self.previous_shard_count.store(current, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.begin(total_shards);
+        drop(active);
+        self.publish_write_for_all_shards();
         Ok(())
     }
 
@@ -245,6 +438,10 @@ where
             }
             self.previous_shard_count.store(0, Ordering::Relaxed);
             self.rebalance_tracker.finish();
+        }
+
+        if processed > 0 {
+            self.publish_write_for_all_shards();
         }
 
         processed
@@ -414,6 +611,9 @@ where
             max_pause_ns = options.max_pause_ns,
             "sync stop-the-world rebalance completed"
         );
+        drop(prev_slots);
+        drop(old_slots);
+        self.publish_write_for_all_shards();
 
         Ok(RebalanceReport {
             from_shards: current,
@@ -439,7 +639,8 @@ where
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let lookup_key = key.clone();
-        let shard = self.get_or_init_shard(self.shard_index(&key));
+        let shard_idx = self.shard_index(&key);
+        let shard = self.get_or_init_shard(shard_idx);
         let old = {
             let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
             guard.insert(key, value)
@@ -449,8 +650,10 @@ where
             if previous_old.is_none() {
                 self.total_len.fetch_add(1, Ordering::Relaxed);
             }
+            self.publish_write_for_touched_shards([shard_idx]);
             previous_old
         } else {
+            self.publish_write_for_touched_shards([shard_idx]);
             old
         }
     }
@@ -505,7 +708,8 @@ where
     ///
     #[tracing::instrument(skip(self, key), level = "trace")]
     pub fn remove(&self, key: &K) -> Option<V> {
-        let shard = self.get_or_init_shard(self.shard_index(key));
+        let shard_idx = self.shard_index(key);
+        let shard = self.get_or_init_shard(shard_idx);
         let old = {
             let mut guard: StdWriteGuard<'_, HashMap<K, V, S>> = std_write_guard(&shard, "shard");
             guard.remove(key)
@@ -513,11 +717,13 @@ where
         if let Some(old_val) = old {
             self.total_len.fetch_sub(1, Ordering::Relaxed);
             let _ = self.previous_remove(key);
+            self.publish_write_for_touched_shards([shard_idx]);
             Some(old_val)
         } else {
             let prev = self.previous_remove(key);
             if prev.is_some() {
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
+                self.publish_write_for_touched_shards([shard_idx]);
             }
             prev
         }
@@ -552,16 +758,21 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn clear(&self) {
-        let slots = std_read_guard(&self.shards, "shards");
-        for shard in slots.iter().flatten() {
-            let mut g = std_write_guard(shard, "shard");
-            g.clear();
+        let mut changed = false;
+        {
+            let slots = std_read_guard(&self.shards, "shards");
+            for shard in slots.iter().flatten() {
+                let mut g = std_write_guard(shard, "shard");
+                changed |= !g.is_empty();
+                g.clear();
+            }
         }
         {
             let prev = std_write_guard(&self.previous_shards, "clear_previous_shards");
             if let Some(prev_shards) = prev.as_ref() {
                 for shard in prev_shards.iter().flatten() {
                     let mut g = std_write_guard(shard, "previous_shard");
+                    changed |= !g.is_empty();
                     g.clear();
                 }
             }
@@ -573,6 +784,9 @@ where
         self.previous_shard_count.store(0, Ordering::Relaxed);
         self.rebalance_tracker.finish();
         self.total_len.store(0, Ordering::Relaxed);
+        if changed {
+            self.publish_write_for_all_shards();
+        }
     }
 
     /// Snapshot iteration over (K,V) clones.
@@ -592,35 +806,87 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
-        let shards_snapshot: Vec<StdShard<K, V, S>> = {
-            let g = std_read_guard(&self.shards, "shards");
-            g.iter().filter_map(|o| o.as_ref().cloned()).collect()
+        let start_epoch = self.write_epoch.load(Ordering::Relaxed);
+        if self.cache_enabled() {
+            let cached_epoch = self.snapshot_cache_epoch.load(Ordering::Relaxed);
+            if cached_epoch == start_epoch {
+                let cache = std_read_guard(&self.snapshot_cache, "snapshot_cache_read");
+                if let Some(entries) = cache.as_ref() {
+                    return entries.as_ref().clone().into_iter();
+                }
+            }
+        }
+
+        let items: Vec<(K, V)> = if self.cow_enabled() {
+            let shard_count = self.shard_count();
+            let mut snapshots = Vec::new();
+            for i in 0..shard_count {
+                let snapshot = self.cow_shard_snapshot(i);
+                if !snapshot.is_empty() {
+                    snapshots.push(snapshot);
+                }
+            }
+
+            #[cfg(feature = "rayon")]
+            {
+                snapshots
+                    .par_iter()
+                    .flat_map(|m| m.par_iter().map(|(k, v)| (k.clone(), v.clone())))
+                    .collect()
+            }
+
+            #[cfg(not(feature = "rayon"))]
+            {
+                let mut items = Vec::new();
+                for m in snapshots {
+                    items.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                items
+            }
+        } else {
+            let shards_snapshot: Vec<StdShard<K, V, S>> = {
+                let g = std_read_guard(&self.shards, "shards");
+                g.iter().filter_map(|o| o.as_ref().cloned()).collect()
+            };
+
+            #[cfg(feature = "rayon")]
+            {
+                let items: Vec<(K, V)> = shards_snapshot
+                    .par_iter()
+                    .flat_map(|shard| {
+                        let guard = std_read_guard(shard, "shard");
+                        guard
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                items
+            }
+
+            #[cfg(not(feature = "rayon"))]
+            {
+                let mut items = Vec::new();
+                for shard in shards_snapshot {
+                    let guard = std_read_guard(&shard, "shard");
+                    items.extend(guard.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                items
+            }
         };
 
-        #[cfg(feature = "rayon")]
-        {
-            let items: Vec<(K, V)> = shards_snapshot
-                .par_iter()
-                .flat_map(|shard| {
-                    let guard = std_read_guard(shard, "shard");
-                    guard
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            items.into_iter()
+        if self.cache_enabled() {
+            let end_epoch = self.write_epoch.load(Ordering::Relaxed);
+            if start_epoch == end_epoch {
+                let arc_items = Arc::new(items.clone());
+                let mut cache = std_write_guard(&self.snapshot_cache, "snapshot_cache_write");
+                *cache = Some(arc_items);
+                self.snapshot_cache_epoch
+                    .store(end_epoch, Ordering::Relaxed);
+            }
         }
 
-        #[cfg(not(feature = "rayon"))]
-        {
-            let mut items = Vec::new();
-            for shard in shards_snapshot {
-                let guard = std_read_guard(&shard, "shard");
-                items.extend(guard.iter().map(|(k, v)| (k.clone(), v.clone())));
-            }
-            return items.into_iter();
-        }
+        items.into_iter()
     }
 
     /// Batch insert multiple key-value pairs.
@@ -648,17 +914,26 @@ where
 
         let buckets = self.bucketize_entries(entries);
         let mut count = 0;
+        let mut touched = Vec::new();
         for (shard_idx, pairs) in buckets {
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
+            let mut shard_changed = false;
             for (k, v) in pairs {
                 if guard.insert(k, v).is_none() {
                     count += 1;
                 }
+                shard_changed = true;
+            }
+            if shard_changed {
+                touched.push(shard_idx);
             }
         }
         if count > 0 {
             self.total_len.fetch_add(count, Ordering::Relaxed);
+        }
+        if !touched.is_empty() {
+            self.publish_write_for_touched_shards(touched);
         }
         count
     }
@@ -688,17 +963,24 @@ where
 
         let buckets = self.bucketize_keys(keys);
         let mut count = 0;
+        let mut touched = Vec::new();
         for (shard_idx, keys) in buckets {
             let shard = self.get_or_init_shard(shard_idx);
             let mut guard = std_write_guard(&shard, "shard");
+            let mut shard_changed = false;
             for k in keys {
                 if guard.remove(&k).is_some() {
                     count += 1;
+                    shard_changed = true;
                 }
+            }
+            if shard_changed {
+                touched.push(shard_idx);
             }
         }
         if count > 0 {
             self.total_len.fetch_sub(count, Ordering::Relaxed);
+            self.publish_write_for_touched_shards(touched);
         }
         count
     }
@@ -757,17 +1039,22 @@ where
         }
 
         let shard = self.get_or_init_shard(self.shard_index(key));
+        let shard_idx = self.shard_index(key);
         let mut guard = std_write_guard(&shard, "shard");
 
         if let Some(old_val) = guard.get(key) {
             if let Some(new_val) = f(old_val) {
                 let result = new_val.clone();
                 guard.insert(key.clone(), new_val);
+                drop(guard);
+                self.publish_write_for_touched_shards([shard_idx]);
                 Some(result)
             } else {
                 // Remove the entry
                 guard.remove(key);
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
+                drop(guard);
+                self.publish_write_for_touched_shards([shard_idx]);
                 None
             }
         } else {
@@ -798,7 +1085,8 @@ where
             return new_v;
         }
 
-        let shard = self.get_or_init_shard(self.shard_index(&key));
+        let shard_idx = self.shard_index(&key);
+        let shard = self.get_or_init_shard(shard_idx);
         let mut guard = std_write_guard(&shard, "shard");
 
         if let Some(val) = guard.get(&key) {
@@ -807,6 +1095,8 @@ where
             let new_v = f();
             guard.insert(key, new_v.clone());
             self.total_len.fetch_add(1, Ordering::Relaxed);
+            drop(guard);
+            self.publish_write_for_touched_shards([shard_idx]);
             new_v
         }
     }
@@ -842,19 +1132,22 @@ where
 
             if removed_count > 0 {
                 self.total_len.fetch_sub(removed_count, Ordering::Relaxed);
+                self.publish_write_for_all_shards();
             }
         }
 
         #[cfg(not(feature = "rayon"))]
         {
+            let mut removed_total = 0usize;
             for shard in shards_snapshot {
                 let mut guard = std_write_guard(&shard, "shard");
-                let removed_count = guard.len();
+                let before = guard.len();
                 guard.retain(|k, v| predicate(k, v));
-                let removed = removed_count - guard.len();
-                if removed > 0 {
-                    self.total_len.fetch_sub(removed, Ordering::Relaxed);
-                }
+                removed_total += before - guard.len();
+            }
+            if removed_total > 0 {
+                self.total_len.fetch_sub(removed_total, Ordering::Relaxed);
+                self.publish_write_for_all_shards();
             }
         }
     }
@@ -908,6 +1201,7 @@ where
         // Since guards are stored in the same order as sorted shard_indices,
         // we can use binary search to find the index.
 
+        let mut changed = false;
         for op in txn.ops {
             match op {
                 TxnOp::Read(k) => {
@@ -944,6 +1238,7 @@ where
                     if guard.insert(k, v).is_none() {
                         self.total_len.fetch_add(1, Ordering::Relaxed);
                     }
+                    changed = true;
                 }
                 TxnOp::Remove(k) => {
                     let idx = self.shard_index(&k);
@@ -960,9 +1255,15 @@ where
                     let guard = &mut guards[guard_idx];
                     if guard.remove(&k).is_some() {
                         self.total_len.fetch_sub(1, Ordering::Relaxed);
+                        changed = true;
                     }
                 }
             }
+        }
+
+        drop(guards);
+        if changed {
+            self.publish_write_for_touched_shards(shard_indices);
         }
 
         TransactionResult::Committed(())
@@ -984,11 +1285,14 @@ where
         V: PartialEq,
     {
         let shard = self.get_or_init_shard(self.shard_index(key));
+        let shard_idx = self.shard_index(key);
         let mut guard = std_write_guard(&shard, "cas");
 
         match guard.get(key) {
             Some(current) if current == expected => {
                 guard.insert(key.clone(), new.clone());
+                drop(guard);
+                self.publish_write_for_touched_shards([shard_idx]);
                 CasResult::Success(new)
             }
             Some(current) => CasResult::Failure(current.clone()),
@@ -1011,12 +1315,15 @@ where
         V: PartialEq,
     {
         let shard = self.get_or_init_shard(self.shard_index(key));
+        let shard_idx = self.shard_index(key);
         let mut guard = std_write_guard(&shard, "cas_remove");
 
         match guard.get(key) {
             Some(current) if current == expected => {
                 guard.remove(key);
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
+                drop(guard);
+                self.publish_write_for_touched_shards([shard_idx]);
                 true
             }
             _ => false,
@@ -1030,8 +1337,29 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn cow_snapshot(&self) -> CowSnapshot<K, V> {
-        let data = self.iter().collect();
-        let version = self.version.load(Ordering::SeqCst) as u64;
+        if self.cache_enabled() {
+            let cache_epoch = self.snapshot_cache_epoch.load(Ordering::Relaxed);
+            let write_epoch = self.write_epoch.load(Ordering::Relaxed);
+            if cache_epoch == write_epoch {
+                let cache = std_read_guard(&self.snapshot_cache, "snapshot_cache_read");
+                if let Some(entries) = cache.as_ref() {
+                    return CowSnapshot::from_arc(entries.clone(), cache_epoch);
+                }
+            }
+        }
+
+        // Best-effort stable epoch labeling: retry a few times if writes overlap snapshot build.
+        for _ in 0..3 {
+            let begin = self.write_epoch.load(Ordering::Relaxed);
+            let data: Vec<(K, V)> = self.iter().collect();
+            let end = self.write_epoch.load(Ordering::Relaxed);
+            if begin == end {
+                return CowSnapshot::new(data, end);
+            }
+        }
+
+        let data: Vec<(K, V)> = self.iter().collect();
+        let version = self.write_epoch.load(Ordering::Relaxed);
         CowSnapshot::new(data, version)
     }
 
@@ -1230,15 +1558,22 @@ where
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn drain(&self) -> DrainIterator<K, V> {
-        let slots = std_read_guard(&self.shards, "shards");
         let mut items = Vec::new();
+        let mut changed = false;
 
-        for shard in slots.iter().flatten() {
-            let mut guard = std_write_guard(shard, "shard");
-            items.extend(guard.drain());
+        {
+            let slots = std_read_guard(&self.shards, "shards");
+            for shard in slots.iter().flatten() {
+                let mut guard = std_write_guard(shard, "shard");
+                changed |= !guard.is_empty();
+                items.extend(guard.drain());
+            }
         }
 
         self.total_len.store(0, Ordering::Relaxed);
+        if changed {
+            self.publish_write_for_all_shards();
+        }
 
         DrainIterator { items, index: 0 }
     }
