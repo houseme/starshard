@@ -66,7 +66,8 @@ Hasher Choice
 
 Limitations
 ------------
-- Supports stop-the-world shard rebalancing via `rebalance_to(...)`; online incremental migration is not implemented yet.
+- Supports stop-the-world shard rebalancing via `rebalance_to(...)` and online incremental migration via
+  `start_rebalance_online(...)` + `advance_rebalance(...)`.
 - Lifecycle features currently provide introspection/utilities (e.g. per-shard load, drain, memory stats),
   but do not implement a built-in autonomous TTL eviction engine.
 - Iteration allocates temporary vectors proportional to initialized shards (to snapshot).
