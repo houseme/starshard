@@ -291,7 +291,7 @@ where
     profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-mod sync_impl;
+mod core;
 
 /* ---------------------- Serde for ShardedHashMap ------------------------ */
 
@@ -324,11 +324,8 @@ where
     quorum_config: Arc<StdRwLock<Option<QuorumConfig>>>,
 }
 
-#[cfg(feature = "async")]
-mod async_impl;
-
 #[cfg(all(feature = "async", feature = "serde"))]
-pub use async_impl::AsyncShardedHashMapSnapshot;
+pub use core::async_impl::AsyncShardedHashMapSnapshot;
 
 /* ================================ Tests ================================ */
 
