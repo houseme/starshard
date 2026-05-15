@@ -11,7 +11,7 @@ fn run_workload(mode: SnapshotMode) -> u128 {
     for round in 0..200 {
         for i in 0..25 {
             let key = format!("rw_{}", (round * 25 + i) % 20_000);
-            map.insert(key, (round * 25 + i) as i32);
+            map.insert(key, round * 25 + i);
         }
         let _ = map.iter().count();
     }

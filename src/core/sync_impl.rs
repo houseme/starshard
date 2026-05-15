@@ -219,6 +219,28 @@ where
         self.invalidate_snapshot_cache();
     }
 
+    fn publish_write_for_touched_shards<I>(&self, touched: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        if self.cow_enabled() {
+            for idx in touched {
+                self.sync_cow_shard_from_active(idx);
+            }
+        }
+        self.on_structural_write();
+    }
+
+    fn publish_write_for_all_shards(&self) {
+        if self.cow_enabled() {
+            let count = self.shard_count();
+            for idx in 0..count {
+                self.sync_cow_shard_from_active(idx);
+            }
+        }
+        self.on_structural_write();
+    }
+
     fn get_or_init_cow_shard(&self, index: usize) -> StdCowShard<K, V, S> {
         let mut shards = std_write_guard(&self.cow_shards, "cow_shards");
         if index >= shards.len() {
@@ -243,8 +265,26 @@ where
         }
         let source = self.get_or_init_shard(index);
         let guard = std_read_guard(&source, "cow_sync_source");
-        let snapshot = Arc::new(guard.clone());
+        let mut merged = guard.clone();
         drop(guard);
+
+        // During online rebalance, unmigrated entries still live in previous shards.
+        // Keep COW views complete by merging fallback entries that route to this active shard.
+        if self.rebalance_tracker.is_migrating() {
+            let prev = std_read_guard(&self.previous_shards, "cow_sync_previous");
+            if let Some(prev_shards) = prev.as_ref() {
+                for prev_shard in prev_shards.iter().flatten() {
+                    let prev_guard = std_read_guard(prev_shard, "cow_sync_previous_shard");
+                    for (k, v) in prev_guard.iter() {
+                        if self.shard_index(k) == index {
+                            merged.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let snapshot = Arc::new(merged);
         let cow_shard = self.get_or_init_cow_shard(index);
         let mut cow_guard = std_write_guard(&cow_shard, "cow_sync_target");
         *cow_guard = snapshot;
@@ -297,11 +337,7 @@ where
         self.previous_shard_count.store(current, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.begin(total_shards);
-        self.on_structural_write();
-        let count = self.shard_count();
-        for idx in 0..count {
-            self.sync_cow_shard_from_active(idx);
-        }
+        self.publish_write_for_all_shards();
         Ok(())
     }
 
@@ -362,11 +398,7 @@ where
         }
 
         if processed > 0 {
-            self.on_structural_write();
-            let count = self.shard_count();
-            for idx in 0..count {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.publish_write_for_all_shards();
         }
 
         processed
@@ -536,11 +568,7 @@ where
             max_pause_ns = options.max_pause_ns,
             "sync stop-the-world rebalance completed"
         );
-        self.on_structural_write();
-        let count = self.shard_count();
-        for idx in 0..count {
-            self.sync_cow_shard_from_active(idx);
-        }
+        self.publish_write_for_all_shards();
 
         Ok(RebalanceReport {
             from_shards: current,
@@ -576,13 +604,11 @@ where
             let previous_old = self.previous_take(&lookup_key);
             if previous_old.is_none() {
                 self.total_len.fetch_add(1, Ordering::Relaxed);
-                self.on_structural_write();
             }
-            self.sync_cow_shard_from_active(shard_idx);
+            self.publish_write_for_touched_shards([shard_idx]);
             previous_old
         } else {
-            self.on_structural_write();
-            self.sync_cow_shard_from_active(shard_idx);
+            self.publish_write_for_touched_shards([shard_idx]);
             old
         }
     }
@@ -646,16 +672,14 @@ where
         if let Some(old_val) = old {
             self.total_len.fetch_sub(1, Ordering::Relaxed);
             let _ = self.previous_remove(key);
-            self.on_structural_write();
-            self.sync_cow_shard_from_active(shard_idx);
+            self.publish_write_for_touched_shards([shard_idx]);
             Some(old_val)
         } else {
             let prev = self.previous_remove(key);
             if prev.is_some() {
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
-                self.on_structural_write();
+                self.publish_write_for_touched_shards([shard_idx]);
             }
-            self.sync_cow_shard_from_active(shard_idx);
             prev
         }
     }
@@ -714,14 +738,7 @@ where
         self.rebalance_tracker.finish();
         self.total_len.store(0, Ordering::Relaxed);
         if changed {
-            self.on_structural_write();
-            if self.cow_enabled() {
-                let cow_slots = std_read_guard(&self.cow_shards, "cow_shards_clear");
-                for shard in cow_slots.iter().flatten() {
-                    let mut g = std_write_guard(shard, "cow_shard_clear");
-                    *g = Arc::new(HashMap::with_hasher(self.hasher.clone()));
-                }
-            }
+            self.publish_write_for_all_shards();
         }
     }
 
@@ -742,10 +759,10 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
+        let start_epoch = self.write_epoch.load(Ordering::Relaxed);
         if self.cache_enabled() {
-            let current_epoch = self.write_epoch.load(Ordering::Relaxed);
             let cached_epoch = self.snapshot_cache_epoch.load(Ordering::Relaxed);
-            if cached_epoch == current_epoch {
+            if cached_epoch == start_epoch {
                 let cache = std_read_guard(&self.snapshot_cache, "snapshot_cache_read");
                 if let Some(entries) = cache.as_ref() {
                     return entries.as_ref().clone().into_iter();
@@ -812,11 +829,14 @@ where
         };
 
         if self.cache_enabled() {
-            let arc_items = Arc::new(items.clone());
-            let mut cache = std_write_guard(&self.snapshot_cache, "snapshot_cache_write");
-            *cache = Some(arc_items);
-            let epoch = self.write_epoch.load(Ordering::Relaxed);
-            self.snapshot_cache_epoch.store(epoch, Ordering::Relaxed);
+            let end_epoch = self.write_epoch.load(Ordering::Relaxed);
+            if start_epoch == end_epoch {
+                let arc_items = Arc::new(items.clone());
+                let mut cache = std_write_guard(&self.snapshot_cache, "snapshot_cache_write");
+                *cache = Some(arc_items);
+                self.snapshot_cache_epoch
+                    .store(end_epoch, Ordering::Relaxed);
+            }
         }
 
         items.into_iter()
@@ -866,10 +886,7 @@ where
             self.total_len.fetch_add(count, Ordering::Relaxed);
         }
         if !touched.is_empty() {
-            self.on_structural_write();
-            for idx in touched {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.publish_write_for_touched_shards(touched);
         }
         count
     }
@@ -916,12 +933,7 @@ where
         }
         if count > 0 {
             self.total_len.fetch_sub(count, Ordering::Relaxed);
-            self.on_structural_write();
-        }
-        if !touched.is_empty() {
-            for idx in touched {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.publish_write_for_touched_shards(touched);
         }
         count
     }
@@ -988,16 +1000,14 @@ where
                 let result = new_val.clone();
                 guard.insert(key.clone(), new_val);
                 drop(guard);
-                self.on_structural_write();
-                self.sync_cow_shard_from_active(shard_idx);
+                self.publish_write_for_touched_shards([shard_idx]);
                 Some(result)
             } else {
                 // Remove the entry
                 guard.remove(key);
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
                 drop(guard);
-                self.on_structural_write();
-                self.sync_cow_shard_from_active(shard_idx);
+                self.publish_write_for_touched_shards([shard_idx]);
                 None
             }
         } else {
@@ -1039,8 +1049,7 @@ where
             guard.insert(key, new_v.clone());
             self.total_len.fetch_add(1, Ordering::Relaxed);
             drop(guard);
-            self.on_structural_write();
-            self.sync_cow_shard_from_active(shard_idx);
+            self.publish_write_for_touched_shards([shard_idx]);
             new_v
         }
     }
@@ -1076,29 +1085,22 @@ where
 
             if removed_count > 0 {
                 self.total_len.fetch_sub(removed_count, Ordering::Relaxed);
-                self.on_structural_write();
-                let count = self.shard_count();
-                for idx in 0..count {
-                    self.sync_cow_shard_from_active(idx);
-                }
+                self.publish_write_for_all_shards();
             }
         }
 
         #[cfg(not(feature = "rayon"))]
         {
+            let mut removed_total = 0usize;
             for shard in shards_snapshot {
                 let mut guard = std_write_guard(&shard, "shard");
-                let removed_count = guard.len();
+                let before = guard.len();
                 guard.retain(|k, v| predicate(k, v));
-                let removed = removed_count - guard.len();
-                if removed > 0 {
-                    self.total_len.fetch_sub(removed, Ordering::Relaxed);
-                    self.on_structural_write();
-                }
+                removed_total += before - guard.len();
             }
-            let count = self.shard_count();
-            for idx in 0..count {
-                self.sync_cow_shard_from_active(idx);
+            if removed_total > 0 {
+                self.total_len.fetch_sub(removed_total, Ordering::Relaxed);
+                self.publish_write_for_all_shards();
             }
         }
     }
@@ -1214,10 +1216,7 @@ where
 
         drop(guards);
         if changed {
-            self.on_structural_write();
-            for idx in shard_indices {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.publish_write_for_touched_shards(shard_indices);
         }
 
         TransactionResult::Committed(())
@@ -1246,8 +1245,7 @@ where
             Some(current) if current == expected => {
                 guard.insert(key.clone(), new.clone());
                 drop(guard);
-                self.on_structural_write();
-                self.sync_cow_shard_from_active(shard_idx);
+                self.publish_write_for_touched_shards([shard_idx]);
                 CasResult::Success(new)
             }
             Some(current) => CasResult::Failure(current.clone()),
@@ -1278,8 +1276,7 @@ where
                 guard.remove(key);
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
                 drop(guard);
-                self.on_structural_write();
-                self.sync_cow_shard_from_active(shard_idx);
+                self.publish_write_for_touched_shards([shard_idx]);
                 true
             }
             _ => false,
@@ -1293,18 +1290,29 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn cow_snapshot(&self) -> CowSnapshot<K, V> {
-        let version = self.write_epoch.load(Ordering::Relaxed);
         if self.cache_enabled() {
             let cache_epoch = self.snapshot_cache_epoch.load(Ordering::Relaxed);
-            if cache_epoch == version {
+            let write_epoch = self.write_epoch.load(Ordering::Relaxed);
+            if cache_epoch == write_epoch {
                 let cache = std_read_guard(&self.snapshot_cache, "snapshot_cache_read");
                 if let Some(entries) = cache.as_ref() {
-                    return CowSnapshot::from_arc(entries.clone(), version);
+                    return CowSnapshot::from_arc(entries.clone(), cache_epoch);
                 }
             }
         }
 
+        // Best-effort stable epoch labeling: retry a few times if writes overlap snapshot build.
+        for _ in 0..3 {
+            let begin = self.write_epoch.load(Ordering::Relaxed);
+            let data: Vec<(K, V)> = self.iter().collect();
+            let end = self.write_epoch.load(Ordering::Relaxed);
+            if begin == end {
+                return CowSnapshot::new(data, end);
+            }
+        }
+
         let data: Vec<(K, V)> = self.iter().collect();
+        let version = self.write_epoch.load(Ordering::Relaxed);
         CowSnapshot::new(data, version)
     }
 
@@ -1515,11 +1523,7 @@ where
 
         self.total_len.store(0, Ordering::Relaxed);
         if changed {
-            self.on_structural_write();
-            let count = self.shard_count();
-            for idx in 0..count {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.publish_write_for_all_shards();
         }
 
         DrainIterator { items, index: 0 }

@@ -183,6 +183,7 @@ pub use advanced::{
 pub(crate) use crate::core::StdShardVecArc;
 type StdCowShard<K, V, S> = Arc<StdRwLock<Arc<HashMap<K, V, S>>>>;
 type StdCowShardVecArc<K, V, S> = Arc<StdRwLock<Vec<Option<StdCowShard<K, V, S>>>>>;
+type SnapshotCache<K, V> = Arc<StdRwLock<Option<Arc<Vec<(K, V)>>>>>;
 
 #[cfg(feature = "async")]
 pub(crate) use crate::core::AsyncShardVecArc;
@@ -190,6 +191,8 @@ pub(crate) use crate::core::AsyncShardVecArc;
 type AsyncCowShard<K, V, S> = Arc<TokioRwLock<Arc<HashMap<K, V, S>>>>;
 #[cfg(feature = "async")]
 type AsyncCowShardVecArc<K, V, S> = Arc<TokioRwLock<Vec<Option<AsyncCowShard<K, V, S>>>>>;
+#[cfg(feature = "async")]
+type AsyncSnapshotCache<K, V> = Arc<TokioRwLock<Option<Arc<Vec<(K, V)>>>>>;
 
 #[cfg(all(feature = "async", feature = "advanced"))]
 pub(crate) use crate::core::ReplicaList;
@@ -415,7 +418,7 @@ where
     previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
     write_epoch: Arc<AtomicU64>,
-    snapshot_cache: Arc<StdRwLock<Option<Arc<Vec<(K, V)>>>>>,
+    snapshot_cache: SnapshotCache<K, V>,
     snapshot_cache_epoch: Arc<AtomicU64>,
     rebalance_lock: Arc<StdMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
@@ -453,7 +456,7 @@ where
     previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
     write_epoch: Arc<AtomicU64>,
-    snapshot_cache: Arc<TokioRwLock<Option<Arc<Vec<(K, V)>>>>>,
+    snapshot_cache: AsyncSnapshotCache<K, V>,
     snapshot_cache_epoch: Arc<AtomicU64>,
     rebalance_lock: Arc<TokioMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,

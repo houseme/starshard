@@ -249,7 +249,7 @@ let cow_map: ShardedHashMap<String, i32> =
 | 负载特征             | 推荐模式         |
 |----------------------|------------------|
 | 高写低快照           | `Clone`          |
-| 中写中快照           | `Cached`         |
+| 中写中快照           | `Clone` / `Cached` |
 | 低写高频快照读取     | `Cow` / `Cached` |
 
 灰度与回滚建议：

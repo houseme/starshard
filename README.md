@@ -260,7 +260,7 @@ Selection guidance:
 | Workload profile                | Recommended mode |
 |---------------------------------|------------------|
 | High write, low snapshot        | `Clone`          |
-| Medium write, medium snapshot   | `Cached`         |
+| Medium write, medium snapshot   | `Clone` / `Cached` |
 | Low write, high snapshot reads  | `Cow` / `Cached` |
 
 Migration / rollback:
