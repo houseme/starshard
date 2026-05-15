@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-05-15
+
+### Changed
+
+- **Snapshot concurrency hardening**:
+    - Eliminated snapshot cache race windows in sync/async paths.
+    - Strengthened COW snapshot + rebalance interaction consistency under concurrent writes.
+    - Refined snapshot/rebalance internal flow to reduce patch-on-patch branching in hot paths.
+
+### Documentation
+
+- Updated release documentation and roadmap status to `v2.2.0`.
+- Refreshed snapshot mode guidance and runnable examples in `README.md` and `README_CN.md`.
+
 ## [2.1.0] - 2026-05-15
 
 ### Added
