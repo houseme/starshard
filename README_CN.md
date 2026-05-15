@@ -226,10 +226,38 @@ let json = serde_json::to_string( & snap).unwrap();
 
 ---
 
-## Roadmap（潜在）
+## 快照模式（`v2.1.0`）
 
-- 更细粒度的重平衡可观测与取消控制
-- 更低拷贝成本的 COW 快照
+`SnapshotMode` 支持按负载选择快照策略：
+
+- `Clone`：每次快照都重建（默认，写入开销最低）。
+- `Cached`：无写入时复用快照缓存。
+- `Cow`：分片级 COW 快照视图，降低高频快照重建成本。
+
+```rust
+use starshard::{ShardedHashMap, SnapshotMode};
+
+let clone_map: ShardedHashMap<String, i32> = ShardedHashMap::new(64); // 默认 Clone
+let cached_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cached);
+let cow_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cow);
+```
+
+选型建议：
+
+| 负载特征             | 推荐模式         |
+|----------------------|------------------|
+| 高写低快照           | `Clone`          |
+| 中写中快照           | `Cached`         |
+| 低写高频快照读取     | `Cow` / `Cached` |
+
+灰度与回滚建议：
+
+1. 先以 `Clone` 作为生产基线。
+2. 单实例灰度到 `Cached`，观察快照延迟和分配指标。
+3. 快照占比高且写入比例低时，再灰度 `Cow`。
+4. 回滚时重建为 `SnapshotMode::Clone` 即可。
 
 ---
 

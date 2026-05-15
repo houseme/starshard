@@ -21,6 +21,20 @@ All notable changes to this project will be documented in this file.
       - `RebalanceOptions`
       - `RebalanceReport`
       - `RebalanceStatus`
+- **Snapshot mode APIs (sync + async)**:
+    - Added `SnapshotMode::{Clone, Cached, Cow}`.
+    - Added constructors:
+      - `with_snapshot_mode(...)`
+      - `with_shards_and_hasher_and_snapshot_mode(...)`
+      - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
+    - Added write epoch + snapshot cache flow for repeated snapshot reads.
+    - Added COW snapshot shard path for snapshot-heavy workloads.
+    - Added snapshot mode benchmark groups in `benches/bench_main.rs`.
+    - Added snapshot mode examples:
+      - `snapshot_mode_clone_demo`
+      - `snapshot_mode_cached_demo`
+      - `snapshot_mode_cow_demo`
+      - `mixed_workload_snapshot_tradeoff_demo`
 
 ### Changed
 

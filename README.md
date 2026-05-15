@@ -237,10 +237,38 @@ Do benchmark with your own key/value distribution and CPU topology.
 
 ---
 
-## Roadmap (Potential)
+## Snapshot Modes (`v2.1.0`)
 
-- Extended rebalance telemetry and cancellation controls.
-- Zero-copy or COW snapshot mode.
+`SnapshotMode` provides workload-oriented snapshot behavior:
+
+- `Clone`: always rebuild snapshot entries (default, lowest write overhead).
+- `Cached`: cache snapshot results and reuse until next write.
+- `Cow`: use per-shard copy-on-write snapshot view to reduce repeated snapshot rebuild pressure.
+
+```rust
+use starshard::{ShardedHashMap, SnapshotMode};
+
+let clone_map: ShardedHashMap<String, i32> = ShardedHashMap::new(64); // default = Clone
+let cached_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cached);
+let cow_map: ShardedHashMap<String, i32> =
+    ShardedHashMap::with_snapshot_mode(64, SnapshotMode::Cow);
+```
+
+Selection guidance:
+
+| Workload profile                | Recommended mode |
+|---------------------------------|------------------|
+| High write, low snapshot        | `Clone`          |
+| Medium write, medium snapshot   | `Cached`         |
+| Low write, high snapshot reads  | `Cow` / `Cached` |
+
+Migration / rollback:
+
+1. Start from `Clone` in production baseline.
+2. Switch one instance to `Cached` and compare snapshot latency + alloc metrics.
+3. If snapshot-heavy and write ratio is low, canary `Cow`.
+4. Roll back by recreating map with `SnapshotMode::Clone`.
 
 ---
 
