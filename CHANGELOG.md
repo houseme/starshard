@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-05-15
+
+### Changed
+
+- **Version bump**:
+    - Crate version updated from `1.2.0` to `2.0.0`.
+
+- **Internal architecture refactor (API unchanged)**:
+    - Split core sync implementation out of `src/lib.rs` into `src/sync_impl.rs`.
+    - Split core async implementation out of `src/lib.rs` into `src/async_impl.rs`.
+    - Extracted serde implementation into `src/serde_impl.rs`.
+    - Kept public API surface and feature behavior stable while reducing `lib.rs` complexity.
+
+- **Batch-path performance optimization**:
+    - Reworked sync/async `batch_insert`, `batch_remove`, and `batch_get` grouping from per-call
+      `HashMap<usize, Vec<_>>` to indexed shard buckets.
+    - Reduced grouping overhead and extra hashing work on hot paths while preserving semantics.
+
+### Added
+
+- **Refactor guardrails and verification scripts**:
+    - Added `scripts/export_api_surface.sh` for API-surface snapshot/export.
+    - Added `scripts/verify_feature_matrix.sh` for repeatable feature-matrix + doctest validation.
+
+- **CI hardening**:
+    - Added dedicated feature matrix job in GitHub Actions.
+    - Added dedicated doctest job in GitHub Actions.
+
+### Documentation
+
+- Updated `README.md` and `README_CN.md` for `2.0.0` version references.
+- Synced feature matrix and performance notes with current `v2.0` implementation status.
+
 ## [1.2.0] - 2026-05-15
 
 ### Added
