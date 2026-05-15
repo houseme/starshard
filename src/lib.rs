@@ -336,7 +336,8 @@ impl RebalanceTracker {
     fn begin(&self, total_shards: usize) {
         self.total_shards.store(total_shards, Ordering::Relaxed);
         self.moved_shards.store(0, Ordering::Relaxed);
-        self.state.store(REBALANCE_STATE_MIGRATING, Ordering::Relaxed);
+        self.state
+            .store(REBALANCE_STATE_MIGRATING, Ordering::Relaxed);
     }
 
     fn step(&self) {
@@ -486,12 +487,9 @@ mod tests {
 
     #[test]
     fn sync_try_constructor_custom_cap_success_and_rejection() {
-        let ok = ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
-            32,
-            FxBuildHasher,
-            64,
-        )
-        .expect("expected shard_count within custom cap to succeed");
+        let ok =
+            ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(32, FxBuildHasher, 64)
+                .expect("expected shard_count within custom cap to succeed");
         assert_eq!(ok.shard_count(), 32);
 
         let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
@@ -508,12 +506,9 @@ mod tests {
 
     #[test]
     fn sync_try_constructor_custom_cap_zero_normalizes_to_one() {
-        let ok = ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
-            1,
-            FxBuildHasher,
-            0,
-        )
-        .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
+        let ok =
+            ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(1, FxBuildHasher, 0)
+                .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
         assert_eq!(ok.shard_count(), 1);
 
         let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(

@@ -27,7 +27,10 @@ fn sync_online_incremental_demo() {
     }
 
     assert_eq!(map.get(&"k99".to_string()), Some(99));
-    println!("online rebalance finished, shard_count={}", map.shard_count());
+    println!(
+        "online rebalance finished, shard_count={}",
+        map.shard_count()
+    );
 }
 
 #[cfg(feature = "async")]

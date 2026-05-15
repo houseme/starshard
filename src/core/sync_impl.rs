@@ -165,7 +165,10 @@ where
     /// shards until migration is fully advanced via `advance_rebalance`.
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn start_rebalance_online(&self, new_shard_count: usize) -> Result<(), ShardCountError> {
-        let _rebalance_guard = self.rebalance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _rebalance_guard = self
+            .rebalance_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
         if self.rebalance_status().state == "migrating" {
             return Ok(());
@@ -205,7 +208,8 @@ where
             }
             let idx = status.moved_shards;
             let source_shard = {
-                let mut prev = std_write_guard(&self.previous_shards, "advance_rebalance_prev_take");
+                let mut prev =
+                    std_write_guard(&self.previous_shards, "advance_rebalance_prev_take");
                 let Some(shards) = prev.as_mut() else {
                     break;
                 };
@@ -235,7 +239,8 @@ where
         let status = self.rebalance_tracker.snapshot();
         if status.state == "migrating" && status.moved_shards >= status.total_shards {
             {
-                let mut prev = std_write_guard(&self.previous_shards, "advance_rebalance_finish_prev");
+                let mut prev =
+                    std_write_guard(&self.previous_shards, "advance_rebalance_finish_prev");
                 *prev = None;
             }
             self.previous_shard_count.store(0, Ordering::Relaxed);
@@ -329,7 +334,10 @@ where
         new_shard_count: usize,
         options: RebalanceOptions,
     ) -> Result<RebalanceReport, ShardCountError> {
-        let _rebalance_guard = self.rebalance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _rebalance_guard = self
+            .rebalance_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
         let current = self.shard_count();
         if target == current {
@@ -379,7 +387,8 @@ where
                             new_slots[new_idx] = Some(Arc::new(StdRwLock::new(map)));
                         }
                         if let Some(dest) = new_slots[new_idx].as_ref() {
-                            let mut dest_guard = std_write_guard(dest, "rebalance_previous_target_shard");
+                            let mut dest_guard =
+                                std_write_guard(dest, "rebalance_previous_target_shard");
                             if dest_guard.insert(k.clone(), v.clone()).is_none() {
                                 moved_entries += 1;
                             }
