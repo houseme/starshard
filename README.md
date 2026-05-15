@@ -33,6 +33,16 @@ starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecyc
 # starshard = "2.2.0"
 ```
 
+## 5-Minute Path
+
+1. Start with default sync map: `ShardedHashMap::new(64)`.
+2. If you are in Tokio runtime, switch to `AsyncShardedHashMap`.
+3. If snapshots are frequent, try `SnapshotMode::Cached` first, then `SnapshotMode::Cow`.
+4. If shard count is user-driven or external-input-driven, use strict constructors (`try_with_*`).
+
+Migration guide:
+- [1.x to 2.x Usage Differences](MIGRATION-1X-TO-2X.md)
+
 ## Feature Flags
 
 | Feature | What you get | Typical use |
@@ -67,6 +77,19 @@ async fn main() {
     assert_eq!(m.get(&"k1".into()).await, Some(10));
 }
 ```
+
+## Common Operations (Cheat Sheet)
+
+| Goal | Sync API | Async API |
+|---|---|---|
+| insert/update | `insert(k, v)` | `insert(k, v).await` |
+| read | `get(&k)` | `get(&k).await` |
+| delete | `remove(&k)` | `remove(&k).await` |
+| batch insert | `batch_insert(items)` | `batch_insert(items).await` |
+| batch read | `batch_get(&keys)` | `batch_get(&keys).await` |
+| conditional update | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
+| conditional insert | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
+| metrics/introspection | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
 
 ## Constructor Strategy
 
@@ -189,3 +212,16 @@ cargo check --all-features
 - Not lock-free; hot-shard writer pressure can still serialize.
 - Snapshot operations still materialize `Vec<(K, V)>` as output format.
 - `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.0`.
+
+## License
+
+Dual license:
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)
+
+You may choose either license.
+
+## Disclaimer
+
+- Benchmarks and throughput notes in this README are indicative, not guaranteed.
+- Always validate behavior, latency, and memory usage under your own workload before production rollout.

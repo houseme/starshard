@@ -32,6 +32,16 @@ starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecyc
 # starshard = "2.2.0"
 ```
 
+## 5 分钟上手路径
+
+1. 先用默认同步 map：`ShardedHashMap::new(64)`。
+2. 如果在 Tokio 运行时内，切换到 `AsyncShardedHashMap`。
+3. 如果快照调用频繁，先尝试 `SnapshotMode::Cached`，再评估 `SnapshotMode::Cow`。
+4. 如果分片数量来自用户输入或外部配置，优先用严格构造器（`try_with_*`）。
+
+迁移说明：
+- [1.x 到 2.x 使用差异](MIGRATION-1X-TO-2X_CN.md)
+
 ## 特性开关
 
 | Feature | 能力 | 典型场景 |
@@ -66,6 +76,19 @@ async fn main() {
     assert_eq!(m.get(&"k1".into()).await, Some(10));
 }
 ```
+
+## 常用操作速查
+
+| 目标 | 同步 API | 异步 API |
+|---|---|---|
+| 插入/更新 | `insert(k, v)` | `insert(k, v).await` |
+| 读取 | `get(&k)` | `get(&k).await` |
+| 删除 | `remove(&k)` | `remove(&k).await` |
+| 批量插入 | `batch_insert(items)` | `batch_insert(items).await` |
+| 批量读取 | `batch_get(&keys)` | `batch_get(&keys).await` |
+| 条件更新 | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
+| 条件插入 | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
+| 指标/内省 | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
 
 ## 构造器选型
 
@@ -188,3 +211,16 @@ cargo check --all-features
 - 不是 lock-free；热点分片写压力仍可能串行化。
 - 快照输出仍需物化为 `Vec<(K, V)>`。
 - `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.0` 中为前向兼容预留参数。
+
+## License
+
+双许可证：
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)
+
+你可以任选其一。
+
+## 免责声明
+
+- README 中的基准和性能描述仅作参考，不构成性能承诺。
+- 生产使用前请务必基于真实负载完成延迟、吞吐与内存验证。
