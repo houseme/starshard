@@ -16,7 +16,7 @@
 
 ## 状态
 
-生产就绪 (v2.0+)。API 稳定性优先。
+生产就绪 (v2.1+)。API 稳定性优先。
 
 ## 为什么需要它
 
@@ -55,7 +55,7 @@ Starshard 目标：
 all-features = true
 ```
 
-`v2.0.0` 当前内部结构：
+`v2.1.0` 当前内部结构：
 
 - `src/core/sync_impl.rs`
 - `src/core/async_impl.rs`
@@ -70,9 +70,9 @@ all-features = true
 
 ```toml
 [dependencies]
-starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.1.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小：
-# starshard = "2.0.0"
+# starshard = "2.1.0"
 ```
 
 开发/测试:
@@ -119,6 +119,27 @@ async fn main() {
     let m: AsyncShardedHashMap<String, u32> = AsyncShardedHashMap::new(64);
     m.insert("x".into(), 42).await;
     assert_eq!(m.get(&"x".into()).await, Some(42));
+}
+```
+
+## 自适应重平衡（`v2.1+`）
+
+同步：
+
+```rust
+use starshard::{RebalanceOptions, ShardedHashMap};
+
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+m.rebalance_to(32, RebalanceOptions::default()).unwrap();
+```
+
+在线渐进迁移（同步）：
+
+```rust
+let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+m.start_rebalance_online(32).unwrap();
+while m.rebalance_status().state == "migrating" {
+    m.advance_rebalance(2);
 }
 ```
 
@@ -181,6 +202,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | 大量快照迭代 + `rayon` | 3~4 倍扁平化速度 (100k+ 元素) |
 | 稀疏访问             | 仅访问分片分配内存             |
 | 批量插入/移除          | 每个分片组仅一次锁获取，`v2.0.0` 使用稀疏分桶降低额外内存开销 |
+| 在线重平衡             | 支持按分片渐进迁移，读路径 active 优先 |
 
 请基准测试你的真实负载（键分布、核心数、缓存行为）。
 
@@ -197,7 +219,7 @@ let json = serde_json::to_string( & snap).unwrap();
 
 ## 局限
 
-- 无在线分片再平衡。
+- 已支持停顿式与在线渐进分片重平衡（`v2.1`）。
 - 迭代需分配临时 `Vec`。
 - Hasher 状态不序列化。
 - 大量写倾斜仍可能产生热点锁。
@@ -206,7 +228,7 @@ let json = serde_json::to_string( & snap).unwrap();
 
 ## Roadmap（潜在）
 
-- 自适应/重分片机制
+- 更细粒度的重平衡可观测与取消控制
 - 更低拷贝成本的 COW 快照
 
 ---
