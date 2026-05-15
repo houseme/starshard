@@ -13,7 +13,7 @@ This document focuses on **usage-level** differences and migration guidance.
 - The key practical changes are:
   - safer shard-count constructor behavior in `2.0.0`,
   - optional rebalance APIs in `2.1+`,
-  - optional snapshot modes in `2.1+`.
+  - optional snapshot modes in `2.2+`.
 
 ## 3. High-Level Differences
 
@@ -73,9 +73,9 @@ let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
 m.rebalance_to(32, RebalanceOptions::default())?;
 ```
 
-### 4.3 Snapshot Mode Selection (`2.1+`)
+### 4.3 Snapshot Mode Selection (`2.2+`)
 
-2.1+ makes snapshot strategy explicit:
+2.2+ makes snapshot strategy explicit:
 - `SnapshotMode::Clone` (default)
 - `SnapshotMode::Cached`
 - `SnapshotMode::Cow`

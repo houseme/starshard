@@ -233,12 +233,53 @@ where
 
     async fn publish_write_for_all_shards(&self) {
         if self.cow_enabled() {
-            let count = self.shard_count();
-            for idx in 0..count {
-                self.sync_cow_shard_from_active(idx).await;
-            }
+            self.sync_all_cow_shards_from_active().await;
         }
         self.on_structural_write().await;
+    }
+
+    async fn sync_all_cow_shards_from_active(&self) {
+        let count = self.shard_count();
+        let active_slots: Vec<Option<AsyncShard<K, V, S>>> = {
+            let slots = self.shards.read().await;
+            slots.iter().cloned().collect()
+        };
+        let mut merged_shards: Vec<HashMap<K, V, S>> = Vec::with_capacity(count);
+        for idx in 0..count {
+            let base = match active_slots.get(idx).and_then(|slot| slot.as_ref()).cloned() {
+                Some(shard) => {
+                    let guard = shard.read().await;
+                    guard.clone()
+                }
+                None => HashMap::with_hasher(self.hasher.clone()),
+            };
+            merged_shards.push(base);
+        }
+
+        if self.rebalance_tracker.is_migrating() {
+            let prev_shards: Vec<AsyncShard<K, V, S>> = {
+                let prev = self.previous_shards.read().await;
+                prev.as_ref()
+                    .map(|shards| shards.iter().filter_map(|o| o.as_ref().cloned()).collect())
+                    .unwrap_or_default()
+            };
+            for prev_shard in prev_shards {
+                let prev_guard = prev_shard.read().await;
+                for (k, v) in prev_guard.iter() {
+                    let idx = (self.hasher.hash_one(k) % count as u64) as usize;
+                    merged_shards[idx]
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
+                }
+            }
+        }
+
+        for (idx, merged) in merged_shards.into_iter().enumerate() {
+            let snapshot = Arc::new(merged);
+            let cow_shard = self.get_or_init_cow_shard(idx).await;
+            let mut cow_guard = cow_shard.write().await;
+            *cow_guard = snapshot;
+        }
     }
 
     async fn get_or_init_cow_shard(&self, index: usize) -> AsyncCowShard<K, V, S> {
@@ -341,6 +382,7 @@ where
         self.previous_shard_count.store(current, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.begin(total_shards);
+        drop(active);
         self.publish_write_for_all_shards().await;
         Ok(())
     }
@@ -566,6 +608,8 @@ where
             max_pause_ns = options.max_pause_ns,
             "async stop-the-world rebalance completed"
         );
+        drop(prev_slots);
+        drop(old_slots);
         self.publish_write_for_all_shards().await;
 
         Ok(RebalanceReport {
@@ -715,12 +759,14 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn clear(&self) {
-        let slots = self.shards.read().await;
         let mut changed = false;
-        for shard in slots.iter().flatten() {
-            let mut g = shard.write().await;
-            changed |= !g.is_empty();
-            g.clear();
+        {
+            let slots = self.shards.read().await;
+            for shard in slots.iter().flatten() {
+                let mut g = shard.write().await;
+                changed |= !g.is_empty();
+                g.clear();
+            }
         }
         {
             let prev = self.previous_shards.write().await;
@@ -1631,14 +1677,16 @@ where
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn drain(&self) -> DrainIterator<K, V> {
-        let slots = self.shards.read().await;
         let mut items = Vec::new();
         let mut changed = false;
 
-        for shard in slots.iter().flatten() {
-            let mut guard = shard.write().await;
-            changed |= !guard.is_empty();
-            items.extend(guard.drain());
+        {
+            let slots = self.shards.read().await;
+            for shard in slots.iter().flatten() {
+                let mut guard = shard.write().await;
+                changed |= !guard.is_empty();
+                items.extend(guard.drain());
+            }
         }
 
         self.total_len.store(0, Ordering::Relaxed);

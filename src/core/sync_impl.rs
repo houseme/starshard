@@ -233,12 +233,50 @@ where
 
     fn publish_write_for_all_shards(&self) {
         if self.cow_enabled() {
-            let count = self.shard_count();
-            for idx in 0..count {
-                self.sync_cow_shard_from_active(idx);
-            }
+            self.sync_all_cow_shards_from_active();
         }
         self.on_structural_write();
+    }
+
+    fn sync_all_cow_shards_from_active(&self) {
+        let count = self.shard_count();
+        let active_slots: Vec<Option<StdShard<K, V, S>>> = {
+            let slots = std_read_guard(&self.shards, "cow_sync_all_active_slots");
+            slots.iter().cloned().collect()
+        };
+        let mut merged_shards: Vec<HashMap<K, V, S>> = Vec::with_capacity(count);
+        for idx in 0..count {
+            let base = match active_slots.get(idx).and_then(|slot| slot.as_ref()).cloned() {
+                Some(shard) => {
+                    let guard = std_read_guard(&shard, "cow_sync_all_active_shard");
+                    guard.clone()
+                }
+                None => HashMap::with_hasher(self.hasher.clone()),
+            };
+            merged_shards.push(base);
+        }
+
+        if self.rebalance_tracker.is_migrating() {
+            let prev = std_read_guard(&self.previous_shards, "cow_sync_all_previous");
+            if let Some(prev_shards) = prev.as_ref() {
+                for prev_shard in prev_shards.iter().flatten() {
+                    let prev_guard = std_read_guard(prev_shard, "cow_sync_all_previous_shard");
+                    for (k, v) in prev_guard.iter() {
+                        let idx = (self.hasher.hash_one(k) % count as u64) as usize;
+                        merged_shards[idx]
+                            .entry(k.clone())
+                            .or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+
+        for (idx, merged) in merged_shards.into_iter().enumerate() {
+            let snapshot = Arc::new(merged);
+            let cow_shard = self.get_or_init_cow_shard(idx);
+            let mut cow_guard = std_write_guard(&cow_shard, "cow_sync_all_target");
+            *cow_guard = snapshot;
+        }
     }
 
     fn get_or_init_cow_shard(&self, index: usize) -> StdCowShard<K, V, S> {
@@ -337,6 +375,7 @@ where
         self.previous_shard_count.store(current, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
         self.rebalance_tracker.begin(total_shards);
+        drop(active);
         self.publish_write_for_all_shards();
         Ok(())
     }
@@ -568,6 +607,8 @@ where
             max_pause_ns = options.max_pause_ns,
             "sync stop-the-world rebalance completed"
         );
+        drop(prev_slots);
+        drop(old_slots);
         self.publish_write_for_all_shards();
 
         Ok(RebalanceReport {
@@ -713,12 +754,14 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn clear(&self) {
-        let slots = std_read_guard(&self.shards, "shards");
         let mut changed = false;
-        for shard in slots.iter().flatten() {
-            let mut g = std_write_guard(shard, "shard");
-            changed |= !g.is_empty();
-            g.clear();
+        {
+            let slots = std_read_guard(&self.shards, "shards");
+            for shard in slots.iter().flatten() {
+                let mut g = std_write_guard(shard, "shard");
+                changed |= !g.is_empty();
+                g.clear();
+            }
         }
         {
             let prev = std_write_guard(&self.previous_shards, "clear_previous_shards");
@@ -1511,14 +1554,16 @@ where
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn drain(&self) -> DrainIterator<K, V> {
-        let slots = std_read_guard(&self.shards, "shards");
         let mut items = Vec::new();
         let mut changed = false;
 
-        for shard in slots.iter().flatten() {
-            let mut guard = std_write_guard(shard, "shard");
-            changed |= !guard.is_empty();
-            items.extend(guard.drain());
+        {
+            let slots = std_read_guard(&self.shards, "shards");
+            for shard in slots.iter().flatten() {
+                let mut guard = std_write_guard(shard, "shard");
+                changed |= !guard.is_empty();
+                items.extend(guard.drain());
+            }
         }
 
         self.total_len.store(0, Ordering::Relaxed);

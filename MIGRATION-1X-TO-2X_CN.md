@@ -13,7 +13,7 @@
 - 主要变化是：
   - `2.0.0` 的分片安全构造策略升级，
   - `2.1+` 新增可选重平衡 API，
-  - `2.1+` 新增可选快照模式。
+  - `2.2+` 新增可选快照模式。
 
 ## 3. 核心差异总览
 
@@ -73,9 +73,9 @@ let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
 m.rebalance_to(32, RebalanceOptions::default())?;
 ```
 
-### 4.3 快照模式选型（`2.1+`）
+### 4.3 快照模式选型（`2.2+`）
 
-2.1+ 将快照策略显式化：
+2.2+ 将快照策略显式化：
 - `SnapshotMode::Clone`（默认）
 - `SnapshotMode::Cached`
 - `SnapshotMode::Cow`

@@ -50,16 +50,12 @@ harness = false
 
 [[example]]
 name = "snapshot_mode_clone_demo"
-required-features = ["advanced"]
 
 [[example]]
 name = "snapshot_mode_cached_demo"
-required-features = ["advanced"]
 
 [[example]]
 name = "snapshot_mode_cow_demo"
-required-features = ["advanced"]
 
 [[example]]
 name = "mixed_workload_snapshot_tradeoff_demo"
-required-features = ["advanced"]
