@@ -16,7 +16,7 @@ English | [简体中文](README_CN.md)
 
 ## Status
 
-Production-ready (v1.2+). API stability prioritized.
+Production-ready (v2.0+). API stability prioritized.
 
 ## Motivation
 
@@ -55,15 +55,24 @@ Enable all in docs.rs via:
 all-features = true
 ```
 
+Internal layout in `v2.0.0`:
+
+- `src/core/sync_impl.rs`
+- `src/core/async_impl.rs`
+- `src/core/types.rs`
+- `src/core/helpers.rs`
+- `src/serde/sync_serde.rs`
+- `src/serde/async_snapshot.rs`
+
 ---
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "1.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.0.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # or minimal:
-# starshard = "1.2"
+# starshard = "2.0.0"
 ```
 
 `serde_json` (tests / examples):
@@ -173,7 +182,7 @@ let json = serde_json::to_string( & snap).unwrap();
 | Read-heavy mixed workload vs global `RwLock<HashMap>` | Reduced contention           |
 | Large snapshot iteration with `rayon` (100k+)         | 3-4x speedup flattening      |
 | Sparse shard usage                                    | Only touched shards allocate |
-| Batch Insert/Remove                                   | Single lock per shard group  |
+| Batch Insert/Remove                                   | Single lock per shard group + sparse grouping in v2.0.0 |
 
 Do benchmark with your own key/value distribution and CPU topology.
 
@@ -329,19 +338,19 @@ Enable via `features = ["advanced"]`.
 
 ## Feature Matrix
 
-| Feature                    | v0.7 | v0.8 | v0.9 | v1.0 | Status          |
-|----------------------------|------|------|------|------|-----------------|
-| Sharded HashMap (sync)     | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | Stable          |
-| Conditional Operations     | -    | ✅    | ✅    | ✅    | Stable          |
-| Batch operations           | -    | ✅    | ✅    | ✅    | Stable          |
-| Lifecycle utilities        | -    | -    | ✅    | ✅    | Stable (lifecycle) |
-| Eviction/metrics primitives| -    | -    | ✅    | ✅    | Stable (lifecycle) |
-| Transactions               | -    | -    | -    | ✅    | Stable (advanced) |
-| CAS operations             | -    | -    | -    | ✅    | Stable (advanced) |
-| Replication                | -    | -    | -    | ✅    | Stable (advanced) |
+| Feature                    | v0.7 | v0.8 | v0.9 | v1.0 | v2.0 | Status          |
+|----------------------------|------|------|------|------|------|-----------------|
+| Sharded HashMap (sync)     | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Async (Tokio)              | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Parallel iteration (rayon) | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Serde (de)serialization    | ✅    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Conditional Operations     | -    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Batch operations           | -    | ✅    | ✅    | ✅    | ✅    | Stable          |
+| Lifecycle utilities        | -    | -    | ✅    | ✅    | ✅    | Stable (lifecycle) |
+| Eviction/metrics primitives| -    | -    | ✅    | ✅    | ✅    | Stable (lifecycle) |
+| Transactions               | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
+| CAS operations             | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
+| Replication                | -    | -    | -    | ✅    | ✅    | Stable (advanced) |
 
 ---
 
@@ -367,6 +376,17 @@ Lazy fill of inner `Option` slot when first key hashes into shard.
 | Serde snapshot (sync) | `serde_json::to_string(&map)`   |
 | Async serde snapshot  | `async_snapshot_serializable()` |
 | Custom hasher         | `with_shards_and_hasher(..)`    |
+| Custom shard cap      | `with_shards_and_hasher_capped(..)` |
+| Strict validation     | `try_with_shards_and_hasher(..)` |
+
+---
+
+## Shard Count Safety
+
+- Infallible constructors now enforce a default cap via `MAX_SHARDS` to prevent oversized allocations.
+- For custom limits, use `with_shards_and_hasher_capped(shard_count, hasher, max_shards)`.
+- For strict validation (no clamping), use `try_with_shards_and_hasher(..)` or
+  `try_with_shards_and_hasher_capped(..)`, which return `ShardCountError`.
 
 ---
 
