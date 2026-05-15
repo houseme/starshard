@@ -246,7 +246,11 @@ where
         };
         let mut merged_shards: Vec<HashMap<K, V, S>> = Vec::with_capacity(count);
         for idx in 0..count {
-            let base = match active_slots.get(idx).and_then(|slot| slot.as_ref()).cloned() {
+            let base = match active_slots
+                .get(idx)
+                .and_then(|slot| slot.as_ref())
+                .cloned()
+            {
                 Some(shard) => {
                     let guard = std_read_guard(&shard, "cow_sync_all_active_shard");
                     guard.clone()
