@@ -58,19 +58,16 @@ fn sync_try_constructor_custom_cap_success_and_rejection() {
 
 #[test]
 fn sync_try_constructor_custom_cap_zero_normalizes_to_one() {
-    let ok =
-        ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(1, FxBuildHasher, 0)
-            .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
+    let ok = ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(1, FxBuildHasher, 0)
+        .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
     assert_eq!(ok.shard_count(), 1);
 
-    let err = match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
-        2,
-        FxBuildHasher,
-        0,
-    ) {
-        Ok(_) => panic!("expected shard_count=2 to fail when cap=0 normalizes to 1"),
-        Err(err) => err,
-    };
+    let err =
+        match ShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(2, FxBuildHasher, 0)
+        {
+            Ok(_) => panic!("expected shard_count=2 to fail when cap=0 normalizes to 1"),
+            Err(err) => err,
+        };
     assert_eq!(err.requested(), 2);
     assert_eq!(err.max_allowed(), 1);
 }

@@ -63,8 +63,7 @@ fn sync_cached_snapshot_cache_invalidation() {
 
 #[test]
 fn sync_cow_mode_iter_matches_writes() {
-    let m: ShardedHashMap<String, i32> =
-        ShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
     m.insert("a".into(), 1);
     m.insert("b".into(), 2);
     m.remove(&"a".into());

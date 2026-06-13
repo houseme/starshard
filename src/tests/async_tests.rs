@@ -1,7 +1,6 @@
 use super::*;
 
 #[cfg(feature = "async")]
-use tokio;
 
 #[tokio::test]
 async fn async_basic() {
@@ -64,12 +63,9 @@ async fn async_try_constructor_custom_cap_success_and_rejection() {
 
 #[tokio::test]
 async fn async_try_constructor_custom_cap_zero_normalizes_to_one() {
-    let ok = AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(
-        1,
-        FxBuildHasher,
-        0,
-    )
-    .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
+    let ok =
+        AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(1, FxBuildHasher, 0)
+            .expect("expected shard_count=1 to pass when cap=0 normalizes to 1");
     assert_eq!(ok.shard_count(), 1);
 
     let err = match AsyncShardedHashMap::<String, i32>::try_with_shards_and_hasher_capped(

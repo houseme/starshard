@@ -199,14 +199,14 @@ pub(crate) use crate::core::ReplicaList;
 
 /* ======================== Extracted Modules ======================== */
 
-mod types;
 mod error;
 mod rebalance;
+mod types;
 
-pub use types::{DEFAULT_SHARDS, MAX_SHARDS, ShardStats, SnapshotMode};
 pub use error::ShardCountError;
-pub use rebalance::{RebalanceOptions, RebalanceReport, RebalanceStatus};
 pub(crate) use rebalance::RebalanceTracker;
+pub use rebalance::{RebalanceOptions, RebalanceReport, RebalanceStatus};
+pub use types::{DEFAULT_SHARDS, MAX_SHARDS, ShardStats, SnapshotMode};
 
 /* ============================== Sync Map =============================== */
 
