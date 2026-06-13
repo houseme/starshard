@@ -1,7 +1,6 @@
 use super::*;
 
 #[cfg(feature = "async")]
-
 #[tokio::test]
 async fn async_basic() {
     let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
