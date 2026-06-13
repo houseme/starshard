@@ -1,3 +1,9 @@
+//! Internal type aliases for shard storage.
+//!
+//! Defines the concrete container types used by both sync and async maps:
+//! `StdShard`, `StdShardVec`, `StdShardVecArc` (and their `Async*` mirrors),
+//! plus the `ReplicaList` alias used by the advanced replication feature.
+
 use super::*;
 
 pub(crate) type StdShardMap<K, V, S> = HashMap<K, V, S>;

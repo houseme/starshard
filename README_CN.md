@@ -17,9 +17,9 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-已达到生产可用（`v2.2.0`）。
+已达到生产可用（`v2.2.1`）。
 
-`v2.2.0` 已交付的 Roadmap 主能力：
+`v2.2.1` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
 - 快照模式（`Clone` / `Cached` / `Cow`）及基于 epoch 的缓存失效机制。
 
@@ -27,9 +27,9 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小依赖：
-# starshard = "2.2.0"
+# starshard = "2.2.1"
 ```
 
 ## 5 分钟上手路径
@@ -105,7 +105,7 @@ async fn main() {
   - `with_shards_and_hasher_and_snapshot_mode(...)`
   - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
 
-## 自适应重平衡（`v2.2.0`）
+## 自适应重平衡（`v2.2.1`）
 
 ### 停顿式重平衡
 
@@ -138,7 +138,7 @@ assert_eq!(m.rebalance_status().state, "idle");
 - 迁移期间读取走 active 优先，miss 后回退 previous。
 - 所有源分片迁移完成后，状态回到 `idle`。
 
-## 快照模式（`v2.2.0`）
+## 快照模式（`v2.2.1`）
 
 `SnapshotMode` 支持按负载选择：
 
@@ -210,7 +210,7 @@ cargo check --all-features
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
 - 快照输出仍需物化为 `Vec<(K, V)>`。
-- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.0` 中为前向兼容预留参数。
+- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.1` 中为前向兼容预留参数。
 
 ## License
 

@@ -1,3 +1,23 @@
+//! Synchronous `ShardedHashMap` implementation.
+//!
+//! Contains all method bodies for the sync map: constructors, CRUD, batch
+//! operations, iteration, rebalance, transactions, CAS, COW snapshots,
+//! lifecycle introspection, and serde integration.
+//!
+//! # Architecture
+//!
+//! Each key is routed to a shard via `hash(key) % shard_count`.  Shards are
+//! lazily initialized (`None` until first access) to reduce cold-start memory.
+//! The map maintains an atomic `total_len` for O(1) `len()` and a
+//! `write_epoch` for snapshot cache invalidation.
+//!
+//! # COW Snapshot Path
+//!
+//! When `SnapshotMode::Cow` is active, every structural write synchronizes
+//! the affected COW shard(s) from the active shard map.  During online
+//! rebalance, the COW merge also consults `previous_shards` to include
+//! not-yet-migrated entries.
+
 use super::*;
 use std::time::Instant;
 
@@ -25,6 +45,10 @@ where
     V: Clone + Send + Sync,
     S: BuildHasher + Clone + Send + Sync,
 {
+    /// Core constructor: allocates all shard vectors, atomics, and locks.
+    ///
+    /// All shard slots start as `None` (lazy initialization).  The COW shard
+    /// vector is pre-allocated to `count` slots to match the active shard vector.
     #[inline]
     fn build_with_count(count: usize, hasher: S, snapshot_mode: SnapshotMode) -> Self {
         let shards = vec![None; count];
@@ -159,6 +183,10 @@ where
         self.rebalance_tracker.snapshot()
     }
 
+    /// Computes the shard index of `key` under the *previous* shard count.
+    ///
+    /// Returns `None` if no online rebalance is in progress (previous count is 0).
+    /// Used by fallback-read paths during migration.
     #[inline]
     fn previous_shard_index(&self, key: &K) -> Option<usize> {
         let prev_count = self.previous_shard_count.load(Ordering::Relaxed);
@@ -169,6 +197,11 @@ where
         }
     }
 
+    /// Reads a value from the previous shard set (migration fallback).
+    ///
+    /// During online rebalance, some keys have not yet been moved to the new
+    /// shard layout.  This method looks them up in `previous_shards` so that
+    /// `get()` and `contains()` remain correct throughout migration.
     fn previous_get(&self, key: &K) -> Option<V> {
         let idx = self.previous_shard_index(key)?;
         let prev = std_read_guard(&self.previous_shards, "previous_shards_read");
@@ -206,6 +239,10 @@ where
         matches!(self.snapshot_mode, SnapshotMode::Cow)
     }
 
+    /// Drops the cached snapshot so the next `iter()` rebuilds it.
+    ///
+    /// Only meaningful when `SnapshotMode::Cached` or `Cow` is active;
+    /// returns immediately for `Clone` mode.
     fn invalidate_snapshot_cache(&self) {
         if !self.cache_enabled() {
             return;
@@ -214,11 +251,18 @@ where
         *cache = None;
     }
 
+    /// Called after every insert/remove/clear to bump the write epoch and
+    /// invalidate any cached snapshot.  The epoch is used by `iter()` to
+    /// detect whether the snapshot is still fresh.
     fn on_structural_write(&self) {
         self.write_epoch.fetch_add(1, Ordering::Relaxed);
         self.invalidate_snapshot_cache();
     }
 
+    /// Syncs COW views for the given shard indices, then bumps the write epoch.
+    ///
+    /// Used by batch operations that know exactly which shards were modified,
+    /// avoiding a full COW resync.
     fn publish_write_for_touched_shards<I>(&self, touched: I)
     where
         I: IntoIterator<Item = usize>,
@@ -231,6 +275,10 @@ where
         self.on_structural_write();
     }
 
+    /// Full COW resync of all shards followed by a write-epoch bump.
+    ///
+    /// Used by operations that affect an unpredictable set of shards
+    /// (e.g. `clear`, `rebalance_to`).
     fn publish_write_for_all_shards(&self) {
         if self.cow_enabled() {
             self.sync_all_cow_shards_from_active();
@@ -238,12 +286,25 @@ where
         self.on_structural_write();
     }
 
+    /// Rebuilds every COW shard from the active shard map (and previous shards
+    /// during migration).
+    ///
+    /// This is the "full COW resync" path used by `clear` and `rebalance_to`.
+    ///
+    /// **Algorithm (3 phases):**
+    /// 1. Snapshot all active shards into `merged_shards` (one `HashMap` per shard).
+    /// 2. If an online rebalance is in progress, iterate `previous_shards` and
+    ///    merge unmigrated entries into the correct `merged_shards` slot using
+    ///    `hash(key) % new_count` routing.
+    /// 3. Publish each merged map as an `Arc<HashMap>` into the corresponding
+    ///    COW shard slot, replacing the old view atomically.
     fn sync_all_cow_shards_from_active(&self) {
         let count = self.shard_count();
         let active_slots: Vec<Option<StdShard<K, V, S>>> = {
             let slots = std_read_guard(&self.shards, "cow_sync_all_active_slots");
             slots.iter().cloned().collect()
         };
+        // Phase 1: clone each active shard into a mutable working copy.
         let mut merged_shards: Vec<HashMap<K, V, S>> = Vec::with_capacity(count);
         for idx in 0..count {
             let base = match active_slots
@@ -260,6 +321,9 @@ where
             merged_shards.push(base);
         }
 
+        // Phase 2: during online rebalance, merge unmigrated entries from
+        // previous shards.  `or_insert` ensures active-shard entries win
+        // on key collision (they are more up-to-date).
         if self.rebalance_tracker.is_migrating() {
             let prev = std_read_guard(&self.previous_shards, "cow_sync_all_previous");
             if let Some(prev_shards) = prev.as_ref() {
@@ -275,6 +339,7 @@ where
             }
         }
 
+        // Phase 3: publish merged maps as Arc snapshots into COW slots.
         for (idx, merged) in merged_shards.into_iter().enumerate() {
             let snapshot = Arc::new(merged);
             let cow_shard = self.get_or_init_cow_shard(idx);
@@ -301,6 +366,12 @@ where
         }
     }
 
+    /// Rebuilds a single COW shard from its active counterpart.
+    ///
+    /// Called after per-shard writes (insert/remove) to keep the COW view
+    /// in sync without a full resync.  During online rebalance, entries
+    /// from `previous_shards` that route to this shard index are merged in
+    /// so the COW snapshot remains complete.
     fn sync_cow_shard_from_active(&self, index: usize) {
         if !self.cow_enabled() {
             return;
@@ -332,6 +403,8 @@ where
         *cow_guard = snapshot;
     }
 
+    /// Returns the COW snapshot for shard `index`, seeding it from the active
+    /// shard if the COW slot is empty (first access after construction or clear).
     fn cow_shard_snapshot(&self, index: usize) -> Arc<HashMap<K, V, S>> {
         let cow_shard = self.get_or_init_cow_shard(index);
         {
@@ -447,12 +520,17 @@ where
         processed
     }
 
+    /// Returns the shard index for `key` under the current shard count.
     #[inline]
     #[tracing::instrument(skip(self, key), level = "trace")]
     fn shard_index(&self, key: &K) -> usize {
         (self.hasher.hash_one(key) % self.shard_count() as u64) as usize
     }
 
+    /// Returns the shard at `index`, lazily initializing it if the slot is `None`.
+    ///
+    /// This is the core lazy-materialization primitive: cold shards cost only
+    /// a `None` slot until the first key routes to them.
     #[inline]
     #[tracing::instrument(skip(self), level = "trace")]
     fn get_or_init_shard(&self, index: usize) -> StdShard<K, V, S> {
@@ -475,6 +553,10 @@ where
         }
     }
 
+    /// Groups `(K, V)` pairs by target shard index for batch insertion.
+    ///
+    /// Each shard gets its own `Vec` so we can acquire the shard lock once
+    /// and insert all pairs in a single critical section.
     #[inline]
     fn bucketize_entries<I>(&self, entries: I) -> HashMap<usize, Vec<(K, V)>, FxBuildHasher>
     where
@@ -491,6 +573,7 @@ where
         buckets
     }
 
+    /// Groups owned keys by target shard index for batch removal.
     #[inline]
     fn bucketize_keys<I>(&self, keys: I) -> HashMap<usize, Vec<K>, FxBuildHasher>
     where
@@ -507,6 +590,10 @@ where
         buckets
     }
 
+    /// Groups key references (with original index) by target shard for batch reads.
+    ///
+    /// The original index is preserved so `batch_get` can return results in the
+    /// same order as the input key slice.
     #[inline]
     fn bucketize_key_refs<'a>(
         &self,
@@ -806,7 +893,11 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
+        // Record the epoch *before* reading any shard.  If no writes happen
+        // between here and the end of the method, the snapshot is cacheable.
         let start_epoch = self.write_epoch.load(Ordering::Relaxed);
+
+        // Fast path: return cached snapshot if the epoch hasn't changed.
         if self.cache_enabled() {
             let cached_epoch = self.snapshot_cache_epoch.load(Ordering::Relaxed);
             if cached_epoch == start_epoch {
@@ -817,6 +908,8 @@ where
             }
         }
 
+        // COW path: read from pre-built COW shard views (cheap reads, writes
+        // pay the merge cost).  Standard path: snapshot each active shard.
         let items: Vec<(K, V)> = if self.cow_enabled() {
             let shard_count = self.shard_count();
             let mut snapshots = Vec::new();
@@ -875,6 +968,9 @@ where
             }
         };
 
+        // If no concurrent write bumped the epoch, cache this snapshot for
+        // the next `iter()` call.  The double-check prevents caching a stale
+        // snapshot that was built while a write was in flight.
         if self.cache_enabled() {
             let end_epoch = self.write_epoch.load(Ordering::Relaxed);
             if start_epoch == end_epoch {
@@ -902,6 +998,9 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
+        // During online rebalance, per-key routing may need to consult both
+        // active and previous shards.  Fall back to single-key insert so the
+        // rebalance-aware `insert()` logic handles fallback reads correctly.
         if self.rebalance_tracker.is_migrating() {
             let mut inserted = 0usize;
             for (k, v) in entries {

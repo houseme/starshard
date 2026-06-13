@@ -18,9 +18,9 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Production-ready (`v2.2.0`).
+Production-ready (`v2.2.1`).
 
-Roadmap capabilities shipped in `v2.2.0`:
+Roadmap capabilities shipped in `v2.2.1`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
 - Snapshot modes (`Clone`, `Cached`, `Cow`) with epoch-based cache invalidation.
 
@@ -28,9 +28,9 @@ Roadmap capabilities shipped in `v2.2.0`:
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # minimal:
-# starshard = "2.2.0"
+# starshard = "2.2.1"
 ```
 
 ## 5-Minute Path
@@ -106,7 +106,7 @@ Choose by strictness and control level:
   - `with_shards_and_hasher_and_snapshot_mode(...)`
   - `with_shards_and_hasher_capped_and_snapshot_mode(...)`
 
-## Adaptive Rebalance (`v2.2.0`)
+## Adaptive Rebalance (`v2.2.1`)
 
 ### Stop-the-world rebalance
 
@@ -139,7 +139,7 @@ Semantics:
 - reads fall back to previous shards while migration is in progress,
 - migration is finalized when `advance_rebalance(...)` drains all source shards.
 
-## Snapshot Modes (`v2.2.0`)
+## Snapshot Modes (`v2.2.1`)
 
 `SnapshotMode` lets you pick snapshot behavior per workload:
 
@@ -211,7 +211,7 @@ cargo check --all-features
 
 - Not lock-free; hot-shard writer pressure can still serialize.
 - Snapshot operations still materialize `Vec<(K, V)>` as output format.
-- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.0`.
+- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.1`.
 
 ## License
 

@@ -1,3 +1,14 @@
+//! Core implementation module for Starshard.
+//!
+//! This `pub(crate)` module houses the concrete `ShardedHashMap` and
+//! `AsyncShardedHashMap` method implementations, internal type aliases,
+//! and shared helper utilities.  It is split into:
+//!
+//! - [`types`] — shard-level type aliases (`StdShard`, `StdShardVecArc`, etc.)
+//! - [`helpers`] — lock helpers, shard-count normalization and validation
+//! - [`sync_impl`] — synchronous map implementation
+//! - [`async_impl`] — asynchronous map implementation (behind `async` feature)
+
 use super::*;
 
 pub(crate) mod helpers;

@@ -1,3 +1,9 @@
+//! Serializable snapshot wrapper for `AsyncShardedHashMap`.
+//!
+//! Since async maps require `.await` to read locks, they cannot directly
+//! implement `Serialize`.  Instead, call `async_snapshot_serializable().await`
+//! to obtain an [`AsyncShardedHashMapSnapshot`] that implements `Serialize`.
+
 use super::*;
 use ::serde::{Serialize, Serializer, ser::SerializeSeq};
 

@@ -1,3 +1,13 @@
+//! Core data types and configuration constants for Starshard.
+//!
+//! This module contains the shared types used across both synchronous and
+//! asynchronous map implementations:
+//!
+//! - [`SnapshotMode`] — controls how iteration snapshots are produced
+//!   (`Clone`, `Cached`, or `Cow`).
+//! - [`ShardStats`] — runtime statistics about shard distribution and load.
+//! - [`DEFAULT_SHARDS`] / [`MAX_SHARDS`] — default and upper-bound shard counts.
+
 /// Default shard count (power-of-two not required; hashing modulo used).
 pub const DEFAULT_SHARDS: usize = 64;
 

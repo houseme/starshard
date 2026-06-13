@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-06-14
+
+### Changed
+
+- Refactored `lib.rs` into focused modules: `types.rs`, `error.rs`, `rebalance.rs`.
+- Extracted tests into `tests/` module with `sync.rs`, `async_tests.rs`, `batch.rs`, `snapshot.rs`.
+- `lib.rs` reduced from 1349 to 290 lines (-78.5%).
+
+### Documentation
+
+- Added module-level doc comments (`//!`) to all source modules (`types`, `error`, `rebalance`, `core`, `serde`).
+- Added doc comments to all complex private functions in `core/sync_impl.rs` and `core/async_impl.rs`.
+- Added doc comments to `core/helpers.rs` utility functions (`std_read_guard`, `std_write_guard`, `normalized_shard_count`, `strict_shard_count`, `capped_shard_count`).
+- Added doc comments to `RebalanceTracker` internals in `rebalance.rs`.
+- Added inline comments explaining COW merge algorithm (3-phase), iteration branching (epoch cache / COW / standard / rayon), and batch operation migration fallback.
+
 ## [2.2.0] - 2026-05-15
 
 ### Added

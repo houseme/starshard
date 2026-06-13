@@ -1,9 +1,15 @@
+//! `Serialize` and `Deserialize` implementations for `ShardedHashMap`.
+//!
+//! The serialized form is `{ shard_count, entries: Vec<(K, V)> }`.
+//! Hasher state is not preserved; deserialization rebuilds with `S::default()`.
+//! A `shard_count` of zero is normalized to [`DEFAULT_SHARDS`].
+
 use super::DEFAULT_SHARDS;
 use super::ShardedHashMap;
 use ::serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::hash::{BuildHasher, Hash};
 
-// Transit representation
+/// Transit representation used for serialization/deserialization.
 #[derive(Serialize, Deserialize)]
 struct ShardedMapRepr<K, V> {
     shard_count: usize,

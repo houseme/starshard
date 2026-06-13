@@ -1,9 +1,15 @@
+//! Serde support for Starshard maps.
+//!
+//! - [`sync_serde`] — `Serialize` / `Deserialize` impls for `ShardedHashMap`.
+//! - [`async_snapshot`] — serializable snapshot wrapper for
+//!   `AsyncShardedHashMap` (behind `async` + `serde` features).
+
 use super::*;
 
-mod sync_serde;
+pub(crate) mod sync_serde;
 
 #[cfg(feature = "async")]
-mod async_snapshot;
+pub(crate) mod async_snapshot;
 
 #[cfg(all(feature = "async", feature = "serde"))]
 pub use async_snapshot::AsyncShardedHashMapSnapshot;

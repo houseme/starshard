@@ -1,3 +1,10 @@
+//! Error types for Starshard constructor validation.
+//!
+//! Contains [`ShardCountError`], returned by strict constructors
+//! (`try_with_shards_and_hasher`, `try_with_shards_and_hasher_capped`,
+//! `rebalance_to`, `start_rebalance_online`) when the requested shard
+//! count exceeds the configured maximum.
+
 use std::fmt;
 
 /// Error returned by strict shard-count constructors.
