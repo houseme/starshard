@@ -18,19 +18,20 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Production-ready (`v2.2.1`).
+Production-ready (`v2.2.2`).
 
-Roadmap capabilities shipped in `v2.2.1`:
+Roadmap capabilities shipped through `v2.2.2`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
 - Snapshot modes (`Clone`, `Cached`, `Cow`) with epoch-based cache invalidation.
+- Patch-level dependency hygiene: the `async` feature no longer forces Tokio's multi-thread runtime.
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # minimal:
-# starshard = "2.2.1"
+# starshard = "2.2.2"
 ```
 
 ## 5-Minute Path
@@ -211,7 +212,7 @@ cargo check --all-features
 
 - Not lock-free; hot-shard writer pressure can still serialize.
 - Snapshot operations still materialize `Vec<(K, V)>` as output format.
-- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.1`.
+- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.x`.
 
 ## License
 

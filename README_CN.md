@@ -17,19 +17,20 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-已达到生产可用（`v2.2.1`）。
+已达到生产可用（`v2.2.2`）。
 
-`v2.2.1` 已交付的 Roadmap 主能力：
+截至 `v2.2.2` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
 - 快照模式（`Clone` / `Cached` / `Cow`）及基于 epoch 的缓存失效机制。
+- Patch 级依赖治理：`async` feature 不再强制启用 Tokio 多线程运行时。
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小依赖：
-# starshard = "2.2.1"
+# starshard = "2.2.2"
 ```
 
 ## 5 分钟上手路径
@@ -210,7 +211,7 @@ cargo check --all-features
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
 - 快照输出仍需物化为 `Vec<(K, V)>`。
-- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.1` 中为前向兼容预留参数。
+- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.x` 中为前向兼容预留参数。
 
 ## License
 

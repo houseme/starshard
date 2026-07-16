@@ -105,7 +105,7 @@ If migrating from early 1.x, re-check `Cargo.toml` feature selection:
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. Migration Checklist

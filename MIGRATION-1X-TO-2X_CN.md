@@ -105,7 +105,7 @@ let map: ShardedHashMap<String, i32> =
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. 迁移清单

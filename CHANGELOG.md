@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-07-16
+
+### Changed
+
+- Simplified the optional Tokio dependency used by the `async` feature to `rt` + `sync`, so downstream users are no longer forced onto Tokio's multi-thread runtime.
+- Made the dev Tokio dependency explicit with `default-features = false` while keeping `macros`, `rt-multi-thread`, and `sync` for tests and examples.
+- Refreshed dependency lock state for the release.
+
 ## [2.2.1] - 2026-06-14
 
 ### Changed
