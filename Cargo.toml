@@ -18,8 +18,8 @@ exclude = ["/examples/*", "/tests/*"]
 hashbrown = { version = "0.17", default-features = false }
 rustc-hash = "2.1"
 rayon = { version = "1.12", optional = true }
-tokio = { version = "1.52", optional = true, default-features = false, features = ["rt", "sync"] }
-serde = { version = "1.0.228", features = ["derive"], optional = true }
+tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "sync"] }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 async-trait = { version = "0.1", optional = true }
 tracing = { version = "0.1" }
 
@@ -33,7 +33,7 @@ advanced = ["dep:async-trait"]
 full = ["async", "rayon", "serde", "lifecycle", "advanced"]
 
 [dev-dependencies]
-tokio = { version = "1.52", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
 serde_json = "1"
 async-trait = "0.1"
 criterion = "0.8"
