@@ -87,6 +87,7 @@ async fn main() {
 | read | `get(&k)` | `get(&k).await` |
 | delete | `remove(&k)` | `remove(&k).await` |
 | entry insert/update | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
+| get or insert | `get_or_insert_with(k, f)` | `get_or_insert_with(k, f).await` |
 | batch insert | `batch_insert(items)` | `batch_insert(items).await` |
 | batch read | `batch_get(&keys)` | `batch_get(&keys).await` |
 | conditional update | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
@@ -104,6 +105,16 @@ let value = map
     .and_modify(|count| *count += 1)
     .or_insert_with(|| 1);
 assert_eq!(value, 1);
+```
+
+Atomic get-or-create helper:
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, Vec<u64>> = ShardedHashMap::new(16);
+let lane = map.get_or_insert_with("read-version".to_string(), Vec::new);
+assert!(lane.is_empty());
 ```
 
 ## Constructor Strategy

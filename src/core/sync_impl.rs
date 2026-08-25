@@ -1214,28 +1214,17 @@ where
         }
     }
 
-    /// Gets a mutable reference to the value for the given key,
-    /// inserting with `f` if the key does not exist.
+    /// Gets the value for the given key, inserting with `f` if the key does not exist.
     ///
-    /// This is atomic: the lock is held for the entire operation.
+    /// This is a convenience alias for [`Self::compute_if_absent`], preserving
+    /// online-rebalance fallback semantics, length accounting, and snapshot
+    /// publication.
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> V,
     {
-        let shard_idx = self.shard_index(&key);
-        let shard = self.get_or_init_shard(shard_idx);
-        let mut guard = std_write_guard(&shard, "shard");
-
-        if let Some(val) = guard.get(&key) {
-            return val.clone();
-        }
-
-        let new_val = f();
-        guard.insert(key, new_val.clone());
-        self.total_len.fetch_add(1, Ordering::Relaxed);
-        drop(guard);
-        self.publish_write_for_touched_shards([shard_idx]);
-        new_val
+        self.compute_if_absent(key, f)
     }
 
     /// Remove entries where predicate returns false.
