@@ -710,6 +710,20 @@ where
         })
     }
 
+    /// Returns an entry handle for in-place style operations on a key.
+    ///
+    /// The returned variant reflects the state observed at call time. Methods
+    /// such as [`Entry::or_insert_with`](crate::Entry::or_insert_with) perform
+    /// their own shard write operation and preserve length/snapshot metadata.
+    #[tracing::instrument(skip(self, key), level = "trace")]
+    pub fn entry(&self, key: K) -> crate::Entry<'_, K, V, S> {
+        if self.contains(&key) {
+            crate::Entry::occupied(self, key)
+        } else {
+            crate::Entry::vacant(self, key)
+        }
+    }
+
     /// Insert key/value. Returns previous value if existed.
     ///
     /// Complexity: O(1) expected.

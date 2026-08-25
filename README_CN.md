@@ -85,11 +85,25 @@ async fn main() {
 | 插入/更新 | `insert(k, v)` | `insert(k, v).await` |
 | 读取 | `get(&k)` | `get(&k).await` |
 | 删除 | `remove(&k)` | `remove(&k).await` |
+| entry 插入/更新 | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
 | 批量插入 | `batch_insert(items)` | `batch_insert(items).await` |
 | 批量读取 | `batch_get(&keys)` | `batch_get(&keys).await` |
 | 条件更新 | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
 | 条件插入 | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
 | 指标/内省 | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+Entry 风格插入/更新：
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, usize> = ShardedHashMap::new(16);
+let value = map
+    .entry("read-version".to_string())
+    .and_modify(|count| *count += 1)
+    .or_insert_with(|| 1);
+assert_eq!(value, 1);
+```
 
 ## 构造器选型
 

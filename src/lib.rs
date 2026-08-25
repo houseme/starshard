@@ -95,7 +95,7 @@ assert_eq!(map.len(), 1);
 ```
 
 Async (enable `async` feature):
-```
+```ignore
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() {
@@ -118,7 +118,7 @@ assert_eq!(count, 10_000);
 ```
 
 Async + Rayon (enable `async,rayon`):
-```
+```ignore
 #[cfg(all(feature="async", feature="rayon"))]
 #[tokio::main]
 async fn main() {
@@ -240,6 +240,9 @@ where
 }
 
 mod core;
+mod entry;
+
+pub use entry::{Entry, OccupiedEntry, VacantEntry};
 
 /* ---------------------- Serde for ShardedHashMap ------------------------ */
 
@@ -283,6 +286,12 @@ where
 
 #[cfg(all(feature = "async", feature = "serde"))]
 pub use serde::AsyncShardedHashMapSnapshot;
+
+#[cfg(feature = "async")]
+mod async_entry;
+
+#[cfg(feature = "async")]
+pub use async_entry::{AsyncEntry, AsyncOccupiedEntry, AsyncVacantEntry};
 
 /* ================================ Tests ================================ */
 

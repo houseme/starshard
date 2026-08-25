@@ -73,6 +73,21 @@ fn sync_cow_mode_iter_matches_writes() {
     assert_eq!(values, vec![2]);
 }
 
+#[test]
+fn sync_entry_updates_cow_snapshot() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
+    assert_eq!(m.entry("a".to_string()).or_insert(1), 1);
+    assert_eq!(
+        m.entry("a".to_string())
+            .and_modify(|v| *v += 1)
+            .or_insert(0),
+        2
+    );
+
+    let values = m.iter().collect::<Vec<_>>();
+    assert_eq!(values, vec![("a".to_string(), 2)]);
+}
+
 #[cfg(feature = "async")]
 #[tokio::test]
 async fn async_cached_snapshot_cache_invalidation() {
@@ -110,4 +125,24 @@ async fn async_cow_mode_iter_matches_writes() {
         .collect::<Vec<_>>();
     values.sort_unstable();
     assert_eq!(values, vec![2]);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_entry_updates_cow_snapshot() {
+    let m: AsyncShardedHashMap<String, i32> =
+        AsyncShardedHashMap::with_snapshot_mode(8, SnapshotMode::Cow);
+    assert_eq!(m.entry("a".to_string()).await.or_insert(1).await, 1);
+    assert_eq!(
+        m.entry("a".to_string())
+            .await
+            .and_modify(|v| *v += 1)
+            .await
+            .or_insert(0)
+            .await,
+        2
+    );
+
+    let values = m.iter().await;
+    assert_eq!(values, vec![("a".to_string(), 2)]);
 }

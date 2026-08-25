@@ -697,6 +697,21 @@ where
         })
     }
 
+    /// Returns an entry handle for in-place style operations on a key.
+    ///
+    /// The returned variant reflects the state observed at call time. Methods
+    /// such as [`AsyncEntry::or_insert_with`](crate::AsyncEntry::or_insert_with)
+    /// perform their own shard write operation and preserve length/snapshot
+    /// metadata.
+    #[tracing::instrument(skip(self, key), level = "trace")]
+    pub async fn entry(&self, key: K) -> crate::AsyncEntry<'_, K, V, S> {
+        if self.contains(&key).await {
+            crate::AsyncEntry::occupied(self, key)
+        } else {
+            crate::AsyncEntry::vacant(self, key)
+        }
+    }
+
     /// Insert key/value asynchronously.
     ///
     /// # Arguments

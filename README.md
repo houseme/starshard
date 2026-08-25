@@ -86,11 +86,25 @@ async fn main() {
 | insert/update | `insert(k, v)` | `insert(k, v).await` |
 | read | `get(&k)` | `get(&k).await` |
 | delete | `remove(&k)` | `remove(&k).await` |
+| entry insert/update | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
 | batch insert | `batch_insert(items)` | `batch_insert(items).await` |
 | batch read | `batch_get(&keys)` | `batch_get(&keys).await` |
 | conditional update | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
 | conditional insert | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
 | metrics/introspection | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+Entry-style insert/update:
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, usize> = ShardedHashMap::new(16);
+let value = map
+    .entry("read-version".to_string())
+    .and_modify(|count| *count += 1)
+    .or_insert_with(|| 1);
+assert_eq!(value, 1);
+```
 
 ## Constructor Strategy
 

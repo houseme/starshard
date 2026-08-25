@@ -86,6 +86,73 @@ fn sync_contains() {
 }
 
 #[test]
+fn sync_entry_or_insert_and_modify() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+
+    let inserted = m.entry("a".to_string()).or_insert_with(|| 1);
+    assert_eq!(inserted, 1);
+    assert_eq!(m.len(), 1);
+
+    let value = m
+        .entry("a".to_string())
+        .and_modify(|v| *v += 41)
+        .or_insert(7);
+    assert_eq!(value, 42);
+    assert_eq!(m.get(&"a".to_string()), Some(42));
+    assert_eq!(m.len(), 1);
+}
+
+#[test]
+fn sync_entry_reports_variants_and_removes() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
+
+    let vacant = m.entry("missing".to_string());
+    assert!(vacant.is_vacant());
+    assert_eq!(vacant.key(), "missing");
+
+    m.insert("present".to_string(), 3);
+    match m.entry("present".to_string()) {
+        Entry::Occupied(entry) => {
+            assert_eq!(entry.get(), Some(3));
+            assert_eq!(entry.remove_entry(), Some(("present".to_string(), 3)));
+        }
+        Entry::Vacant(_) => panic!("entry should be occupied"),
+    }
+    assert!(m.is_empty());
+}
+
+#[test]
+fn sync_entry_or_insert_with_initializes_once_under_contention() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+
+    let m: Arc<ShardedHashMap<String, i32>> = Arc::new(ShardedHashMap::new(8));
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+
+    for _ in 0..16 {
+        let map = Arc::clone(&m);
+        let counter = Arc::clone(&init_count);
+        workers.push(thread::spawn(move || {
+            map.entry("shared".to_string()).or_insert_with(|| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                9
+            })
+        }));
+    }
+
+    for worker in workers {
+        assert_eq!(worker.join().expect("worker should not panic"), 9);
+    }
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.get(&"shared".to_string()), Some(9));
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn sync_iteration() {
     let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
     m.insert("x".into(), 10);

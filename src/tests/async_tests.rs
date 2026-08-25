@@ -93,6 +93,78 @@ async fn async_contains() {
 }
 
 #[tokio::test]
+async fn async_entry_or_insert_and_modify() {
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
+
+    let inserted = m.entry("a".to_string()).await.or_insert_with(|| 1).await;
+    assert_eq!(inserted, 1);
+    assert_eq!(m.len().await, 1);
+
+    let value = m
+        .entry("a".to_string())
+        .await
+        .and_modify(|v| *v += 41)
+        .await
+        .or_insert(7)
+        .await;
+    assert_eq!(value, 42);
+    assert_eq!(m.get(&"a".to_string()).await, Some(42));
+    assert_eq!(m.len().await, 1);
+}
+
+#[tokio::test]
+async fn async_entry_reports_variants_and_removes() {
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(8);
+
+    let vacant = m.entry("missing".to_string()).await;
+    assert!(vacant.is_vacant());
+    assert_eq!(vacant.key(), "missing");
+
+    m.insert("present".to_string(), 3).await;
+    match m.entry("present".to_string()).await {
+        AsyncEntry::Occupied(entry) => {
+            assert_eq!(entry.get().await, Some(3));
+            assert_eq!(entry.remove_entry().await, Some(("present".to_string(), 3)));
+        }
+        AsyncEntry::Vacant(_) => panic!("entry should be occupied"),
+    }
+    assert!(m.is_empty().await);
+}
+
+#[tokio::test]
+async fn async_entry_or_insert_with_initializes_once_under_contention() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let m: Arc<AsyncShardedHashMap<String, i32>> = Arc::new(AsyncShardedHashMap::new(8));
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+
+    for _ in 0..16 {
+        let map = Arc::clone(&m);
+        let counter = Arc::clone(&init_count);
+        workers.push(tokio::spawn(async move {
+            map.entry("shared".to_string())
+                .await
+                .or_insert_with(|| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    9
+                })
+                .await
+        }));
+    }
+
+    for worker in workers {
+        assert_eq!(worker.await.expect("worker should not panic"), 9);
+    }
+    assert_eq!(m.len().await, 1);
+    assert_eq!(m.get(&"shared".to_string()).await, Some(9));
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn async_rebalance_stop_the_world() {
     let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
     for i in 0..200 {
