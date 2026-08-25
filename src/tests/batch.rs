@@ -104,6 +104,69 @@ fn compute_if_absent_inserts() {
 }
 
 #[test]
+fn get_or_insert_with_exists_does_not_call_initializer() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+    m.insert("a".into(), 10);
+
+    let result = m.get_or_insert_with("a".into(), || panic!("initializer should not run"));
+    assert_eq!(result, 10);
+    assert_eq!(m.len(), 1);
+}
+
+#[test]
+fn get_or_insert_with_inserts_missing_value() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+
+    let result = m.get_or_insert_with("a".into(), || 20);
+    assert_eq!(result, 20);
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.get(&"a".into()), Some(20));
+}
+
+#[test]
+fn get_or_insert_with_preserves_online_rebalance_fallback() {
+    let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
+    m.insert("a".into(), 10);
+    m.start_rebalance_online(8)
+        .expect("online rebalance should start");
+
+    let result = m.get_or_insert_with("a".into(), || panic!("initializer should not run"));
+    assert_eq!(result, 10);
+    assert_eq!(m.len(), 1);
+}
+
+#[test]
+fn get_or_insert_with_initializes_once_under_contention() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+
+    let m: Arc<ShardedHashMap<String, i32>> = Arc::new(ShardedHashMap::new(4));
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+
+    for _ in 0..16 {
+        let map = Arc::clone(&m);
+        let counter = Arc::clone(&init_count);
+        workers.push(thread::spawn(move || {
+            map.get_or_insert_with("shared".into(), || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                9
+            })
+        }));
+    }
+
+    for worker in workers {
+        assert_eq!(worker.join().expect("worker should not panic"), 9);
+    }
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.get(&"shared".into()), Some(9));
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn retain_filter() {
     let m: ShardedHashMap<String, i32> = ShardedHashMap::new(4);
     for i in 0..10 {
@@ -230,6 +293,78 @@ async fn async_compute_if_absent() {
     let result = m.compute_if_absent("a".into(), || 20).await;
     assert_eq!(result, 20);
     assert_eq!(m.len().await, 1);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_get_or_insert_with_exists_does_not_call_initializer() {
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+    m.insert("a".into(), 10).await;
+
+    let result = m
+        .get_or_insert_with("a".into(), || panic!("initializer should not run"))
+        .await;
+    assert_eq!(result, 10);
+    assert_eq!(m.len().await, 1);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_get_or_insert_with_inserts_missing_value() {
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+
+    let result = m.get_or_insert_with("a".into(), || 20).await;
+    assert_eq!(result, 20);
+    assert_eq!(m.len().await, 1);
+    assert_eq!(m.get(&"a".into()).await, Some(20));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_get_or_insert_with_preserves_online_rebalance_fallback() {
+    let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(4);
+    m.insert("a".into(), 10).await;
+    m.start_rebalance_online(8)
+        .await
+        .expect("online rebalance should start");
+
+    let result = m
+        .get_or_insert_with("a".into(), || panic!("initializer should not run"))
+        .await;
+    assert_eq!(result, 10);
+    assert_eq!(m.len().await, 1);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_get_or_insert_with_initializes_once_under_contention() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let m: Arc<AsyncShardedHashMap<String, i32>> = Arc::new(AsyncShardedHashMap::new(4));
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+
+    for _ in 0..16 {
+        let map = Arc::clone(&m);
+        let counter = Arc::clone(&init_count);
+        workers.push(tokio::spawn(async move {
+            map.get_or_insert_with("shared".into(), || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                9
+            })
+            .await
+        }));
+    }
+
+    for worker in workers {
+        assert_eq!(worker.await.expect("worker should not panic"), 9);
+    }
+    assert_eq!(m.len().await, 1);
+    assert_eq!(m.get(&"shared".into()).await, Some(9));
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(feature = "async")]

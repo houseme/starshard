@@ -1214,6 +1214,19 @@ where
         }
     }
 
+    /// Gets the value for the given key, inserting with `f` if the key does not exist.
+    ///
+    /// This is a convenience alias for [`Self::compute_if_absent`], preserving
+    /// online-rebalance fallback semantics, length accounting, and snapshot
+    /// publication.
+    #[tracing::instrument(skip(self, key, f), level = "trace")]
+    pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        self.compute_if_absent(key, f)
+    }
+
     /// Remove entries where predicate returns false.
     ///
     /// Locks each shard independently to maximize parallelism.

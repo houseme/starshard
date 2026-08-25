@@ -86,6 +86,7 @@ async fn main() {
 | 读取 | `get(&k)` | `get(&k).await` |
 | 删除 | `remove(&k)` | `remove(&k).await` |
 | entry 插入/更新 | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
+| 获取或插入 | `get_or_insert_with(k, f)` | `get_or_insert_with(k, f).await` |
 | 批量插入 | `batch_insert(items)` | `batch_insert(items).await` |
 | 批量读取 | `batch_get(&keys)` | `batch_get(&keys).await` |
 | 条件更新 | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
@@ -103,6 +104,16 @@ let value = map
     .and_modify(|count| *count += 1)
     .or_insert_with(|| 1);
 assert_eq!(value, 1);
+```
+
+原子 get-or-create 辅助方法：
+
+```rust
+use starshard::ShardedHashMap;
+
+let map: ShardedHashMap<String, Vec<u64>> = ShardedHashMap::new(16);
+let lane = map.get_or_insert_with("read-version".to_string(), Vec::new);
+assert!(lane.is_empty());
 ```
 
 ## 构造器选型
