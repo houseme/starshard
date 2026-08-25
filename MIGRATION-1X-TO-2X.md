@@ -3,7 +3,7 @@
 ## 1. Scope
 
 - 1.x line: `1.0.0` to `1.2.x`
-- 2.x line: `2.0.0` to `2.2.x`
+- 2.x line: `2.0.0` to `2.3.x`
 
 This document focuses on **usage-level** differences and migration guidance.
 
@@ -105,12 +105,12 @@ If migrating from early 1.x, re-check `Cargo.toml` feature selection:
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. Migration Checklist
 
-1. Upgrade dependency to 2.x (recommended: `2.2.x`).
+1. Upgrade dependency to 2.x (recommended: `2.3.x`).
 2. Review constructor entry points:
    - external input -> use `try_with_*`
    - fixed internal params -> compatibility constructors are fine

@@ -3,7 +3,7 @@
 ## 1. 适用范围
 
 - 1.x 系列：`1.0.0` ~ `1.2.x`
-- 2.x 系列：`2.0.0` ~ `2.2.x`
+- 2.x 系列：`2.0.0` ~ `2.3.x`
 
 本文聚焦**使用层面**差异与迁移建议，不展开内部重构细节。
 
@@ -105,12 +105,12 @@ let map: ShardedHashMap<String, i32> =
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. 迁移清单
 
-1. 升级依赖到 2.x（建议 `2.2.x`）。
+1. 升级依赖到 2.x（建议 `2.3.x`）。
 2. 检查构造入口：
    - 外部输入参数 -> 用 `try_with_*`
    - 内部固定参数 -> 继续兼容构造器即可

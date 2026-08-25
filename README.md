@@ -18,20 +18,21 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Production-ready (`v2.2.2`).
+Production-ready (`v2.3.0`).
 
-Roadmap capabilities shipped through `v2.2.2`:
+Roadmap capabilities shipped through `v2.3.0`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
 - Snapshot modes (`Clone`, `Cached`, `Cow`) with epoch-based cache invalidation.
 - Patch-level dependency hygiene: the `async` feature no longer forces Tokio's multi-thread runtime.
+- Entry-style and get-or-create APIs for atomic per-key initialization in sync and async maps.
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # minimal:
-# starshard = "2.2.2"
+# starshard = "2.3.0"
 ```
 
 ## 5-Minute Path
@@ -203,6 +204,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - Sharding reduces contention versus a single `RwLock<HashMap<..>>` under mixed load.
 - Lazy shard allocation keeps memory proportional to touched shards.
 - `rayon` improves large snapshot flatten throughput when scan size is high.
+- Use `get_or_insert_with` or `entry(...).or_insert_with(...)` for atomic get-or-create paths instead of external check-then-insert locks.
 - For snapshot-heavy services, test `Cached` and `Cow` with your real key distribution.
 
 ## Serde Semantics
@@ -237,7 +239,7 @@ cargo check --all-features
 
 - Not lock-free; hot-shard writer pressure can still serialize.
 - Snapshot operations still materialize `Vec<(K, V)>` as output format.
-- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.2.x`.
+- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.x`.
 
 ## License
 

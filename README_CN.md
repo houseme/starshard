@@ -17,20 +17,21 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-已达到生产可用（`v2.2.2`）。
+已达到生产可用（`v2.3.0`）。
 
-截至 `v2.2.2` 已交付的 Roadmap 主能力：
+截至 `v2.3.0` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
 - 快照模式（`Clone` / `Cached` / `Cow`）及基于 epoch 的缓存失效机制。
 - Patch 级依赖治理：`async` feature 不再强制启用 Tokio 多线程运行时。
+- 同步/异步 map 都支持 Entry 风格和 get-or-create 原子初始化 API。
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "2.2.2", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小依赖：
-# starshard = "2.2.2"
+# starshard = "2.3.0"
 ```
 
 ## 5 分钟上手路径
@@ -202,6 +203,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - 相比单全局 `RwLock<HashMap<..>>`，分片模型在混合负载下通常能降低竞争。
 - 延迟分片初始化可让内存更接近“按访问付费”。
 - 大规模扫描场景建议启用 `rayon`。
+- 原子 get-or-create 路径优先使用 `get_or_insert_with` 或 `entry(...).or_insert_with(...)`，避免外部 check-then-insert 锁。
 - 快照密集型服务建议按真实键分布对比 `Cached` 与 `Cow`。
 
 ## Serde 语义
@@ -236,7 +238,7 @@ cargo check --all-features
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
 - 快照输出仍需物化为 `Vec<(K, V)>`。
-- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.2.x` 中为前向兼容预留参数。
+- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.x` 中为前向兼容预留参数。
 
 ## License
 

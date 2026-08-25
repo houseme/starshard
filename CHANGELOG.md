@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-08-25
+
+### Added
+
+- Added Entry-style APIs for sync and async maps:
+  - `ShardedHashMap::entry(...) -> Entry`
+  - `AsyncShardedHashMap::entry(...).await -> AsyncEntry`
+  - `Entry::{or_insert, or_insert_with, and_modify, insert, remove}`
+  - `OccupiedEntry` / `VacantEntry` and async equivalents
+- Added atomic get-or-create helpers for sync and async maps:
+  - `ShardedHashMap::get_or_insert_with(...)`
+  - `AsyncShardedHashMap::get_or_insert_with(...).await`
+
+### Changed
+
+- Unified `compute_if_absent`, `get_or_insert_with`, and Entry insertion paths through a shared internal hot path to avoid patch-on-patch public API forwarding.
+- Preserved online-rebalance fallback semantics for get-or-create operations, including active-first + previous-shard fallback lookup.
+- Pinned dependency version requirements and refreshed the lockfile for the release.
+- Included examples and integration tests in the packaged crate so declared targets resolve cleanly during packaging.
+
+### Tests
+
+- Added sync and async coverage for Entry operations, atomic get-or-insert behavior, concurrent single-initializer execution, COW snapshot updates, and online rebalance fallback behavior.
+
 ## [2.2.2] - 2026-07-16
 
 ### Changed
