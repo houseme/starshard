@@ -1189,6 +1189,14 @@ where
     where
         F: FnOnce() -> V,
     {
+        self.get_or_insert_with_inner(key, f)
+    }
+
+    #[inline]
+    fn get_or_insert_with_inner<F>(&self, key: K, f: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
         if self.rebalance_tracker.is_migrating() {
             if let Some(existing) = self.get(&key) {
                 return existing;
@@ -1216,15 +1224,15 @@ where
 
     /// Gets the value for the given key, inserting with `f` if the key does not exist.
     ///
-    /// This is a convenience alias for [`Self::compute_if_absent`], preserving
-    /// online-rebalance fallback semantics, length accounting, and snapshot
-    /// publication.
+    /// This shares the same hot-path implementation as [`Self::compute_if_absent`],
+    /// preserving online-rebalance fallback semantics, length accounting, and
+    /// snapshot publication.
     #[tracing::instrument(skip(self, key, f), level = "trace")]
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> V,
     {
-        self.compute_if_absent(key, f)
+        self.get_or_insert_with_inner(key, f)
     }
 
     /// Remove entries where predicate returns false.

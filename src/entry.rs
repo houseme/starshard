@@ -63,7 +63,7 @@ where
         F: FnOnce() -> V,
     {
         let (map, key) = self.into_parts();
-        map.compute_if_absent(key, default)
+        map.get_or_insert_with(key, default)
     }
 
     /// Runs `f` on the value when present, then returns a fresh entry handle.
@@ -179,6 +179,6 @@ where
 
     /// Inserts the value if the key is still absent and returns the final value.
     pub fn insert(self, value: V) -> V {
-        self.map.compute_if_absent(self.key, || value)
+        self.map.get_or_insert_with(self.key, || value)
     }
 }
