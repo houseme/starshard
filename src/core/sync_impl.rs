@@ -437,11 +437,9 @@ where
         for (index, entries) in buckets {
             let shard = self.get_or_init_shard(index);
             let mut guard = std_write_guard(&shard, "batch_insert");
-            // Account each committed insert before another user Hash/Drop can panic.
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for (key, value) in entries {
-                let new = guard.insert(key, value).is_none();
-                inserted += usize::from(new);
-                self.record_write(usize::from(new), 0);
+                inserted += usize::from(mutation.insert(key, value).is_none());
             }
         }
         inserted
@@ -469,11 +467,9 @@ where
                 continue;
             };
             let mut guard = std_write_guard(&shard, "batch_remove");
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for key in keys {
-                if guard.remove(&key).is_some() {
-                    removed += 1;
-                    self.record_write(0, 1);
-                }
+                removed += usize::from(mutation.remove(&key).is_some());
             }
         }
         removed

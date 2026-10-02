@@ -214,6 +214,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - 启用 Rayon 后，`IterBuilder::parallel(true)` 对至少 1024 项的输入并行过滤；该初始阈值尚未经过针对不同负载的调优。先过滤再截取结果，结果顺序与输入一致。过滤调用可以并发执行，`for_each` 回调仍按结果顺序串行执行。小输入或未启用 `rayon` 时顺序过滤。
 - 原子 get-or-create 路径优先使用 `get_or_insert_with` 或 `entry(...).or_insert_with(...)`，避免外部 check-then-insert 锁。
 - 快照密集型服务建议按真实键分布对比 `Cached` 与 `Cow`。
+- 非迁移状态的批量操作按实际修改分片汇总长度和版本更新，panic 展开时也会结算。快照版本是变更标记，不是逐操作计数器。
 
 ## Serde 语义
 

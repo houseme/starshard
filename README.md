@@ -215,6 +215,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - `IterBuilder::parallel(true)` uses Rayon for filtering at least 1024 inputs when enabled. This initial cutoff is not a measured optimum. Filtering precedes the result limit and preserves input order; filter calls can run concurrently, while `for_each` callbacks remain sequential. Small inputs and builds without `rayon` use sequential filtering.
 - Use `get_or_insert_with` or `entry(...).or_insert_with(...)` for atomic get-or-create paths instead of external check-then-insert locks.
 - For snapshot-heavy services, test `Cached` and `Cow` with your real key distribution.
+- Stable-layout batches publish length and version changes once per touched shard, including during unwinding. Snapshot versions are change tokens, not per-operation counters.
 
 ## Serde Semantics
 

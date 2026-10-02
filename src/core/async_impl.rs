@@ -862,13 +862,10 @@ where
         for (index, pairs) in self.bucketize_entries(entries) {
             let shard = self.get_or_init_shard(index).await;
             let mut guard = shard.write().await;
-            let mut added = 0;
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for (key, value) in pairs {
-                added += usize::from(guard.insert(key, value).is_none());
+                count += usize::from(mutation.insert(key, value).is_none());
             }
-            self.total_len.fetch_add(added, Ordering::Relaxed);
-            self.on_structural_write();
-            count += added;
         }
         count
     }
@@ -904,14 +901,9 @@ where
                 continue;
             };
             let mut guard = shard.write().await;
-            let mut removed = 0;
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for key in keys {
-                removed += usize::from(guard.remove(&key).is_some());
-            }
-            if removed > 0 {
-                self.total_len.fetch_sub(removed, Ordering::Relaxed);
-                self.on_structural_write();
-                count += removed;
+                count += usize::from(mutation.remove(&key).is_some());
             }
         }
         count
