@@ -4,7 +4,7 @@
 //! - Pessimistic transactions over participating shards
 //! - Compare-and-swap (CAS) operations
 //! - Copy-on-write snapshots for read-heavy workloads
-//! - Distributed replication framework
+//! - Primary-first replication with write acknowledgements (not consensus)
 //! - Lock profiling and diagnostics
 
 use std::sync::Arc;
@@ -172,7 +172,7 @@ impl<K: Clone, V: Clone> CowSnapshot<K, V> {
 }
 
 /// Replication error types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaError {
     /// Connection failed
     ConnectionFailed,
@@ -183,6 +183,19 @@ pub enum ReplicaError {
     /// Quorum not reached
     QuorumFailed,
 }
+
+impl std::fmt::Display for ReplicaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionFailed => f.write_str("replica connection failed"),
+            Self::Timeout => f.write_str("replication deadline elapsed"),
+            Self::Rejected(reason) => write!(f, "replica rejected operation: {reason}"),
+            Self::QuorumFailed => f.write_str("write quorum was not reached"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicaError {}
 
 /// Operations for replication.
 #[derive(Debug, Clone)]
@@ -210,7 +223,13 @@ where
     K: Send,
     V: Send,
 {
-    /// Replicate an operation
+    /// Apply and acknowledge an operation.
+    ///
+    /// The map cancels outstanding replica futures at the operation deadline or
+    /// when the last map handle is dropped. Implementations must support this
+    /// cancellation boundary and must not leave detached writes that can later
+    /// overtake a subsequent operation. A failed or cancelled call may have
+    /// applied its operation; the framework provides no rollback or consensus.
     async fn replicate(&self, op: ReplicationOp<K, V>) -> Result<(), ReplicaError>;
 
     /// Fetch current state
@@ -299,16 +318,21 @@ impl<K, V> IsolatedSnapshot<K, V> {
     }
 }
 
-/// Quorum-based consistency configuration.
+/// Write-acknowledgement configuration for primary-first replication.
+///
+/// This framework is not a consensus or distributed transaction protocol.
+/// Reads use local state; `read_quorum` is reserved and is not enforced.
 #[derive(Debug, Clone)]
 pub struct QuorumConfig {
     /// Total number of replicas (including primary)
     pub replica_count: usize,
     /// Minimum replicas that must acknowledge writes (must be > replica_count/2)
     pub write_quorum: usize,
-    /// Minimum replicas for read quorum
+    /// Reserved read quorum; validated but not implemented by local read APIs
     pub read_quorum: usize,
-    /// Replication timeout
+    /// Total deadline for queueing, local application, and replica fanout.
+    /// Must be nonzero. Replica work continues after early quorum success only
+    /// until this deadline.
     pub timeout: std::time::Duration,
 }
 
@@ -339,7 +363,9 @@ impl QuorumConfig {
     /// Validate configuration
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn is_valid(&self) -> bool {
-        self.write_quorum > self.replica_count / 2
+        self.replica_count > 0
+            && !self.timeout.is_zero()
+            && self.write_quorum > self.replica_count / 2
             && self.read_quorum > 0
             && self.write_quorum <= self.replica_count
             && self.read_quorum <= self.replica_count

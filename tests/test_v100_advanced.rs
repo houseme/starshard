@@ -594,7 +594,7 @@ mod advanced_tests {
                 replica2.clone() as Arc<dyn Replica<String, i32>>,
             ];
 
-            let config = QuorumConfig::majority(3); // 2 replicas + 1 primary
+            let config = QuorumConfig::strict(3); // 2 replicas + 1 primary
             let map: AsyncShardedHashMap<String, i32, rustc_hash::FxBuildHasher> =
                 AsyncShardedHashMap::with_replication(8, replicas, config);
 
@@ -611,7 +611,7 @@ mod advanced_tests {
                 replica2.clone() as Arc<dyn Replica<String, i32>>,
             ];
 
-            let config = QuorumConfig::majority(3);
+            let config = QuorumConfig::strict(3);
             let map: AsyncShardedHashMap<String, i32, rustc_hash::FxBuildHasher> =
                 AsyncShardedHashMap::with_replication(8, replicas, config);
 
@@ -635,9 +635,8 @@ mod advanced_tests {
             let replicas: Vec<Arc<dyn Replica<String, i32>>> =
                 vec![replica1.clone() as Arc<dyn Replica<String, i32>>];
 
-            // With 1 replica, we need a config that requires quorum of 1
-            // majority(1) = (1/2) + 1 = 0 + 1 = 1
-            let config = QuorumConfig::majority(1);
+            // One primary plus one remote replica.
+            let config = QuorumConfig::strict(2);
             let map: AsyncShardedHashMap<String, i32, rustc_hash::FxBuildHasher> =
                 AsyncShardedHashMap::with_replication(8, replicas, config);
 

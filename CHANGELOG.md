@@ -26,6 +26,15 @@ All notable changes to this project will be documented in this file.
 
 - Add sync/async regressions for migration interleavings, shrinking, atomic initialization, CAS/transactions, cancellation, panic recovery, lazy producer reentry, snapshot versions, and clone counts.
 
+### Replication
+
+- Count the primary toward write quorum and validate replica counts, quorum values, duplicate handles, and nonzero deadlines.
+- Add `try_with_replication`; invalid configuration uses the existing `ReplicaError::Rejected` variant. `with_replication` now panics for invalid topology instead of silently accepting it.
+- Enforce one deadline across queueing, local application, and remote fanout. Acknowledge quorum early while tracking bounded remaining work in order across map clones; dropping the last map cancels that work.
+- Document primary-first local application: failure/cancellation does not roll back writes, ordinary local operations are outside replica ordering, and quorum reads/consensus are not implemented.
+- Implement `Display` and `Error` for `ReplicaError` without adding enum variants; enable Tokio time only when async and advanced features are combined.
+- Add quorum, cancellation, clone lifetime, timeout cleanup, queued timeout, replica panic, and ordering regression tests.
+
 ## [2.3.0] - 2026-08-25
 
 ### Added

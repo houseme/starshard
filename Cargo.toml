@@ -28,7 +28,7 @@ async = ["dep:tokio", "dep:async-trait"]
 rayon = ["dep:rayon", "hashbrown/rayon"]
 serde = ["dep:serde", "hashbrown/serde"]
 lifecycle = []
-advanced = ["dep:async-trait"]
+advanced = ["dep:async-trait", "tokio?/time"]
 full = ["async", "rayon", "serde", "lifecycle", "advanced"]
 
 [dev-dependencies]

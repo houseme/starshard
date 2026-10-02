@@ -28,3 +28,6 @@ pub(crate) use types::{AsyncShard, AsyncShardVec, AsyncShardVecArc};
 
 #[cfg(all(feature = "async", feature = "advanced"))]
 pub(crate) use types::ReplicaList;
+
+#[cfg(all(feature = "async", feature = "advanced"))]
+pub(crate) mod replication;

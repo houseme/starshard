@@ -265,6 +265,8 @@ where
     #[cfg(feature = "advanced")]
     replicas: ReplicaList<K, V>,
     #[cfg(feature = "advanced")]
+    replication_state: Arc<crate::core::replication::ReplicationState>,
+    #[cfg(feature = "advanced")]
     quorum_config: Arc<StdRwLock<Option<QuorumConfig>>>,
 }
 
