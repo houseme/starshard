@@ -56,11 +56,22 @@ fn bench_get(c: &mut Criterion) {
 }
 
 #[derive(Clone, Copy)]
+enum ReadOperation {
+    Get,
+    ReadWith,
+    GetOrInsert,
+    // Worker zero repeatedly acquires a cached shared snapshot while the
+    // remaining persistent workers perform ordinary reads.
+    GetWithSnapshots,
+}
+
+#[derive(Clone, Copy)]
 struct MixedWorkload {
     threads: usize,
     hot_keys: bool,
     value_bytes: usize,
     write_percent: usize,
+    read: ReadOperation,
 }
 
 // Workers and key schedules are created before measurement. Each timed batch
@@ -76,9 +87,17 @@ impl MixedWorkers {
     fn new(workload: MixedWorkload) -> Self {
         let keys = Arc::new(keys());
         let value = Arc::new(vec![42_u8; workload.value_bytes]);
-        let map = Arc::new(ShardedHashMap::new(64));
+        let snapshot_mode = if matches!(workload.read, ReadOperation::GetWithSnapshots) {
+            SnapshotMode::Cached
+        } else {
+            SnapshotMode::Clone
+        };
+        let map = Arc::new(ShardedHashMap::with_snapshot_mode(64, snapshot_mode));
         for key in keys.iter() {
             map.insert(key.clone(), value.as_ref().clone());
+        }
+        if matches!(workload.read, ReadOperation::GetWithSnapshots) {
+            black_box(map.shared_snapshot());
         }
         let start = Arc::new(Barrier::new(workload.threads + 1));
         let finished = Arc::new(Barrier::new(workload.threads + 1));
@@ -110,10 +129,28 @@ impl MixedWorkers {
                         }
                         for &(key_index, write) in &schedule {
                             let key = &keys[key_index];
-                            if write {
+                            if matches!(workload.read, ReadOperation::GetWithSnapshots)
+                                && worker == 0
+                            {
+                                black_box(map.shared_snapshot());
+                            } else if write {
                                 black_box(map.insert(key.clone(), value.as_ref().clone()));
                             } else {
-                                black_box(map.get(key));
+                                match workload.read {
+                                    ReadOperation::Get | ReadOperation::GetWithSnapshots => {
+                                        black_box(map.get(key));
+                                    }
+                                    ReadOperation::ReadWith => {
+                                        black_box(map.read_with(key.as_str(), |value| {
+                                            black_box(value.len())
+                                        }));
+                                    }
+                                    ReadOperation::GetOrInsert => {
+                                        black_box(map.get_or_insert_with(key.clone(), || {
+                                            panic!("benchmark key must already exist")
+                                        }));
+                                    }
+                                }
                             }
                         }
                         finished.wait();
@@ -162,6 +199,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
             hot_keys: false,
             value_bytes: 16,
             write_percent: 10,
+            read: ReadOperation::Get,
         })
         .chain([
             MixedWorkload {
@@ -169,18 +207,21 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                 hot_keys: true,
                 value_bytes: 16,
                 write_percent: 10,
+                read: ReadOperation::Get,
             },
             MixedWorkload {
                 threads: 8,
                 hot_keys: false,
                 value_bytes: 4096,
                 write_percent: 10,
+                read: ReadOperation::Get,
             },
             MixedWorkload {
                 threads: 8,
                 hot_keys: false,
                 value_bytes: 16,
                 write_percent: 50,
+                read: ReadOperation::Get,
             },
         ]);
     for workload in workloads {
@@ -197,6 +238,61 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
             (workload.threads * OPS_PER_WORKER) as u64,
         ));
         group.bench_function(name, |b| {
+            let workers = MixedWorkers::new(workload);
+            b.iter_custom(|iterations| workers.measure(iterations));
+        });
+    }
+    group.finish();
+}
+
+fn bench_concurrent_read_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_read_paths");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for (name, read) in [
+        ("get", ReadOperation::Get),
+        ("read_with", ReadOperation::ReadWith),
+        ("get_or_insert_hit", ReadOperation::GetOrInsert),
+    ] {
+        for threads in [1, 2, 4, 8] {
+            for hot_keys in [false, true] {
+                let distribution = if hot_keys { "hot90" } else { "uniform" };
+                let workload = MixedWorkload {
+                    threads,
+                    hot_keys,
+                    value_bytes: 16,
+                    write_percent: 0,
+                    read,
+                };
+                group.throughput(Throughput::Elements((threads * OPS_PER_WORKER) as u64));
+                group.bench_function(format!("{name}_t{threads}_{distribution}"), |b| {
+                    let workers = MixedWorkers::new(workload);
+                    b.iter_custom(|iterations| workers.measure(iterations));
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
+fn bench_concurrent_cached_snapshots(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_cached_snapshot");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for threads in [2, 4, 8] {
+        let workload = MixedWorkload {
+            threads,
+            hot_keys: false,
+            value_bytes: 16,
+            write_percent: 0,
+            read: ReadOperation::GetWithSnapshots,
+        };
+        // One snapshot worker and threads - 1 get workers execute equal fixed
+        // operation counts, so the throughput reports that explicit mixture.
+        group.throughput(Throughput::Elements((threads * OPS_PER_WORKER) as u64));
+        group.bench_function(format!("t{threads}"), |b| {
             let workers = MixedWorkers::new(workload);
             b.iter_custom(|iterations| workers.measure(iterations));
         });
@@ -271,6 +367,8 @@ criterion_group!(
     bench_insert,
     bench_get,
     bench_concurrent_mixed,
+    bench_concurrent_read_paths,
+    bench_concurrent_cached_snapshots,
     bench_snapshot_modes,
     bench_shared_snapshots,
 );

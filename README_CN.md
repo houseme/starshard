@@ -239,6 +239,8 @@ let cow_map: ShardedHashMap<String, i32> =
 cargo bench --bench bench_main -- concurrent_mixed
 cargo bench --bench bench_main -- snapshot_modes
 cargo bench --bench bench_main -- shared_snapshot
+cargo bench --bench bench_main -- concurrent_read_paths
+cargo bench --bench bench_main -- concurrent_cached_snapshot
 ```
 
 这些 Criterion 基准报告批次耗时和吞吐，不测量单次操作 p99 延迟、分配次数、内存峰值或迁移暂停上界；上述指标需要单独的负载观测。

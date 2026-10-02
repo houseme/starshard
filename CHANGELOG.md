@@ -46,6 +46,7 @@ All notable changes to this project will be documented in this file.
 
 ### Benchmarks and documentation
 
+- Add persistent-worker comparisons of ordinary reads, projected reads, initialization hits, and fixed-batch cached-snapshot/read mixtures; document cache-hit versus rebuild locking boundaries.
 - Pre-generate benchmark keys and reuse worker threads; cover thread counts, skewed key distributions, value sizes, write ratios, owned snapshots, and shared cache hits.
 - Strengthen the locked feature matrix with isolated lifecycle, advanced, async, and async-combination lanes.
 - Update English/Chinese usage guidance and document migration pauses, lazy snapshot tradeoffs, pessimistic transaction semantics, and unimplemented TTL/metrics/profiling scheduling capabilities.
