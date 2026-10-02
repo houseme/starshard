@@ -1,7 +1,16 @@
 //! Version 0.9.0: Eviction, Metrics, and Advanced Iteration Support
 //!
-//! This module provides production-grade lifecycle management, observability hooks,
-//! and advanced iteration patterns for the Starshard sharded HashMap.
+//! Eviction configuration and metrics counters are standalone building blocks;
+//! maps do not automatically schedule eviction or update these counters.
+//! Iterator builders and drain iterators are integrated with the map APIs.
+
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+
+// Initial scheduling cutoff, not a benchmark-derived optimum. Small filters
+// retain their allocation and avoid dispatching work to the Rayon pool.
+#[cfg(feature = "rayon")]
+const PARALLEL_FILTER_MIN_ITEMS: usize = 1024;
 
 /// Eviction policy for cache entries.
 #[derive(Clone)]
@@ -229,19 +238,37 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
         self
     }
 
-    /// Enable or disable parallel processing
+    /// Enable or disable parallel filtering.
+    ///
+    /// With the `rayon` feature, filters over at least 1024 items may run
+    /// concurrently. This initial cutoff has not been tuned for every workload.
+    /// Smaller inputs and builds without `rayon` use sequential filtering.
+    /// Result order is preserved; predicate invocation order is unspecified
+    /// when filtering in parallel. Callbacks passed to [`Self::for_each`] still
+    /// run sequentially in result order.
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn parallel(mut self, enabled: bool) -> Self {
         self.parallel = enabled;
         self
     }
 
-    /// Execute the iteration and collect results
+    /// Filter all input items, then limit and collect results in input order.
     #[tracing::instrument(skip(self, items), level = "trace")]
     pub fn collect(&self, items: Vec<(K, V)>) -> Vec<(K, V)> {
         let mut result = items;
 
         if let Some(ref filter) = self.filter {
+            #[cfg(feature = "rayon")]
+            if self.parallel && result.len() >= PARALLEL_FILTER_MIN_ITEMS {
+                result = result
+                    .into_par_iter()
+                    .filter(|(k, v)| filter(k, v))
+                    .collect();
+            } else {
+                result.retain(|(k, v)| filter(k, v));
+            }
+
+            #[cfg(not(feature = "rayon"))]
             result.retain(|(k, v)| filter(k, v));
         }
 
@@ -252,7 +279,7 @@ impl<K: Clone + Send + Sync, V: Clone + Send + Sync> IterBuilder<K, V> {
         result
     }
 
-    /// Execute the iteration with a callback
+    /// Filter and limit the input, then invoke the callback sequentially.
     #[tracing::instrument(skip(self, items, f), level = "trace")]
     pub fn for_each<F: Fn((K, V))>(&self, items: Vec<(K, V)>, f: F) {
         let items = self.collect(items);
@@ -289,12 +316,18 @@ impl<K, V> Iterator for DrainIterator<K, V> {
             None
         }
     }
+
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len();
+        (remaining, Some(remaining))
+    }
 }
 
 impl<K, V> ExactSizeIterator for DrainIterator<K, V> {
     #[tracing::instrument(skip(self), level = "trace")]
     fn len(&self) -> usize {
-        self.items.len() - self.index
+        self.items.len().saturating_sub(self.index)
     }
 }
 
@@ -350,6 +383,72 @@ mod tests {
     }
 
     #[test]
+    fn parallel_filter_preserves_order_and_filters_before_limiting() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for size in [0, 17, 4096] {
+            for limit in [0, 5, size + 1] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let filter_calls = calls.clone();
+                let builder = IterBuilder::new()
+                    .parallel(true)
+                    .filter(move |key: &usize, _| {
+                        filter_calls.fetch_add(1, Ordering::Relaxed);
+                        key.is_multiple_of(3)
+                    })
+                    .limit(limit);
+                let expected: Vec<_> = (0..size)
+                    .filter(|key| key.is_multiple_of(3))
+                    .take(limit)
+                    .map(|key| (key, key * 2))
+                    .collect();
+                let actual = builder.collect((0..size).map(|key| (key, key * 2)).collect());
+                assert_eq!(actual, expected);
+                assert_eq!(calls.load(Ordering::Relaxed), size);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_filter_keeps_callbacks_sequential_and_non_send() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let callback_results = results.clone();
+        IterBuilder::new()
+            .parallel(true)
+            .filter(|key: &usize, _| key.is_multiple_of(2))
+            .limit(4)
+            .for_each((0..4096).map(|key| (key, key)).collect(), move |item| {
+                callback_results.borrow_mut().push(item);
+            });
+        assert_eq!(*results.borrow(), vec![(0, 0), (2, 2), (4, 4), (6, 6)]);
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn parallel_filter_dispatches_large_inputs_to_rayon() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let saw_worker = Arc::new(AtomicBool::new(false));
+        let filter_worker = saw_worker.clone();
+        let builder = IterBuilder::new()
+            .parallel(true)
+            .filter(move |_: &usize, _| {
+                if rayon::current_thread_index().is_some() {
+                    filter_worker.store(true, Ordering::Relaxed);
+                }
+                true
+            });
+        let result = builder.collect((0..4096).map(|key| (key, key)).collect());
+        assert_eq!(result.len(), 4096);
+        assert!(saw_worker.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn drain_iterator() {
         let drain = DrainIterator {
             items: vec![("a", 1), ("b", 2), ("c", 3)],
@@ -357,5 +456,19 @@ mod tests {
         };
         let collected: Vec<_> = drain.collect();
         assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn drain_iterator_reports_exact_remaining_size() {
+        let mut drain = DrainIterator {
+            items: vec![("a", 1), ("b", 2), ("c", 3)],
+            index: 0,
+        };
+        for remaining in (0..=3).rev() {
+            assert_eq!(drain.size_hint(), (remaining, Some(remaining)));
+            assert_eq!(drain.len(), remaining);
+            assert_eq!(drain.next().is_some(), remaining > 0);
+        }
+        assert_eq!(drain.size_hint(), (0, Some(0)));
     }
 }

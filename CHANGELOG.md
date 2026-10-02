@@ -35,6 +35,12 @@ All notable changes to this project will be documented in this file.
 - Implement `Display` and `Error` for `ReplicaError` without adding enum variants; enable Tokio time only when async and advanced features are combined.
 - Add quorum, cancellation, clone lifetime, timeout cleanup, queued timeout, replica panic, and ordering regression tests.
 
+### Iteration utilities
+
+- Honor `IterBuilder::parallel` for large filtered inputs with Rayon while preserving input order, filter-before-limit behavior, and sequential callbacks; retain a sequential fallback without Rayon.
+- Correct `DrainIterator::size_hint()` to match its exact remaining length.
+- Add parallel-filter, callback, ordering, and drain-size regression tests.
+
 ## [2.3.0] - 2026-08-25
 
 ### Added
