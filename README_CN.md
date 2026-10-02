@@ -17,7 +17,7 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-已达到生产可用（`v2.3.0`）。
+当前 crate 版本为 `2.3.0`。未发布的修复与 API 变更记录在 [CHANGELOG.md](CHANGELOG.md)。
 
 截至 `v2.3.0` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
@@ -49,7 +49,7 @@ starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecyc
 | Feature | 能力 | 典型场景 |
 |---|---|---|
 | `async` | `AsyncShardedHashMap`（Tokio `RwLock`） | 异步服务与任务系统 |
-| `rayon` | 快照迭代并行扁平化 | 大规模扫描/导出 |
+| `rayon` | 大型同步快照；启用 `lifecycle` 时支持 `IterBuilder` 并行过滤 | 大规模扫描和较重的过滤计算 |
 | `serde` | 同步版序列化/反序列化 + 异步快照序列化辅助 | 持久化与数据导出 |
 | `lifecycle` | `per_shard_load`、`memory_stats`、`drain` 等 | 运维观测与维护 |
 | `advanced` | 事务/CAS/复制/诊断 API | 高级并发控制与控制面 |
@@ -61,7 +61,7 @@ use starshard::ShardedHashMap;
 
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
 m.insert("k1".into(), 10);
-assert_eq!(m.get(&"k1".into()), Some(10));
+assert_eq!(m.get_borrowed("k1"), Some(10));
 assert_eq!(m.len(), 1);
 ```
 
@@ -75,7 +75,7 @@ async fn main() {
 
     let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(64);
     m.insert("k1".into(), 10).await;
-    assert_eq!(m.get(&"k1".into()).await, Some(10));
+    assert_eq!(m.get_borrowed("k1").await, Some(10));
 }
 ```
 
@@ -85,6 +85,7 @@ async fn main() {
 |---|---|---|
 | 插入/更新 | `insert(k, v)` | `insert(k, v).await` |
 | 读取 | `get(&k)` | `get(&k).await` |
+| 借用键读取 | `get_borrowed(q)` | `get_borrowed(q).await` |
 | 删除 | `remove(&k)` | `remove(&k).await` |
 | entry 插入/更新 | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
 | 获取或插入 | `get_or_insert_with(k, f)` | `get_or_insert_with(k, f).await` |
@@ -93,6 +94,8 @@ async fn main() {
 | 条件更新 | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
 | 条件插入 | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
 | 指标/内省 | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+使用 `get_borrowed`、`contains_borrowed`、`remove_borrowed` 可传入借用键，例如用 `&str` 查询 `String` 键。原有 `get`、`contains`、`remove` 保留 `&K` 签名；读取仍返回克隆后的值。
 
 Entry 风格插入/更新：
 
@@ -164,14 +167,17 @@ assert_eq!(m.rebalance_status().state, "idle");
 - 写入立即路由到新 active 分片。
 - 迁移期间读取走 active 优先，miss 后回退 previous。
 - 所有源分片迁移完成后，状态回到 `idle`。
+- 每次推进会暂停 map 操作，最多搬迁指定数量的源分片；单个源分片较大时仍可能出现长暂停。该数量不代表时间预算或条目数预算。
 
 ## 快照模式（`v2.2.1`）
 
 `SnapshotMode` 支持按负载选择：
 
-- `Clone`：每次重建快照（默认，写路径开销最低）。
-- `Cached`：无写入时复用快照缓存。
-- `Cow`：分片级 COW 快照视图，适合高频快照读取。
+- `Clone`：每次请求都重建快照（默认模式）。
+- `Cached`：复用带版本的全 map 共享快照，写入后失效。
+- `Cow`：目前与 `Cached` 共用惰性共享快照缓存。写入只使缓存失效，不再复制整个分片；下次请求快照时重建。
+
+`iter()` 返回拥有所有权的条目，因此命中共享缓存后仍会复制条目。使用 `shared_snapshot()` 获取 `Arc<Vec<(K, V)>>`，可重复读取快照而不复制条目。后续写入不会改变已有快照句柄的数据。启用 `advanced` 后，`cow_snapshot()` 还提供共享视图及其数据版本。
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -195,14 +201,15 @@ let cow_map: ShardedHashMap<String, i32> =
 ## 一致性模型
 
 - 分片内操作是线性化可见的。
-- 全局迭代/快照是“分片级快照拼接”，不是全局串行化事务。
+- 快照捕获期间排除并发修改和目录切换，得到覆盖 active 与 previous 分片的稳定视图；无写入时可复用缓存而不重新复制条目。
 - 在线迁移期间，通过 active-first + previous-fallback 保证 key 可达性。
+- 事务按固定顺序获取涉及分片的写锁，采用悲观锁；读写集合不构成 MVCC 冲突检测。持锁期间的回调不得重入同一个 map。
 
 ## 性能建议
 
-- 相比单全局 `RwLock<HashMap<..>>`，分片模型在混合负载下通常能降低竞争。
+- 根据实际线程数与键分布运行竞争基准，再选择分片数量。
 - 延迟分片初始化可让内存更接近“按访问付费”。
-- 大规模扫描场景建议启用 `rayon`。
+- 启用 Rayon 后，`IterBuilder::parallel(true)` 对至少 1024 项的输入并行过滤；该初始阈值尚未经过针对不同负载的调优。先过滤再截取结果，结果顺序与输入一致。过滤调用可以并发执行，`for_each` 回调仍按结果顺序串行执行。小输入或未启用 `rayon` 时顺序过滤。
 - 原子 get-or-create 路径优先使用 `get_or_insert_with` 或 `entry(...).or_insert_with(...)`，避免外部 check-then-insert 锁。
 - 快照密集型服务建议按真实键分布对比 `Cached` 与 `Cow`。
 
@@ -224,6 +231,16 @@ let cow_map: ShardedHashMap<String, i32> =
 基准入口：
 - `benches/bench_main.rs`
 
+基准提前生成键并复用并发工作线程。计时批次包含屏障同步，每个线程执行 1000 次操作以摊薄同步成本。按维度抽样覆盖 1/2/4/8/16 线程、90% 热点键、16 字节/4 KiB 值、10%/50% 写入以及全部快照模式，避免执行完整笛卡尔积。拥有所有权的迭代与共享快照句柄分别测量。
+
+```bash
+cargo bench --bench bench_main -- concurrent_mixed
+cargo bench --bench bench_main -- snapshot_modes
+cargo bench --bench bench_main -- shared_snapshot
+```
+
+这些 Criterion 基准报告批次耗时和吞吐，不测量单次操作 p99 延迟、分配次数、内存峰值或迁移暂停上界；上述指标需要单独的负载观测。
+
 ## 验证建议
 
 发布前或升级后建议执行：
@@ -237,8 +254,10 @@ cargo check --all-features
 ## 当前边界
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
-- 快照输出仍需物化为 `Vec<(K, V)>`。
-- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.x` 中为前向兼容预留参数。
+- 快照缓存未命中时，会在暂停修改的期间物化全 map 的 `Vec<(K, V)>`；只有后续写入未使缓存失效时，`shared_snapshot()` 才能摊薄这项成本。
+- `EvictionConfig`、淘汰策略和 `AtomicMetrics` 是独立类型。map 不会自动运行 TTL/LRU/LFU 调度器，也不会自动累加这些操作计数；`memory_stats()` 与 `per_shard_load()` 用于查询 map 状态。
+- 尚未实现锁耗时采集；`lock_profiles()` 不提供实测的锁竞争数据。
+- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.x` 中为前向兼容预留参数，不会启动后台任务或强制执行暂停预算。
 
 ## License
 

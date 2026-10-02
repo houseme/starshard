@@ -41,6 +41,13 @@ All notable changes to this project will be documented in this file.
 - Correct `DrainIterator::size_hint()` to match its exact remaining length.
 - Add parallel-filter, callback, ordering, and drain-size regression tests.
 
+### Benchmarks and documentation
+
+- Pre-generate benchmark keys and reuse worker threads; cover thread counts, skewed key distributions, value sizes, write ratios, owned snapshots, and shared cache hits.
+- Strengthen the locked feature matrix with isolated lifecycle, advanced, async, and async-combination lanes.
+- Update English/Chinese usage guidance and document migration pauses, lazy snapshot tradeoffs, pessimistic transaction semantics, and unimplemented TTL/metrics/profiling scheduling capabilities.
+- Performance evidence is workload-specific: clone-count regressions verify zero full-shard clones on Cow writes and one value clone per async Clone snapshot entry. No general throughput, p99, or memory guarantee is implied.
+
 ## [2.3.0] - 2026-08-25
 
 ### Added

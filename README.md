@@ -18,7 +18,7 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Production-ready (`v2.3.0`).
+Current crate version: `2.3.0`. Unreleased fixes and API changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 Roadmap capabilities shipped through `v2.3.0`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
@@ -50,7 +50,7 @@ Migration guide:
 | Feature | What you get | Typical use |
 |---|---|---|
 | `async` | `AsyncShardedHashMap` (Tokio `RwLock`) | async services and workers |
-| `rayon` | parallel snapshot flatten in iteration | large snapshot/scan workloads |
+| `rayon` | large sync snapshots; parallel `IterBuilder` filtering with `lifecycle` | large scans and expensive predicates |
 | `serde` | sync serialize/deserialize + async serializable snapshot helper | persistence/export |
 | `lifecycle` | `per_shard_load`, `memory_stats`, `drain`, lifecycle structs | observability and maintenance |
 | `advanced` | transaction/CAS/replication/diagnostic APIs | advanced concurrency and control planes |
@@ -62,7 +62,7 @@ use starshard::ShardedHashMap;
 
 let m: ShardedHashMap<String, i32> = ShardedHashMap::new(64);
 m.insert("k1".into(), 10);
-assert_eq!(m.get(&"k1".into()), Some(10));
+assert_eq!(m.get_borrowed("k1"), Some(10));
 assert_eq!(m.len(), 1);
 ```
 
@@ -76,7 +76,7 @@ async fn main() {
 
     let m: AsyncShardedHashMap<String, i32> = AsyncShardedHashMap::new(64);
     m.insert("k1".into(), 10).await;
-    assert_eq!(m.get(&"k1".into()).await, Some(10));
+    assert_eq!(m.get_borrowed("k1").await, Some(10));
 }
 ```
 
@@ -86,6 +86,7 @@ async fn main() {
 |---|---|---|
 | insert/update | `insert(k, v)` | `insert(k, v).await` |
 | read | `get(&k)` | `get(&k).await` |
+| borrowed-key read | `get_borrowed(q)` | `get_borrowed(q).await` |
 | delete | `remove(&k)` | `remove(&k).await` |
 | entry insert/update | `entry(k).or_insert_with(f)` | `entry(k).await.or_insert_with(f).await` |
 | get or insert | `get_or_insert_with(k, f)` | `get_or_insert_with(k, f).await` |
@@ -94,6 +95,8 @@ async fn main() {
 | conditional update | `compute_if_present(&k, f)` | `compute_if_present(&k, f).await` |
 | conditional insert | `compute_if_absent(k, f)` | `compute_if_absent(k, f).await` |
 | metrics/introspection | `shard_stats()` / `memory_stats()` | `shard_stats().await` / `memory_stats().await` |
+
+For borrowed keys, use `get_borrowed`, `contains_borrowed`, and `remove_borrowed` (for example, an `&str` query against `String` keys). Existing `get`, `contains`, and `remove` retain their `&K` signatures. Reads still return cloned values.
 
 Entry-style insert/update:
 
@@ -164,15 +167,18 @@ assert_eq!(m.rebalance_status().state, "idle");
 Semantics:
 - writes route to active shards immediately,
 - reads fall back to previous shards while migration is in progress,
-- migration is finalized when `advance_rebalance(...)` drains all source shards.
+- migration is finalized when `advance_rebalance(...)` drains all source shards,
+- each advance call pauses map operations while moving up to the requested number of source shards; large source shards can still cause long pauses. This is not a time or entry-count budget.
 
 ## Snapshot Modes (`v2.2.1`)
 
 `SnapshotMode` lets you pick snapshot behavior per workload:
 
-- `Clone`: always rebuild snapshot entries (default, lowest write-path overhead).
-- `Cached`: reuse cached snapshot while no writes occur.
-- `Cow`: maintain per-shard COW snapshot views for snapshot-heavy workloads.
+- `Clone`: rebuild snapshot entries on each request (default).
+- `Cached`: reuse a versioned, shared whole-map snapshot until the next write.
+- `Cow`: currently uses the same lazy shared snapshot cache as `Cached`. Writes invalidate the cache without cloning an entire shard; the next snapshot request rebuilds it.
+
+`iter()` returns owned entries and therefore still clones entries from a shared cache. Use `shared_snapshot()` to obtain an `Arc<Vec<(K, V)>>` and read repeated snapshots without copying their entries. Existing snapshot handles remain immutable after later writes. With `advanced`, `cow_snapshot()` also exposes a shared view and its data version.
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -196,14 +202,15 @@ let cow_map: ShardedHashMap<String, i32> =
 ## Consistency Model
 
 - Per-shard operations are linearizable for that shard.
-- Global iteration/snapshot is shard-snapshot based, not a global serializable transaction.
+- Snapshot capture excludes concurrent mutation and directory changes, producing a stable view of both active and previous shards. An unchanged cached snapshot can be shared without recopying its entries.
 - During online rebalance, active-first + previous-fallback keeps key reachability.
+- Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks must not reenter the same map while its locks are held.
 
 ## Performance Notes
 
-- Sharding reduces contention versus a single `RwLock<HashMap<..>>` under mixed load.
+- Use the contention benchmarks to choose a shard count for your thread count and key distribution.
 - Lazy shard allocation keeps memory proportional to touched shards.
-- `rayon` improves large snapshot flatten throughput when scan size is high.
+- `IterBuilder::parallel(true)` uses Rayon for filtering at least 1024 inputs when enabled. This initial cutoff is not a measured optimum. Filtering precedes the result limit and preserves input order; filter calls can run concurrently, while `for_each` callbacks remain sequential. Small inputs and builds without `rayon` use sequential filtering.
 - Use `get_or_insert_with` or `entry(...).or_insert_with(...)` for atomic get-or-create paths instead of external check-then-insert locks.
 - For snapshot-heavy services, test `Cached` and `Cow` with your real key distribution.
 
@@ -225,6 +232,16 @@ Examples:
 Benchmark entry:
 - `benches/bench_main.rs`
 
+The benchmark suite pre-generates keys and reuses contention workers. Timed contention batches include barrier synchronization, amortized over 1000 operations per worker. It samples 1/2/4/8/16 threads, a 90% hot-key distribution, 16-byte/4-KiB values, 10%/50% writes, and all snapshot modes without running the full Cartesian product. Owned iteration and shared snapshot handles are measured separately.
+
+```bash
+cargo bench --bench bench_main -- concurrent_mixed
+cargo bench --bench bench_main -- snapshot_modes
+cargo bench --bench bench_main -- shared_snapshot
+```
+
+Criterion reports batch timing and throughput here. These benchmarks do not measure individual-operation p99 latency, allocations, peak memory, or migration pause bounds; those require separate workload instrumentation.
+
 ## Validation
 
 Before release or upgrade verification:
@@ -238,8 +255,10 @@ cargo check --all-features
 ## Current Limits
 
 - Not lock-free; hot-shard writer pressure can still serialize.
-- Snapshot operations still materialize `Vec<(K, V)>` as output format.
-- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.x`.
+- Snapshot cache misses materialize a whole-map `Vec<(K, V)>` while mutation is paused; `shared_snapshot()` amortizes this cost only while no write invalidates the cache.
+- `EvictionConfig`, eviction policies, and `AtomicMetrics` are standalone types. Maps do not run an autonomous TTL/LRU/LFU scheduler or automatically increment those operation counters. `memory_stats()` and `per_shard_load()` report map state.
+- Lock timing instrumentation is not implemented; `lock_profiles()` does not provide measured contention data.
+- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.x`; they do not start a background task or enforce a pause budget.
 
 ## License
 
