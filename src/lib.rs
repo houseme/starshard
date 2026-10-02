@@ -34,8 +34,10 @@ Design Goals
 Consistency Model
 ------------------
 - Per-shard operations are linearizable with respect to that shard.
-- Global iteration and shared snapshots pin routing exclusively while collecting data.
-  Snapshot construction pauses map operations and includes both migration generations.
+- Snapshot rebuilds serialize behind a dedicated gate, pin directories with shared
+  routing, and acquire all shard read locks in order. This preserves a global view
+  across both generations while permitting ordinary reads subject to lock fairness.
+  Writers and topology changes wait for the corresponding snapshot locks.
 - `len()` reflects committed length changes. In-flight mutations may not yet be reflected;
   after all operations complete it matches the number of stored logical keys.
 
@@ -45,7 +47,8 @@ Thread / Task Safety
 - A routing guard pins the shard directory for each operation.
 - Multiple shard locks follow active-before-previous generation order, with ascending
   indices for transactions. Callbacks must not reenter the map.
-- Atomic length update only after a structural insert/delete succeeds.
+- Mutation metadata is published before shard write locks are released; batches
+  aggregate length and version updates per touched shard, including during unwind.
 - `Clone` bounds on `K`,`V` needed for iteration snapshot flattening.
 
 Performance Notes (Indicative, not guaranteed)
@@ -148,7 +151,8 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
-    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
+    Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
+    RwLockWriteGuard as StdWriteGuard,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -215,6 +219,7 @@ where
     snapshot_mode: SnapshotMode,
     shards: StdShardVecArc<K, V, S>,
     routing_lock: Arc<StdRwLock<()>>,
+    snapshot_build_lock: Arc<StdMutex<()>>,
     previous_shards: Arc<StdRwLock<Option<crate::core::StdShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,
@@ -252,6 +257,7 @@ where
     snapshot_mode: SnapshotMode,
     shards: AsyncShardVecArc<K, V, S>,
     routing_lock: Arc<TokioRwLock<()>>,
+    snapshot_build_lock: Arc<TokioMutex<()>>,
     previous_shards: Arc<TokioRwLock<Option<crate::core::AsyncShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,

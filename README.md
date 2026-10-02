@@ -178,7 +178,7 @@ Semantics:
 - `Cached`: reuse a versioned, shared whole-map snapshot until the next write.
 - `Cow`: currently uses the same lazy shared snapshot cache as `Cached`. Writes invalidate the cache without cloning an entire shard; the next snapshot request rebuilds it.
 
-Valid `Cached`/`Cow` hits validate the data epoch under a short cache lock, without acquiring routing. Missing or stale snapshots still require an exclusive rebuild. Cached reads can finish during topology-only migration; they are not lock-free. Async cache reads preserve Tokio's cooperative task budget.
+Valid `Cached`/`Cow` hits validate the data epoch under a short cache lock, without acquiring routing. Missing or stale snapshots use a separate builder gate and ordered shard read locks. This coalesces concurrent rebuilds while allowing ordinary reads; writers and topology changes wait. Cached reads can finish during topology-only migration; they are not lock-free. Async cache reads preserve Tokio's cooperative task budget.
 
 `iter()` returns owned entries and therefore still clones entries from a shared cache, after releasing routing. Replaced cached data is also destroyed outside routing. Use `shared_snapshot()` to obtain an `Arc<Vec<(K, V)>>` and read repeated snapshots without copying their entries. Existing snapshot handles remain immutable after later writes. With `advanced`, `cow_snapshot()` also exposes a shared view and its data version.
 
@@ -204,7 +204,7 @@ let cow_map: ShardedHashMap<String, i32> =
 ## Consistency Model
 
 - Per-shard operations are linearizable for that shard.
-- Snapshot rebuilding excludes concurrent mutation and directory changes, producing a stable view of both active and previous shards. A matching immutable cache is returned without routing access; its data and epoch are captured together.
+- Snapshot rebuilding retains directory and ordered shard read locks, producing a stable view of both active and previous shards once all guards are held. Ordinary reads can proceed subject to lock fairness; queued writers or cold-shard initialization can still delay later readers. A matching immutable cache is returned without routing access; its data and epoch are captured together.
 - During online rebalance, active-first + previous-fallback keeps key reachability.
 - Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks must not reenter the same map while its locks are held.
 
@@ -260,7 +260,7 @@ cargo check --all-features
 ## Current Limits
 
 - Not lock-free; hot-shard writer pressure can still serialize.
-- Snapshot cache misses materialize a whole-map `Vec<(K, V)>` while mutation is paused; `shared_snapshot()` amortizes this cost only while no write invalidates the cache.
+- Snapshot cache misses materialize a whole-map `Vec<(K, V)>` while holding shard read locks. Rebuilds do not require exclusive routing, but still delay writers and topology changes; `shared_snapshot()` amortizes copying only while no write invalidates the cache.
 - `EvictionConfig`, eviction policies, and `AtomicMetrics` are standalone types. Maps do not run an autonomous TTL/LRU/LFU scheduler or automatically increment those operation counters. `memory_stats()` and `per_shard_load()` report map state.
 - Lock timing instrumentation is not implemented; `lock_profiles()` does not provide measured contention data.
 - `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.x`; they do not start a background task or enforce a pause budget.

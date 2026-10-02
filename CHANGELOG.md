@@ -19,14 +19,17 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Aggregate stable-layout batch length and write-epoch publication once per touched shard. A scoped mutation guard publishes committed changes before unlocking, including Hash/Eq or key/value destructor unwinding; versions remain change tokens, not operation counters.
+- Rebuild snapshots behind a dedicated builder gate using shared routing, retained directory reads, and ordered shard read guards. This preserves coherent cuts and coalesces cache misses while permitting ordinary reads subject to lock fairness; writers and topology changes still wait.
+- Preallocate snapshot output from frozen shard lengths, remove async migration deduplication hashing, and flatten synchronous Rayon scans without a temporary Vec per shard.
 - Serve valid Cached/Cow snapshots without acquiring routing, validating the immutable data and write epoch together. Sync handle capture uses a short cache critical section to avoid shared-reader/refcount contention.
 - Clone owned cached iteration results and destroy retired cached values after releasing routing. Reject obsolete snapshot versions without rebuilding, while retaining Tokio cooperative scheduling for cache hits and early version misses.
-- Build Cached/Cow snapshots lazily instead of cloning entire shards on each write. Cache misses pause map operations to build a consistent view; both modes currently use a whole-map cache.
+- Build Cached/Cow snapshots lazily instead of cloning entire shards on each write. Cache misses hold shard read locks to build a consistent view; both modes currently use a whole-map cache.
 - Use read access for initialized shard directories, avoid allocating shards for read misses, clone async snapshot entries once, and collect keys/values without copying the unused counterpart.
 - Return no lock profiling samples until actual instrumentation exists, rather than fabricated zero measurements.
 
 ### Tests
 
+- Cover reader progress during rebuild, cold-slot stability, coalesced builds, builder cancellation/panic recovery, migration transaction cuts, and projection clone/hash counts.
 - Cover batch Hash/Eq/Drop unwinding, cancellation between committed shard buckets, duplicate keys, empty/miss-only cache reuse, and different-shard length accumulation.
 - Cover cached reads during exclusive topology changes, invalidated-cache waits, coherent transaction snapshots, writer progress during value cloning/destruction outside routing, and current-thread Tokio scheduling fairness.
 - Add sync/async regressions for migration interleavings, shrinking, atomic initialization, CAS/transactions, cancellation, panic recovery, lazy producer reentry, snapshot versions, and clone counts.

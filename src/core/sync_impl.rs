@@ -1,8 +1,9 @@
 //! Synchronous sharded map implementation.
 //!
-//! Routing read guards pin a directory for ordinary operations. Topology changes
-//! and stable snapshots hold routing exclusively. Shard locks are ordered active
-//! first, then previous; transactions sort indices within each generation.
+//! Routing read guards pin directories; topology changes hold routing exclusively.
+//! Snapshot builders serialize separately and retain ordered shard read locks.
+//! Shard locks are ordered active first, then previous; transactions and snapshot
+//! builders sort indices within each generation.
 //! Snapshot caches are immutable and rebuilt lazily by committed write epoch.
 
 use super::*;
@@ -43,6 +44,7 @@ where
             snapshot_mode,
             shards: Arc::new(StdRwLock::new(shards)),
             routing_lock: Arc::new(StdRwLock::new(())),
+            snapshot_build_lock: Arc::new(StdMutex::new(())),
             previous_shards: Arc::new(StdRwLock::new(None)),
             hasher,
             shard_count: Arc::new(AtomicUsize::new(count)),
@@ -538,29 +540,70 @@ where
         drop(removed);
     }
 
-    // Caller holds exclusive routing: no data changes while building the snapshot.
-    fn collect_items(&self) -> Vec<(K, V)> {
-        let shards = self.all_shards();
-        #[cfg(feature = "rayon")]
-        if self.len() >= 4096 && shards.len() > 1 {
-            return shards
-                .par_iter()
-                .flat_map_iter(|shard| {
-                    std_read_guard(shard, "snapshot")
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-        }
-        let mut items = Vec::with_capacity(self.len());
-        for shard in shards {
-            items.extend(
-                std_read_guard(&shard, "snapshot")
+    // Callers serialize builders before entering this method. Holding the
+    // directory reads freezes lazy slots as well as topology. Once the final
+    // ordered shard read is acquired, all maps describe one coherent instant.
+    fn collect_into<T, F>(&self, items: &mut Vec<T>, project: F) -> u64
+    where
+        T: Send,
+        F: Fn(&K, &V) -> T + Send + Sync,
+    {
+        debug_assert!(items.is_empty());
+        let _routing = std_read_guard(&self.routing_lock, "snapshot_routing");
+        let active = std_read_guard(&self.shards, "snapshot_directory");
+        let previous = std_read_guard(&self.previous_shards, "snapshot_previous_directory");
+        let initialized = active.iter().flatten().count()
+            + previous
+                .as_ref()
+                .map_or(0, |slots| slots.iter().flatten().count());
+        let mut guards = Vec::with_capacity(initialized);
+        guards.extend(
+            active
+                .iter()
+                .flatten()
+                .map(|shard| std_read_guard(shard, "snapshot_shard")),
+        );
+        if let Some(previous) = previous.as_ref() {
+            guards.extend(
+                previous
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
+                    .flatten()
+                    .map(|shard| std_read_guard(shard, "snapshot_previous_shard")),
             );
         }
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        let count = guards.iter().map(|guard| guard.len()).sum();
+        items.reserve_exact(count);
+        #[cfg(feature = "rayon")]
+        if count >= 4096 && guards.len() > 1 {
+            // The guards outlive all Rayon work, so flatten their borrowed
+            // iterators directly without allocating a Vec for each shard.
+            items.par_extend(
+                guards
+                    .par_iter()
+                    .flat_map_iter(|guard| guard.iter().map(|(key, value)| project(key, value))),
+            );
+            return epoch;
+        }
+        for guard in &guards {
+            items.extend(guard.iter().map(|(key, value)| project(key, value)));
+        }
+        epoch
+    }
+
+    fn collect_with<T, F>(&self, project: F) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(&K, &V) -> T + Send + Sync,
+    {
+        // Declare user-owned output before the gate so serial collection unwind
+        // drops its partial values only after releasing the builder.
+        let mut items = Vec::new();
+        let _builder = self
+            .snapshot_build_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.collect_into(&mut items, project);
         items
     }
 
@@ -583,21 +626,26 @@ where
         if let Some(snapshot) = self.cached_snapshot() {
             return snapshot;
         }
-        let routing = std_write_guard(&self.routing_lock, "routing_snapshot_build");
-        // Another snapshot may have filled the cache before routing was acquired.
+        let mut items = Vec::new();
+        // Coalesce expensive cache misses independently of routing. Acquiring
+        // this before routing also prevents queued builders from pinning it.
+        let builder = self
+            .snapshot_build_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(snapshot) = self.cached_snapshot() {
             return snapshot;
         }
-        let epoch = self.write_epoch.load(Ordering::Acquire);
-        let items = Arc::new(self.collect_items());
+        let epoch = self.collect_into(&mut items, |key, value| (key.clone(), value.clone()));
+        let items = Arc::new(items);
         let retired = if self.snapshot_mode != SnapshotMode::Clone {
             std_write_guard(&self.snapshot_cache, "snapshot_cache").replace((epoch, items.clone()))
         } else {
             None
         };
-        drop(routing);
-        // A retired Vec may own expensive user destructors. Neither the cache
-        // nor routing lock is held while releasing it.
+        // A concurrent writer after collection can make this pair obsolete,
+        // but its captured epoch ensures no future hit mislabels it as current.
+        drop(builder);
         drop(retired);
         (epoch, items)
     }
@@ -612,8 +660,7 @@ where
     /// are cloned after releasing routing; Clone mode moves its newly built Vec.
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
         let items = if self.snapshot_mode == SnapshotMode::Clone {
-            let _routing = std_write_guard(&self.routing_lock, "routing_snapshot_build");
-            self.collect_items()
+            self.collect_with(|key, value| (key.clone(), value.clone()))
         } else {
             Arc::unwrap_or_clone(self.capture_snapshot().1)
         };
@@ -622,22 +669,12 @@ where
 
     /// Returns key copies without cloning values.
     pub fn keys(&self) -> impl Iterator<Item = K> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_keys");
-        let mut keys = Vec::with_capacity(self.len());
-        for shard in self.all_shards() {
-            keys.extend(std_read_guard(&shard, "keys").keys().cloned());
-        }
-        keys.into_iter()
+        self.collect_with(|key, _| key.clone()).into_iter()
     }
 
     /// Returns value copies without cloning keys.
     pub fn values(&self) -> impl Iterator<Item = V> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_values");
-        let mut values = Vec::with_capacity(self.len());
-        for shard in self.all_shards() {
-            values.extend(std_read_guard(&shard, "values").values().cloned());
-        }
-        values.into_iter()
+        self.collect_with(|_, value| value.clone()).into_iter()
     }
 
     /// Starts incremental migration. Normal operations can access both

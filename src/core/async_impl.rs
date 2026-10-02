@@ -3,6 +3,8 @@
 //! Mirrors the synchronous [`super::sync_impl`] module but uses Tokio
 //! `RwLock`/`Mutex` for non-blocking concurrency. Operations pin shard routing
 //! while looking up and locking data, so directory changes cannot invalidate indices.
+//! Snapshot builders retain ordered shard read locks under shared routing,
+//! allowing other readers to proceed while source data remains stable.
 //!
 //! # Additional async-only features
 //!
@@ -53,6 +55,7 @@ where
             total_len: Arc::new(AtomicUsize::new(0)),
             write_epoch: Arc::new(AtomicU64::new(0)),
             snapshot_cache: Arc::new(StdRwLock::new(None)),
+            snapshot_build_lock: Arc::new(TokioMutex::new(())),
             routing_lock: Arc::new(TokioRwLock::new(())),
             rebalance_lock: Arc::new(TokioMutex::new(())),
             rebalance_tracker: Arc::new(RebalanceTracker::new()),
@@ -251,54 +254,58 @@ where
         }
     }
 
-    /// Collect stable data while the caller holds routing exclusively. Each
-    /// key/value is cloned once; no synchronous Rayon work blocks Tokio workers.
-    async fn collect_with<T>(&self, mut project: impl FnMut(&K, &V) -> T) -> Vec<T> {
-        let active: Vec<_> = self.shards.read().await.iter().flatten().cloned().collect();
-        let previous: Vec<_> = self
-            .previous_shards
-            .read()
-            .await
-            .as_ref()
-            .map(|slots| slots.iter().flatten().cloned().collect())
-            .unwrap_or_default();
-        let mut active_guards = Vec::with_capacity(active.len());
-        for shard in active {
-            active_guards.push(shard.read_owned().await);
+    /// Freeze all existing shards while allowing concurrent reads. The caller
+    /// holds the builder gate and owns output before acquiring that gate, so
+    /// unwinding drops successfully collected output entries after the map locks.
+    /// Temporaries inside user Clone implementations still obey those implementations.
+    async fn collect_into<T>(
+        &self,
+        output: &mut Vec<T>,
+        mut project: impl FnMut(&K, &V) -> T,
+    ) -> u64 {
+        let _routing = self.routing_lock.read().await;
+        // Keep empty slots stable too: a cold-shard insertion must wait until
+        // this snapshot has captured both its data and mutation version.
+        let active = self.shards.read().await;
+        let previous = self.previous_shards.read().await;
+        let initialized = active.iter().flatten().count()
+            + previous
+                .as_ref()
+                .map_or(0, |slots| slots.iter().flatten().count());
+        let mut guards = Vec::with_capacity(initialized);
+        // Transactions and promotion acquire active shards before previous
+        // shards. Matching that order prevents cycles with their write locks.
+        for shard in active.iter().flatten() {
+            guards.push(shard.read().await);
         }
-        let mut previous_guards = Vec::with_capacity(previous.len());
-        for shard in previous {
-            previous_guards.push(shard.read_owned().await);
+        if let Some(previous) = previous.as_ref() {
+            for shard in previous.iter().flatten() {
+                guards.push(shard.read().await);
+            }
         }
-        if previous_guards.is_empty() {
-            return active_guards
-                .iter()
-                .flat_map(|map| map.iter())
-                .map(|(key, value)| project(key, value))
-                .collect();
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        output.reserve_exact(guards.iter().map(|guard| guard.len()).sum());
+        // Promotion removes the old entry while holding both shard locks;
+        // freezing both generations makes each logical key appear exactly once.
+        for guard in &guards {
+            for (key, value) in guard.iter() {
+                output.push(project(key, value));
+            }
         }
-        let mut merged = HashMap::with_capacity_and_hasher(
-            self.total_len.load(Ordering::Relaxed),
-            self.hasher.clone(),
-        );
-        for guard in previous_guards.iter().chain(&active_guards) {
-            merged.extend(guard.iter());
-        }
-        merged
-            .into_iter()
-            .map(|(key, value)| project(key, value))
-            .collect()
+        epoch
     }
 
-    async fn collect_snapshot(&self) -> Vec<(K, V)> {
-        self.collect_with(|key, value| (key.clone(), value.clone()))
-            .await
+    async fn collect_with<T>(&self, project: impl FnMut(&K, &V) -> T) -> Vec<T> {
+        let mut output = Vec::new();
+        let _builder = self.snapshot_build_lock.lock().await;
+        self.collect_into(&mut output, project).await;
+        output
     }
 
     /// Validate immutable cached data without consulting or locking routing.
     /// A concurrent write may linearize after this epoch check; a completed write
-    /// publishes its new epoch before releasing its shard lock. Misses rebuild
-    /// under exclusive routing, keeping cached data and its epoch consistent.
+    /// publishes its new epoch before releasing its shard lock. Misses acquire
+    /// all shard read locks and capture data together with its mutation version.
     async fn capture_snapshot(&self) -> CapturedSnapshot<K, V> {
         if self.cache_enabled() {
             // Cache hits do not otherwise touch Tokio resources. Preserve
@@ -312,10 +319,13 @@ where
                 return (epoch, entries.clone());
             }
         }
-        let _routing = self.routing_lock.write().await;
+        // Declare owned data before the gate so Clone panics release the gate
+        // before destroying any successfully collected entries.
+        let mut output = Vec::new();
+        let _builder = self.snapshot_build_lock.lock().await;
         // Recheck after locking: another snapshot may already have rebuilt
         // the cache, or a writer may have advanced the epoch while we waited.
-        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        let epoch = self.write_epoch.load(Ordering::Acquire);
         if self.cache_enabled() {
             let cached = std_read_guard(&self.snapshot_cache, "async_snapshot_cache");
             if let Some((cached_epoch, entries)) = cached.as_ref()
@@ -324,15 +334,19 @@ where
                 return (epoch, entries.clone());
             }
         }
-        let entries = Arc::new(self.collect_snapshot().await);
+        let epoch = self
+            .collect_into(&mut output, |key, value| (key.clone(), value.clone()))
+            .await;
+        let entries = Arc::new(output);
         let retired = if self.cache_enabled() {
             std_write_guard(&self.snapshot_cache, "async_snapshot_cache")
                 .replace((epoch, entries.clone()))
         } else {
             None
         };
-        // Final destruction of a large old snapshot must not block all writers.
-        drop(_routing);
+        // Retired entries may run user destructors, so release the builder gate
+        // as well as the already released routing and shard guards first.
+        drop(_builder);
         drop(retired);
         (epoch, entries)
     }
@@ -809,7 +823,7 @@ where
 
     /// Materialize a consistent snapshot across active and previous shards.
     ///
-    /// Snapshot construction pins routing exclusively. `Cached` and `Cow` reuse
+    /// Snapshot construction holds all shard read locks. `Cached` and `Cow` reuse
     /// an immutable versioned snapshot until the next write; cache hits use only
     /// the snapshot cache lock. Returning an owned Vec clones cached entries after
     /// routing is released. Use `shared_snapshot()` to share them without cloning.
@@ -818,8 +832,8 @@ where
         if self.cache_enabled() {
             Arc::unwrap_or_clone(self.capture_snapshot().await.1)
         } else {
-            let _routing = self.routing_lock.write().await;
-            self.collect_snapshot().await
+            self.collect_with(|key, value| (key.clone(), value.clone()))
+                .await
         }
     }
 
@@ -1263,7 +1277,6 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn keys(&self) -> Vec<K> {
-        let _routing = self.routing_lock.write().await;
         self.collect_with(|key, _| key.clone()).await
     }
 
@@ -1274,7 +1287,6 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn values(&self) -> Vec<V> {
-        let _routing = self.routing_lock.write().await;
         self.collect_with(|_, value| value.clone()).await
     }
 
