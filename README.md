@@ -243,6 +243,8 @@ cargo bench --bench bench_main -- snapshot_modes
 cargo bench --bench bench_main -- shared_snapshot
 cargo bench --bench bench_main -- concurrent_read_paths
 cargo bench --bench bench_main -- concurrent_cached_snapshot
+cargo bench --all-features --bench bench_main -- snapshot_rebuild
+cargo bench --all-features --bench bench_main -- batch_mutations
 ```
 
 Criterion reports batch timing and throughput here. These benchmarks do not measure individual-operation p99 latency, allocations, peak memory, or migration pause bounds; those require separate workload instrumentation.

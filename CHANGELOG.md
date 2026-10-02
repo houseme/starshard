@@ -51,6 +51,7 @@ All notable changes to this project will be documented in this file.
 
 ### Benchmarks and documentation
 
+- Add sync/async stable and migrating snapshot-rebuild benchmarks plus batch insertion/removal workloads, with setup, invalidation, input generation, and output destruction outside timing.
 - Add persistent-worker comparisons of ordinary reads, projected reads, initialization hits, and fixed-batch cached-snapshot/read mixtures; document cache-hit versus rebuild locking boundaries.
 - Pre-generate benchmark keys and reuse worker threads; cover thread counts, skewed key distributions, value sizes, write ratios, owned snapshots, and shared cache hits.
 - Strengthen the locked feature matrix with isolated lifecycle, advanced, async, and async-combination lanes.

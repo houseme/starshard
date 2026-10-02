@@ -362,6 +362,182 @@ fn bench_shared_snapshots(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_snapshot_rebuild(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_rebuild");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for count in [64, KEY_COUNT] {
+        for migrating in [false, true] {
+            for (name, mode) in [
+                ("clone", SnapshotMode::Clone),
+                ("cached", SnapshotMode::Cached),
+            ] {
+                let map = ShardedHashMap::with_snapshot_mode(64, mode);
+                map.batch_insert((0..count).map(|key| (key, [42_u8; 32])));
+                if migrating {
+                    map.start_rebalance_online(128).unwrap();
+                    map.advance_rebalance(16);
+                }
+                black_box(map.shared_snapshot());
+                let state = if migrating { "migrating" } else { "stable" };
+                group.throughput(Throughput::Elements(count as u64));
+                group.bench_function(BenchmarkId::new(format!("{name}_{state}"), count), |b| {
+                    b.iter_batched(
+                        || {
+                            // Force a rebuild for every measured snapshot. PerIteration
+                            // prevents batched setup from turning later samples into hits.
+                            map.insert(0, [42_u8; 32]);
+                        },
+                        |()| black_box(map.shared_snapshot()),
+                        // Invalidation and returned snapshot destruction are unmeasured.
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
+fn bench_batch_mutations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_mutations");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for count in [64_usize, 1024] {
+        let entries: Vec<_> = (0..count).map(|key| (key, [42_u8; 32])).collect();
+        let keys: Vec<_> = (0..count).collect();
+        for shards in [1, 64] {
+            group.throughput(Throughput::Elements(count as u64));
+            group.bench_function(BenchmarkId::new(format!("insert_s{shards}"), count), |b| {
+                b.iter_batched(
+                    || (ShardedHashMap::new(shards), entries.clone()),
+                    |(map, entries)| {
+                        let inserted = black_box(map.batch_insert(black_box(entries)));
+                        // Keep map teardown outside the measured operation.
+                        (map, inserted)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+            group.bench_function(BenchmarkId::new(format!("remove_s{shards}"), count), |b| {
+                b.iter_batched(
+                    || {
+                        let map = ShardedHashMap::new(shards);
+                        map.batch_insert(entries.clone());
+                        (map, keys.clone())
+                    },
+                    |(map, keys)| {
+                        let removed = black_box(map.batch_remove(black_box(keys)));
+                        (map, removed)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+#[cfg(feature = "async")]
+fn bench_async_snapshot_rebuild(c: &mut Criterion) {
+    use starshard::AsyncShardedHashMap;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("async_snapshot_rebuild");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for count in [64, KEY_COUNT] {
+        for migrating in [false, true] {
+            for (name, mode) in [
+                ("clone", SnapshotMode::Clone),
+                ("cached", SnapshotMode::Cached),
+            ] {
+                let map = AsyncShardedHashMap::with_snapshot_mode(64, mode);
+                runtime.block_on(async {
+                    map.batch_insert((0..count).map(|key| (key, [42_u8; 32])))
+                        .await;
+                    if migrating {
+                        map.start_rebalance_online(128).await.unwrap();
+                        map.advance_rebalance(16).await;
+                    }
+                    black_box(map.shared_snapshot().await);
+                });
+                let state = if migrating { "migrating" } else { "stable" };
+                group.throughput(Throughput::Elements(count as u64));
+                group.bench_function(BenchmarkId::new(format!("{name}_{state}"), count), |b| {
+                    b.iter_batched(
+                        || {
+                            runtime.block_on(map.insert(0, [42_u8; 32]));
+                        },
+                        // Includes current-thread runtime entry; no task is spawned.
+                        |()| black_box(runtime.block_on(map.shared_snapshot())),
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "async"))]
+fn bench_async_snapshot_rebuild(_: &mut Criterion) {}
+
+#[cfg(feature = "async")]
+fn bench_async_batch_mutations(c: &mut Criterion) {
+    use starshard::AsyncShardedHashMap;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("async_batch_mutations");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for count in [64_usize, 1024] {
+        let entries: Vec<_> = (0..count).map(|key| (key, [42_u8; 32])).collect();
+        let keys: Vec<_> = (0..count).collect();
+        for shards in [1, 64] {
+            group.throughput(Throughput::Elements(count as u64));
+            group.bench_function(BenchmarkId::new(format!("insert_s{shards}"), count), |b| {
+                b.iter_batched(
+                    || (AsyncShardedHashMap::new(shards), entries.clone()),
+                    |(map, entries)| {
+                        let inserted =
+                            black_box(runtime.block_on(map.batch_insert(black_box(entries))));
+                        (map, inserted)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+            group.bench_function(BenchmarkId::new(format!("remove_s{shards}"), count), |b| {
+                b.iter_batched(
+                    || {
+                        let map = AsyncShardedHashMap::new(shards);
+                        runtime.block_on(map.batch_insert(entries.clone()));
+                        (map, keys.clone())
+                    },
+                    |(map, keys)| {
+                        let removed =
+                            black_box(runtime.block_on(map.batch_remove(black_box(keys))));
+                        (map, removed)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "async"))]
+fn bench_async_batch_mutations(_: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_insert,
@@ -371,5 +547,9 @@ criterion_group!(
     bench_concurrent_cached_snapshots,
     bench_snapshot_modes,
     bench_shared_snapshots,
+    bench_snapshot_rebuild,
+    bench_batch_mutations,
+    bench_async_snapshot_rebuild,
+    bench_async_batch_mutations,
 );
 criterion_main!(benches);
