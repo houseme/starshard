@@ -3,7 +3,7 @@
 ## 1. 适用范围
 
 - 1.x 系列：`1.0.0` ~ `1.2.x`
-- 2.x 系列：`2.0.0` ~ `2.3.x`
+- 2.x 系列：`2.0.0` ~ `2.4.x`
 
 本文聚焦**使用层面**差异与迁移建议，不展开内部重构细节。
 
@@ -99,18 +99,31 @@ let map: ShardedHashMap<String, i32> =
 
 这些变化通常对调用方透明。
 
+### 4.5 从 2.3.x 升级到 2.4.0
+
+原有 CRUD 和 Entry 签名继续保留，新增 `shared_snapshot()`、`get_borrowed`、`contains_borrowed`、`remove_borrowed` 与 `read_with`。
+
+- `versioned_snapshot()` 和 `snapshot_at_version()` 使用已提交数据的 epoch。无写入时重复快照版本相同，应直接查询返回的版本，不再加一。Map 不保留历史版本，epoch 也不是操作计数器。
+- `Cached` 与 `Cow` 共用惰性的全 map 缓存。有效命中绕过 routing，重建使用独立构建锁和有序分片读锁。普通读取可继续，但受锁公平性约束；写入和拓扑切换仍可能等待。使用共享句柄可避免复制拥有所有权的输出。
+- 事务使用有序分片锁进行悲观协调，不是 MVCC；快照和迁移修复确保新旧两代中的逻辑键保持一致。
+- 复制的 `replica_count` 和 `write_quorum` 包含 primary：两个远端副本加一个 primary 应使用 `QuorumConfig::strict(3)` 或 `majority(3)`。需要处理配置错误时优先使用 `try_with_replication`；`with_replication` 遇到无效拓扑或配置会 panic。
+- 复制操作对排队、本地修改和远端 fanout 使用统一截止时间。成功表示达到 quorum，剩余复制任务受跟踪和超时约束，后续复制写入等待其清理完成。错误或取消不会回滚已应用的本地或远端写入。读取仍是本地读取，未提供共识或 read quorum。配置复制功能时，Tokio runtime 需要启用 time driver。
+- `lock_profiles()` 在真实采样实现前返回空结果。TTL/淘汰配置及独立指标类型不会自动启用后台调度器。
+
+升级后应验证实际使用的 feature 组合，并重新测量业务延迟、吞吐和内存。分配与哈希次数减少不代表所有负载的吞吐或 p99 都会改善。
+
 ## 5. Feature Flag 提醒
 
 从早期 1.x 升级时，建议重新确认 `Cargo.toml` 的 feature 组合：
 
 ```toml
 [dependencies]
-starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. 迁移清单
 
-1. 升级依赖到 2.x（建议 `2.3.x`）。
+1. 升级依赖到 2.x（建议 `2.4.x`）。
 2. 检查构造入口：
    - 外部输入参数 -> 用 `try_with_*`
    - 内部固定参数 -> 继续兼容构造器即可

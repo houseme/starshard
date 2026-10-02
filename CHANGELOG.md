@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-02
+
+### Upgrade notes
+
+- Existing CRUD signatures and `ReplicaError` variants are retained. Review the [2.3.x upgrade guide](MIGRATION-1X-TO-2X.md#45-upgrading-from-23x-to-240) for corrected snapshot-version semantics, stricter replication validation, and snapshot locking tradeoffs.
+- Release evidence includes deterministic concurrency, allocation, hashing, and metadata-publication checks. General throughput, p99, cross-platform runtime behavior, and real replica failures must be validated for the deployment workload.
+
 ### Fixed
 
 - Pin shard routing for each operation so resize cannot invalidate in-flight indices, and serialize migration publication while keeping source entries reachable until commit.

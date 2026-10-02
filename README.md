@@ -18,21 +18,26 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Current crate version: `2.3.0`. Unreleased fixes and API changes are listed in [CHANGELOG.md](CHANGELOG.md).
+Current crate version: `2.4.0`. Release changes are listed in [CHANGELOG.md](CHANGELOG.md#240---2026-10-02).
 
-Roadmap capabilities shipped through `v2.3.0`:
+Roadmap capabilities shipped through `v2.4.0`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
 - Snapshot modes (`Clone`, `Cached`, `Cow`) with epoch-based cache invalidation.
 - Patch-level dependency hygiene: the `async` feature no longer forces Tokio's multi-thread runtime.
 - Entry-style and get-or-create APIs for atomic per-key initialization in sync and async maps.
+- Migration-safe conditional operations, CAS, transactions, and complete snapshots of both shard generations.
+- Shared snapshot handles and borrowed-key reads, with rebuilds that allow ordinary readers to progress.
+- Per-shard batch metadata publication and primary-inclusive, bounded, ordered replication.
+
+Upgrading from 2.3.x: snapshot versions now identify committed data, and invalid replication topologies are rejected. Review the [2.4 upgrade notes](MIGRATION-1X-TO-2X.md#45-upgrading-from-23x-to-240) before using advanced APIs. Performance improvements are supported by operation/allocation counts; workload-specific throughput and p99 still require measurement.
 
 ## Installation
 
 ```toml
 [dependencies]
-starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # minimal:
-# starshard = "2.3.0"
+# starshard = "2.4.0"
 ```
 
 ## 5-Minute Path

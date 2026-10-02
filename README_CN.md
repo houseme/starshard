@@ -17,21 +17,26 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-当前 crate 版本为 `2.3.0`。未发布的修复与 API 变更记录在 [CHANGELOG.md](CHANGELOG.md)。
+当前 crate 版本为 `2.4.0`。发布变更记录在 [CHANGELOG.md](CHANGELOG.md#240---2026-10-02)。
 
-截至 `v2.3.0` 已交付的 Roadmap 主能力：
+截至 `v2.4.0` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
 - 快照模式（`Clone` / `Cached` / `Cow`）及基于 epoch 的缓存失效机制。
 - Patch 级依赖治理：`async` feature 不再强制启用 Tokio 多线程运行时。
 - 同步/异步 map 都支持 Entry 风格和 get-or-create 原子初始化 API。
+- 迁移期间的条件操作、CAS、事务保持一致性，快照覆盖新旧两代分片。
+- 共享快照句柄与借用键查询，快照重建允许普通读取继续。
+- 按分片汇总批量元数据，以及计入 primary、受超时约束并保持顺序的复制。
+
+从 2.3.x 升级时，快照版本改为标识已提交数据，无效复制拓扑会被拒绝。使用高级 API 前请阅读 [2.4 升级说明](MIGRATION-1X-TO-2X_CN.md#45-从-23x-升级到-240)。本轮优化有操作次数与分配次数证据，具体负载的吞吐和 p99 仍需实测。
 
 ## 安装
 
 ```toml
 [dependencies]
-starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小依赖：
-# starshard = "2.3.0"
+# starshard = "2.4.0"
 ```
 
 ## 5 分钟上手路径

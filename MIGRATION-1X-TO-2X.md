@@ -3,7 +3,7 @@
 ## 1. Scope
 
 - 1.x line: `1.0.0` to `1.2.x`
-- 2.x line: `2.0.0` to `2.3.x`
+- 2.x line: `2.0.0` to `2.4.x`
 
 This document focuses on **usage-level** differences and migration guidance.
 
@@ -99,18 +99,31 @@ let map: ShardedHashMap<String, i32> =
 
 These are mostly transparent to callers.
 
+### 4.5 Upgrading from 2.3.x to 2.4.0
+
+Existing CRUD and Entry signatures remain available. New APIs include `shared_snapshot()`, `get_borrowed`, `contains_borrowed`, `remove_borrowed`, and `read_with`.
+
+- `versioned_snapshot()` and `snapshot_at_version()` use the committed data epoch. Repeated snapshots without writes have the same version; query the returned version directly, without adding one. Historical versions are not retained, and epochs are not operation counters.
+- `Cached` and `Cow` share a lazy whole-map cache. Valid hits bypass routing; rebuilds use a dedicated builder gate and ordered shard read locks. Ordinary reads can proceed subject to lock fairness, while writers and topology changes may wait. Use shared handles to avoid owned-output copies.
+- Transactions are pessimistic operations over ordered shard locks, not MVCC. Snapshot and migration fixes preserve the same logical keys across both generations.
+- Replication counts the primary in `replica_count` and `write_quorum`: two remote replicas plus one primary use `QuorumConfig::strict(3)` or `majority(3)`. Prefer `try_with_replication` for recoverable validation; `with_replication` panics on invalid topology or configuration.
+- Replicated operations use one deadline for queueing, local application, and remote fanout. Success acknowledges quorum; remaining fanout is tracked and bounded, and later replicated writes wait for its cleanup. Errors or cancellation do not roll back already-applied local or remote writes. Reads remain local; no consensus or read quorum is implemented. Configured replication requires a Tokio runtime with its time driver enabled.
+- `lock_profiles()` returns no samples until real instrumentation exists. TTL/eviction configuration and standalone metrics do not enable an autonomous scheduler.
+
+Run the feature combinations you deploy and remeasure workload-specific latency, throughput, and memory. Allocation/hash reductions are not a universal throughput or p99 guarantee.
+
 ## 5. Feature Flag Reminder
 
 If migrating from early 1.x, re-check `Cargo.toml` feature selection:
 
 ```toml
 [dependencies]
-starshard = { version = "2.3.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. Migration Checklist
 
-1. Upgrade dependency to 2.x (recommended: `2.3.x`).
+1. Upgrade dependency to 2.x (recommended: `2.4.x`).
 2. Review constructor entry points:
    - external input -> use `try_with_*`
    - fixed internal params -> compatibility constructors are fine
