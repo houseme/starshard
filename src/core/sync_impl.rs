@@ -215,7 +215,7 @@ where
         if removed != 0 {
             self.total_len.fetch_sub(removed, Ordering::Relaxed);
         }
-        self.write_epoch.fetch_add(1, Ordering::Relaxed);
+        self.write_epoch.fetch_add(1, Ordering::Release);
     }
 
     fn all_shards(&self) -> Vec<StdShard<K, V, S>> {
@@ -568,39 +568,58 @@ where
         items
     }
 
-    fn shared_snapshot_inner(&self) -> Arc<Vec<(K, V)>> {
-        let epoch = self.write_epoch.load(Ordering::Relaxed);
-        if self.snapshot_mode != SnapshotMode::Clone {
-            let cache = std_read_guard(&self.snapshot_cache, "snapshot_cache");
-            if let Some((version, data)) = cache.as_ref()
-                && *version == epoch
-            {
-                return data.clone();
-            }
+    // Immutable cached data does not reference either shard directory. A
+    // matching epoch is a read linearization point even while a topology-only
+    // migration holds routing exclusively. Writers publish before shard unlock.
+    fn cached_snapshot(&self) -> Option<CapturedSnapshot<K, V>> {
+        if self.snapshot_mode == SnapshotMode::Clone {
+            return None;
         }
+        // Capturing only an epoch and Arc is a tiny critical section. Serialize
+        // that capture instead of contending on both a shared-reader count and
+        // the snapshot Arc count across cores; no routing lock is involved.
+        let cache = std_write_guard(&self.snapshot_cache, "snapshot_cache_capture");
+        let (epoch, data) = cache.as_ref()?;
+        (*epoch == self.write_epoch.load(Ordering::Acquire)).then(|| (*epoch, data.clone()))
+    }
+
+    fn capture_snapshot(&self) -> CapturedSnapshot<K, V> {
+        if let Some(snapshot) = self.cached_snapshot() {
+            return snapshot;
+        }
+        let routing = std_write_guard(&self.routing_lock, "routing_snapshot_build");
+        // Another snapshot may have filled the cache before routing was acquired.
+        if let Some(snapshot) = self.cached_snapshot() {
+            return snapshot;
+        }
+        let epoch = self.write_epoch.load(Ordering::Acquire);
         let items = Arc::new(self.collect_items());
-        if self.snapshot_mode != SnapshotMode::Clone {
-            let old = std_write_guard(&self.snapshot_cache, "snapshot_cache")
-                .replace((epoch, items.clone()));
-            drop(old);
-        }
-        items
+        let retired = if self.snapshot_mode != SnapshotMode::Clone {
+            std_write_guard(&self.snapshot_cache, "snapshot_cache").replace((epoch, items.clone()))
+        } else {
+            None
+        };
+        drop(routing);
+        // A retired Vec may own expensive user destructors. Neither the cache
+        // nor routing lock is held while releasing it.
+        drop(retired);
+        (epoch, items)
     }
 
-    /// Returns a stable shared snapshot. Cached/Cow modes reuse the same Arc
-    /// until a write; Clone mode rebuilds it. Building pauses map operations.
+    /// Returns a stable shared snapshot. Cached/Cow hits validate an immutable
+    /// cache without routing access; only missing or stale data needs rebuilding.
     pub fn shared_snapshot(&self) -> Arc<Vec<(K, V)>> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_snapshot");
-        self.shared_snapshot_inner()
+        self.capture_snapshot().1
     }
 
-    /// Iterates owned key/value copies from a stable snapshot.
+    /// Iterates owned key/value copies from a stable snapshot. Cached entries
+    /// are cloned after releasing routing; Clone mode moves its newly built Vec.
     pub fn iter(&self) -> impl Iterator<Item = (K, V)> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_snapshot");
         let items = if self.snapshot_mode == SnapshotMode::Clone {
+            let _routing = std_write_guard(&self.routing_lock, "routing_snapshot_build");
             self.collect_items()
         } else {
-            self.shared_snapshot_inner().as_ref().clone()
+            Arc::unwrap_or_clone(self.capture_snapshot().1)
         };
         items.into_iter()
     }
@@ -891,30 +910,26 @@ where
     /// Returns an immutable shared snapshot tagged with its committed write epoch.
     #[cfg(feature = "advanced")]
     pub fn cow_snapshot(&self) -> CowSnapshot<K, V> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_snapshot");
-        CowSnapshot::from_arc(
-            self.shared_snapshot_inner(),
-            self.write_epoch.load(Ordering::Relaxed),
-        )
+        let (version, data) = self.capture_snapshot();
+        CowSnapshot::from_arc(data, version)
     }
 
     /// Captures the current data version. Repeated snapshots without writes have
     /// the same version. Historical versions are not retained by the map.
     #[cfg(feature = "advanced")]
     pub fn versioned_snapshot(&self) -> IsolatedSnapshot<K, V> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_snapshot");
-        IsolatedSnapshot::from_arc(
-            self.write_epoch.load(Ordering::Relaxed),
-            self.shared_snapshot_inner(),
-        )
+        let (version, data) = self.capture_snapshot();
+        IsolatedSnapshot::from_arc(version, data)
     }
 
     /// Returns the current snapshot only when `version` equals its write epoch.
     #[cfg(feature = "advanced")]
     pub fn snapshot_at_version(&self, version: u64) -> Option<IsolatedSnapshot<K, V>> {
-        let _routing = std_write_guard(&self.routing_lock, "routing_snapshot");
-        (version == self.write_epoch.load(Ordering::Relaxed))
-            .then(|| IsolatedSnapshot::from_arc(version, self.shared_snapshot_inner()))
+        if version != self.write_epoch.load(Ordering::Acquire) {
+            return None;
+        }
+        let (captured, data) = self.capture_snapshot();
+        (version == captured).then(|| IsolatedSnapshot::from_arc(captured, data))
     }
 
     /// Lock timing instrumentation is not implemented; returns no samples.

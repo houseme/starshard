@@ -18,12 +18,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Build Cached/Cow snapshots lazily instead of cloning entire shards on each write. Snapshot construction now pauses map operations for a consistent view; both modes currently use a whole-map cache.
+- Serve valid Cached/Cow snapshots without acquiring routing, validating the immutable data and write epoch together. Sync handle capture uses a short cache critical section to avoid shared-reader/refcount contention.
+- Clone owned cached iteration results and destroy retired cached values after releasing routing. Reject obsolete snapshot versions without rebuilding, while retaining Tokio cooperative scheduling for cache hits and early version misses.
+- Build Cached/Cow snapshots lazily instead of cloning entire shards on each write. Cache misses pause map operations to build a consistent view; both modes currently use a whole-map cache.
 - Use read access for initialized shard directories, avoid allocating shards for read misses, clone async snapshot entries once, and collect keys/values without copying the unused counterpart.
 - Return no lock profiling samples until actual instrumentation exists, rather than fabricated zero measurements.
 
 ### Tests
 
+- Cover cached reads during exclusive topology changes, invalidated-cache waits, coherent transaction snapshots, writer progress during value cloning/destruction outside routing, and current-thread Tokio scheduling fairness.
 - Add sync/async regressions for migration interleavings, shrinking, atomic initialization, CAS/transactions, cancellation, panic recovery, lazy producer reentry, snapshot versions, and clone counts.
 
 ### Replication

@@ -178,7 +178,9 @@ Semantics:
 - `Cached`: reuse a versioned, shared whole-map snapshot until the next write.
 - `Cow`: currently uses the same lazy shared snapshot cache as `Cached`. Writes invalidate the cache without cloning an entire shard; the next snapshot request rebuilds it.
 
-`iter()` returns owned entries and therefore still clones entries from a shared cache. Use `shared_snapshot()` to obtain an `Arc<Vec<(K, V)>>` and read repeated snapshots without copying their entries. Existing snapshot handles remain immutable after later writes. With `advanced`, `cow_snapshot()` also exposes a shared view and its data version.
+Valid `Cached`/`Cow` hits validate the data epoch under a short cache lock, without acquiring routing. Missing or stale snapshots still require an exclusive rebuild. Cached reads can finish during topology-only migration; they are not lock-free. Async cache reads preserve Tokio's cooperative task budget.
+
+`iter()` returns owned entries and therefore still clones entries from a shared cache, after releasing routing. Replaced cached data is also destroyed outside routing. Use `shared_snapshot()` to obtain an `Arc<Vec<(K, V)>>` and read repeated snapshots without copying their entries. Existing snapshot handles remain immutable after later writes. With `advanced`, `cow_snapshot()` also exposes a shared view and its data version.
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -202,7 +204,7 @@ let cow_map: ShardedHashMap<String, i32> =
 ## Consistency Model
 
 - Per-shard operations are linearizable for that shard.
-- Snapshot capture excludes concurrent mutation and directory changes, producing a stable view of both active and previous shards. An unchanged cached snapshot can be shared without recopying its entries.
+- Snapshot rebuilding excludes concurrent mutation and directory changes, producing a stable view of both active and previous shards. A matching immutable cache is returned without routing access; its data and epoch are captured together.
 - During online rebalance, active-first + previous-fallback keeps key reachability.
 - Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks must not reenter the same map while its locks are held.
 

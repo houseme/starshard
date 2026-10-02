@@ -198,7 +198,7 @@ where
     /// Publish mutation metadata before releasing its shard lock or awaiting again.
     /// Cached snapshots are rebuilt lazily, avoiding copies on the write path.
     fn on_structural_write(&self) {
-        self.write_epoch.fetch_add(1, Ordering::Relaxed);
+        self.write_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Lock active before previous, then promote the key without an await point.
@@ -295,9 +295,26 @@ where
             .await
     }
 
-    /// Return an immutable epoch-tagged snapshot. Routing is held exclusively by
-    /// the caller, so cache publication cannot race a writer or a newer snapshot.
-    async fn snapshot_with_epoch(&self) -> (u64, Arc<Vec<(K, V)>>) {
+    /// Validate immutable cached data without consulting or locking routing.
+    /// A concurrent write may linearize after this epoch check; a completed write
+    /// publishes its new epoch before releasing its shard lock. Misses rebuild
+    /// under exclusive routing, keeping cached data and its epoch consistent.
+    async fn capture_snapshot(&self) -> CapturedSnapshot<K, V> {
+        if self.cache_enabled() {
+            // Cache hits do not otherwise touch Tokio resources. Preserve
+            // cooperative scheduling without holding a lock across this await.
+            tokio::task::coop::consume_budget().await;
+            let cached = std_read_guard(&self.snapshot_cache, "async_snapshot_cache");
+            let epoch = self.write_epoch.load(Ordering::Acquire);
+            if let Some((cached_epoch, entries)) = cached.as_ref()
+                && *cached_epoch == epoch
+            {
+                return (epoch, entries.clone());
+            }
+        }
+        let _routing = self.routing_lock.write().await;
+        // Recheck after locking: another snapshot may already have rebuilt
+        // the cache, or a writer may have advanced the epoch while we waited.
         let epoch = self.write_epoch.load(Ordering::Relaxed);
         if self.cache_enabled() {
             let cached = std_read_guard(&self.snapshot_cache, "async_snapshot_cache");
@@ -308,11 +325,15 @@ where
             }
         }
         let entries = Arc::new(self.collect_snapshot().await);
-        if self.cache_enabled() {
-            let old = std_write_guard(&self.snapshot_cache, "async_snapshot_cache")
-                .replace((epoch, entries.clone()));
-            drop(old);
-        }
+        let retired = if self.cache_enabled() {
+            std_write_guard(&self.snapshot_cache, "async_snapshot_cache")
+                .replace((epoch, entries.clone()))
+        } else {
+            None
+        };
+        // Final destruction of a large old snapshot must not block all writers.
+        drop(_routing);
+        drop(retired);
         (epoch, entries)
     }
 
@@ -789,14 +810,15 @@ where
     /// Materialize a consistent snapshot across active and previous shards.
     ///
     /// Snapshot construction pins routing exclusively. `Cached` and `Cow` reuse
-    /// an immutable versioned snapshot until the next write; returning an owned
-    /// Vec clones cached entries. Use `cow_snapshot()` to share them when available.
+    /// an immutable versioned snapshot until the next write; cache hits use only
+    /// the snapshot cache lock. Returning an owned Vec clones cached entries after
+    /// routing is released. Use `shared_snapshot()` to share them without cloning.
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn iter(&self) -> Vec<(K, V)> {
-        let _routing = self.routing_lock.write().await;
         if self.cache_enabled() {
-            self.snapshot_with_epoch().await.1.as_ref().clone()
+            Arc::unwrap_or_clone(self.capture_snapshot().await.1)
         } else {
+            let _routing = self.routing_lock.write().await;
             self.collect_snapshot().await
         }
     }
@@ -807,8 +829,7 @@ where
     /// mutation version. `Clone` builds a fresh snapshot for each call.
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn shared_snapshot(&self) -> Arc<Vec<(K, V)>> {
-        let _routing = self.routing_lock.write().await;
-        self.snapshot_with_epoch().await.1
+        self.capture_snapshot().await.1
     }
 
     /* ==================== v0.8.0 Async Methods ==================== */
@@ -1198,8 +1219,7 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn cow_snapshot(&self) -> CowSnapshot<K, V> {
-        let _routing = self.routing_lock.write().await;
-        let (epoch, entries) = self.snapshot_with_epoch().await;
+        let (epoch, entries) = self.capture_snapshot().await;
         CowSnapshot::from_arc(entries, epoch)
     }
 
@@ -1210,8 +1230,7 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn versioned_snapshot(&self) -> IsolatedSnapshot<K, V> {
-        let _routing = self.routing_lock.write().await;
-        let (version, entries) = self.snapshot_with_epoch().await;
+        let (version, entries) = self.capture_snapshot().await;
         IsolatedSnapshot::from_arc(version, entries)
     }
 
@@ -1225,14 +1244,12 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn snapshot_at_version(&self, version: u64) -> Option<IsolatedSnapshot<K, V>> {
-        let _routing = self.routing_lock.write().await;
-        if self.write_epoch.load(Ordering::Relaxed) != version {
+        if self.write_epoch.load(Ordering::Acquire) != version {
+            tokio::task::coop::consume_budget().await;
             return None;
         }
-        Some(IsolatedSnapshot::new(
-            version,
-            self.collect_snapshot().await,
-        ))
+        let (epoch, entries) = self.capture_snapshot().await;
+        (epoch == version).then(|| IsolatedSnapshot::from_arc(epoch, entries))
     }
 
     /// Lock timing instrumentation is not implemented; returns no samples.

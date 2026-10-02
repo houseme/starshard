@@ -180,7 +180,8 @@ pub use advanced::{
 };
 
 pub(crate) use crate::core::StdShardVecArc;
-type SnapshotCache<K, V> = Arc<StdRwLock<Option<(u64, Arc<Vec<(K, V)>>)>>>;
+type CapturedSnapshot<K, V> = (u64, Arc<Vec<(K, V)>>);
+type SnapshotCache<K, V> = Arc<StdRwLock<Option<CapturedSnapshot<K, V>>>>;
 
 #[cfg(feature = "async")]
 pub(crate) use crate::core::AsyncShardVecArc;

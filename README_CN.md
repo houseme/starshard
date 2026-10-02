@@ -177,7 +177,9 @@ assert_eq!(m.rebalance_status().state, "idle");
 - `Cached`：复用带版本的全 map 共享快照，写入后失效。
 - `Cow`：目前与 `Cached` 共用惰性共享快照缓存。写入只使缓存失效，不再复制整个分片；下次请求快照时重建。
 
-`iter()` 返回拥有所有权的条目，因此命中共享缓存后仍会复制条目。使用 `shared_snapshot()` 获取 `Arc<Vec<(K, V)>>`，可重复读取快照而不复制条目。后续写入不会改变已有快照句柄的数据。启用 `advanced` 后，`cow_snapshot()` 还提供共享视图及其数据版本。
+有效的 `Cached`/`Cow` 缓存命中只在短暂的缓存锁下校验数据版本，不获取路由锁；缓存缺失或过期时仍需要独占重建。因此有效缓存可在仅调整拓扑的迁移期间返回，但该路径并非无锁。异步缓存读取保留 Tokio 的协作式任务预算。
+
+`iter()` 返回拥有所有权的条目，因此命中共享缓存后仍会复制条目，但复制发生在释放路由锁之后；旧缓存的析构也移到路由锁外。使用 `shared_snapshot()` 获取 `Arc<Vec<(K, V)>>`，可重复读取快照而不复制条目。后续写入不会改变已有快照句柄的数据。启用 `advanced` 后，`cow_snapshot()` 还提供共享视图及其数据版本。
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -201,7 +203,7 @@ let cow_map: ShardedHashMap<String, i32> =
 ## 一致性模型
 
 - 分片内操作是线性化可见的。
-- 快照捕获期间排除并发修改和目录切换，得到覆盖 active 与 previous 分片的稳定视图；无写入时可复用缓存而不重新复制条目。
+- 快照重建期间排除并发修改和目录切换，得到覆盖 active 与 previous 分片的稳定视图；有效的不可变缓存无需访问路由，数据与版本成对捕获。
 - 在线迁移期间，通过 active-first + previous-fallback 保证 key 可达性。
 - 事务按固定顺序获取涉及分片的写锁，采用悲观锁；读写集合不构成 MVCC 冲突检测。持锁期间的回调不得重入同一个 map。
 
