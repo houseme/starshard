@@ -54,11 +54,22 @@ fn sync_cached_snapshot_cache_invalidation() {
     assert_eq!(first.len(), 2);
     assert_eq!(first, second);
     let epoch = m.write_epoch.load(Ordering::Relaxed);
-    assert_eq!(m.snapshot_cache_epoch.load(Ordering::Relaxed), epoch);
+    assert_eq!(
+        m.snapshot_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .unwrap()
+            .0,
+        epoch
+    );
 
     m.insert("c".into(), 3);
     let cache = m.snapshot_cache.read().unwrap_or_else(|e| e.into_inner());
-    assert!(cache.is_none());
+    assert_ne!(
+        cache.as_ref().unwrap().0,
+        m.write_epoch.load(Ordering::Relaxed)
+    );
 }
 
 #[test]
@@ -101,11 +112,22 @@ async fn async_cached_snapshot_cache_invalidation() {
     assert_eq!(first.len(), 2);
     assert_eq!(first, second);
     let epoch = m.write_epoch.load(Ordering::Relaxed);
-    assert_eq!(m.snapshot_cache_epoch.load(Ordering::Relaxed), epoch);
+    assert_eq!(
+        m.snapshot_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .unwrap()
+            .0,
+        epoch
+    );
 
     m.insert("c".into(), 3).await;
-    let cache = m.snapshot_cache.read().await;
-    assert!(cache.is_none());
+    let cache = m.snapshot_cache.read().unwrap_or_else(|e| e.into_inner());
+    assert_ne!(
+        cache.as_ref().unwrap().0,
+        m.write_epoch.load(Ordering::Relaxed)
+    );
 }
 
 #[cfg(feature = "async")]

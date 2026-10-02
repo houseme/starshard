@@ -279,14 +279,12 @@ mod advanced_tests {
         let map: ShardedHashMap<String, i32> = ShardedHashMap::new(8);
         map.insert("a".into(), 1);
 
-        // Create a snapshot which increments version
+        // Snapshot versions identify committed data, not snapshot calls.
         let snap1 = map.versioned_snapshot();
         let v1 = snap1.version();
 
-        // Now try to get snapshot at the CURRENT version (which is v1 + 1)
-        // Since versioned_snapshot incremented it
-        // We should check if we can get a snapshot at the current internal version
-        let current_internal_version = v1 + 1;
+        // The returned version can be queried until the next write.
+        let current_internal_version = v1;
         let snap = map.snapshot_at_version(current_internal_version);
 
         assert!(snap.is_some());
@@ -323,7 +321,7 @@ mod advanced_tests {
         map.enable_profiling(true);
         let profiles = map.lock_profiles();
         // With no initialized shards, should return empty or just initialized ones
-        assert!(profiles.len() <= 8);
+        assert!(profiles.is_empty());
 
         map.enable_profiling(false);
         let profiles_disabled = map.lock_profiles();
@@ -523,8 +521,8 @@ mod advanced_tests {
             let snap1 = map.versioned_snapshot().await;
             let v1 = snap1.version();
 
-            // Current internal version is now v1 + 1 after versioned_snapshot incremented it
-            let current_internal_version = v1 + 1;
+            // The snapshot version identifies current committed data.
+            let current_internal_version = v1;
             let snap = map.snapshot_at_version(current_internal_version).await;
 
             assert!(snap.is_some());
@@ -538,7 +536,7 @@ mod advanced_tests {
             map.insert("a".into(), 1).await;
 
             let profiles = map.lock_profiles().await;
-            assert!(profiles.len() <= 8);
+            assert!(profiles.is_empty());
         }
 
         // ========== Replication Tests ==========

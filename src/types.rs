@@ -26,7 +26,7 @@ pub enum SnapshotMode {
     Clone,
     /// Reuse snapshot cache while no writes happen.
     Cached,
-    /// Use per-shard copy-on-write versions for snapshot reads.
+    /// Lazily build shared immutable snapshots; writes only invalidate their version.
     Cow,
 }
 

@@ -1,7 +1,7 @@
 //! Version 1.0.0: Advanced Transactions, CAS Operations, and Distributed Support
 //!
 //! This module provides:
-//! - MVCC-based atomic transactions
+//! - Pessimistic transactions over participating shards
 //! - Compare-and-swap (CAS) operations
 //! - Copy-on-write snapshots for read-heavy workloads
 //! - Distributed replication framework
@@ -35,9 +35,9 @@ pub enum TxnOp<K, V> {
 pub struct Transaction<K, V> {
     /// Operations within transaction
     pub(crate) ops: Vec<TxnOp<K, V>>,
-    /// Read set for conflict detection
+    /// Keys mentioned by read operations (not an MVCC conflict detector)
     pub(crate) read_set: Vec<K>,
-    /// Write set for conflict detection
+    /// Keys mentioned by write operations
     pub(crate) write_set: Vec<K>,
     /// Transaction version (epoch)
     #[allow(dead_code)]
@@ -126,7 +126,7 @@ impl<V> CasResult<V> {
 pub struct CowSnapshot<K, V> {
     /// Immutable data snapshot
     pub(crate) data: std::sync::Arc<Vec<(K, V)>>,
-    /// Version number for consistency
+    /// Data write epoch captured with this snapshot
     pub(crate) version: u64,
 }
 
@@ -240,7 +240,9 @@ pub struct LockProfile {
     pub writes: u64,
 }
 
-/// Snapshot with version for time-travel queries.
+/// Immutable snapshot labelled with its captured data write epoch.
+///
+/// The map does not keep historical versions for time-travel queries.
 #[derive(Debug, Clone)]
 pub struct IsolatedSnapshot<K, V> {
     /// Version number
@@ -259,6 +261,16 @@ impl<K, V> IsolatedSnapshot<K, V> {
             version,
             timestamp: std::time::Instant::now(),
             data: Arc::new(data),
+        }
+    }
+
+    /// Create a snapshot without copying pre-built shared data.
+    #[tracing::instrument(skip(data), level = "trace")]
+    pub fn from_arc(version: u64, data: Arc<Vec<(K, V)>>) -> Self {
+        Self {
+            version,
+            timestamp: std::time::Instant::now(),
+            data,
         }
     }
 

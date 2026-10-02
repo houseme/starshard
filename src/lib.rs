@@ -6,7 +6,7 @@ Starshard: a high-performance, lazily sharded concurrent HashMap.
 Features
 ---------
 - `async`: enables `AsyncShardedHashMap` backed by `tokio::sync::RwLock`.
-- `rayon`: enables parallel snapshot flattening inside iteration for large maps (sync + async).
+- `rayon`: enables parallel large synchronous snapshots and optional iterator-builder filtering.
 - `serde`: (sync) serialize/deserialize via a stable map snapshot; async map via snapshot helper.
 
 Serde Semantics
@@ -28,29 +28,31 @@ Design Goals
 2. Lazy shard materialization to reduce cold-start memory (slots are `None` until touched).
 3. O(1) (amortized) length via atomic counter (fast cloning, no full scan).
 4. Parallel iteration using `rayon` if enabled (snapshots each shard then flattens).
-5. Async version mirrors sync semantics; attempts optimistic `try_read` first to reduce await points.
+5. Async version mirrors sync semantics with cancellation-safe mutation accounting.
 6. Predictable memory layout leveraging `hashbrown::HashMap` and user-supplied hasher.
 
 Consistency Model
 ------------------
 - Per-shard operations are linearizable with respect to that shard.
-- Global iteration is *snapshot-per-shard* at the moment each shard lock is taken:
-  You may see entries inserted/removed concurrently in other shards.
-- `len()` is eventually consistent only in the trivial sense of atomic monotonic increments/decrements:
-  It reflects completed inserts/removes; in-flight operations not yet applied are invisible.
+- Global iteration and shared snapshots pin routing exclusively while collecting data.
+  Snapshot construction pauses map operations and includes both migration generations.
+- `len()` reflects committed length changes. In-flight mutations may not yet be reflected;
+  after all operations complete it matches the number of stored logical keys.
 
 Thread / Task Safety
 ---------------------
 - Each shard guarded by a single RwLock (Std or Tokio).
-- No nested acquisition of multiple shard locks (avoids lock order deadlocks).
+- A routing guard pins the shard directory for each operation.
+- Multiple shard locks follow active-before-previous generation order, with ascending
+  indices for transactions. Callbacks must not reenter the map.
 - Atomic length update only after a structural insert/delete succeeds.
 - `Clone` bounds on `K`,`V` needed for iteration snapshot flattening.
 
 Performance Notes (Indicative, not guaranteed)
 -----------------------------------------------
 - Read-heavy sync workloads: sharding reduces write interference vs a single map + RwLock.
-- `rayon` speeds large aggregate scans (e.g. metrics dump, checkpoint) 3-4x on >100k elements.
-- Lazy shards: memory roughly proportional to number of distinct shard indices used.
+- Large synchronous scans may use Rayon; gains depend on workload and need measurement.
+- Lazy shards allocate storage only for initialized slots; read misses do not initialize them.
 
 Hasher Choice
 --------------
@@ -78,8 +80,8 @@ Future Extension Ideas
 - Optional background shard growth / rebalancing.
 - Built-in configurable eviction scheduler integration (LRU per shard / clock / segmented queue).
 - Metrics hooks (pre/post op).
-- Batched mutation (multi-insert with single lock acquisition per target shard).
-- Optional copy-on-write snapshots for near-zero iteration locking windows.
+- Entry/time-bounded migration and snapshot construction with shorter pauses.
+- Cached and Cow modes currently share lazy immutable snapshots, not per-shard COW storage.
 
 Examples
 ---------
@@ -125,7 +127,7 @@ async fn main() {
     use starshard::AsyncShardedHashMap;
     let m: AsyncShardedHashMap<u32, u32> = AsyncShardedHashMap::new(64);
     for i in 0..1000 { m.insert(i, i*i).await; }
-    let items = m.iter().await; // flattens in parallel internally
+    let items = m.iter().await; // clones each value once without synchronously waiting for Rayon
     assert_eq!(items.len(), 1000);
 }
 ```
@@ -146,15 +148,12 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{
-    Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard,
-    RwLockWriteGuard as StdWriteGuard,
+    Arc, RwLock as StdRwLock, RwLockReadGuard as StdReadGuard, RwLockWriteGuard as StdWriteGuard,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "async")]
-use tokio::sync::{
-    Mutex as TokioMutex, RwLock as TokioRwLock, RwLockWriteGuard as TokioWriteGuard,
-};
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 /* ======================== Module Declarations ======================== */
 
@@ -181,18 +180,10 @@ pub use advanced::{
 };
 
 pub(crate) use crate::core::StdShardVecArc;
-type StdCowShard<K, V, S> = Arc<StdRwLock<Arc<HashMap<K, V, S>>>>;
-type StdCowShardVecArc<K, V, S> = Arc<StdRwLock<Vec<Option<StdCowShard<K, V, S>>>>>;
-type SnapshotCache<K, V> = Arc<StdRwLock<Option<Arc<Vec<(K, V)>>>>>;
+type SnapshotCache<K, V> = Arc<StdRwLock<Option<(u64, Arc<Vec<(K, V)>>)>>>;
 
 #[cfg(feature = "async")]
 pub(crate) use crate::core::AsyncShardVecArc;
-#[cfg(feature = "async")]
-type AsyncCowShard<K, V, S> = Arc<TokioRwLock<Arc<HashMap<K, V, S>>>>;
-#[cfg(feature = "async")]
-type AsyncCowShardVecArc<K, V, S> = Arc<TokioRwLock<Vec<Option<AsyncCowShard<K, V, S>>>>>;
-#[cfg(feature = "async")]
-type AsyncSnapshotCache<K, V> = Arc<TokioRwLock<Option<Arc<Vec<(K, V)>>>>>;
 
 #[cfg(all(feature = "async", feature = "advanced"))]
 pub(crate) use crate::core::ReplicaList;
@@ -222,7 +213,7 @@ where
 {
     snapshot_mode: SnapshotMode,
     shards: StdShardVecArc<K, V, S>,
-    cow_shards: StdCowShardVecArc<K, V, S>,
+    routing_lock: Arc<StdRwLock<()>>,
     previous_shards: Arc<StdRwLock<Option<crate::core::StdShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,
@@ -230,11 +221,7 @@ where
     total_len: Arc<AtomicUsize>,
     write_epoch: Arc<AtomicU64>,
     snapshot_cache: SnapshotCache<K, V>,
-    snapshot_cache_epoch: Arc<AtomicU64>,
-    rebalance_lock: Arc<StdMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
-    #[cfg(feature = "advanced")]
-    version: Arc<AtomicUsize>,
     #[cfg(feature = "advanced")]
     profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -263,19 +250,16 @@ where
 {
     snapshot_mode: SnapshotMode,
     shards: AsyncShardVecArc<K, V, S>,
-    cow_shards: AsyncCowShardVecArc<K, V, S>,
+    routing_lock: Arc<TokioRwLock<()>>,
     previous_shards: Arc<TokioRwLock<Option<crate::core::AsyncShardVec<K, V, S>>>>,
     hasher: S,
     shard_count: Arc<AtomicUsize>,
     previous_shard_count: Arc<AtomicUsize>,
     total_len: Arc<AtomicUsize>,
     write_epoch: Arc<AtomicU64>,
-    snapshot_cache: AsyncSnapshotCache<K, V>,
-    snapshot_cache_epoch: Arc<AtomicU64>,
+    snapshot_cache: SnapshotCache<K, V>,
     rebalance_lock: Arc<TokioMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
-    #[cfg(feature = "advanced")]
-    version: Arc<AtomicUsize>,
     #[cfg(feature = "advanced")]
     profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "advanced")]

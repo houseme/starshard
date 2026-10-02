@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Pin shard routing for each operation so resize cannot invalidate in-flight indices, and serialize migration publication while keeping source entries reachable until commit.
+- Make conditional initialization, CAS, transactions, snapshots, retain, and drain include both migration generations without duplicate length accounting or resurrecting old values.
+- Preserve committed length and snapshot epochs across async cancellation and retain-predicate panics; prepare migration replacements before user Hash/Clone/Eq can interrupt publication.
+- Consume caller-provided batch iterators before locking to preserve reentrant lazy producers.
+- Label versioned snapshots with their committed data epoch; repeated snapshots without writes retain the same version and stale version queries return `None`.
+
+### Added
+
+- Add `shared_snapshot()` for immutable shared snapshot handles and `get_borrowed`, `contains_borrowed`, `remove_borrowed`, and `read_with` without changing existing CRUD signatures.
+
+### Changed
+
+- Build Cached/Cow snapshots lazily instead of cloning entire shards on each write. Snapshot construction now pauses map operations for a consistent view; both modes currently use a whole-map cache.
+- Use read access for initialized shard directories, avoid allocating shards for read misses, clone async snapshot entries once, and collect keys/values without copying the unused counterpart.
+- Return no lock profiling samples until actual instrumentation exists, rather than fabricated zero measurements.
+
+### Tests
+
+- Add sync/async regressions for migration interleavings, shrinking, atomic initialization, CAS/transactions, cancellation, panic recovery, lazy producer reentry, snapshot versions, and clone counts.
+
 ## [2.3.0] - 2026-08-25
 
 ### Added
