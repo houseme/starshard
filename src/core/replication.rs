@@ -89,9 +89,11 @@ async fn replicate_to_quorum<K, V>(
     V: Clone + Send + 'static,
 {
     let mut sender = Some(sender);
+    // Clone user data before dispatching any remote work. A cloning panic must
+    // not release ordering while already spawned replicas are still cancelling.
+    let operations: Vec<_> = (0..replicas.len()).map(|_| operation.clone()).collect();
     let mut tasks = JoinSet::new();
-    for replica in replicas {
-        let operation = operation.clone();
+    for (replica, operation) in replicas.into_iter().zip(operations) {
         tasks.spawn(async move { replica.replicate(operation).await });
     }
 
@@ -185,6 +187,10 @@ where
     /// the deadline. Subsequent replicated writes wait for that fanout, keeping
     /// replica calls ordered across map clones. Dropping the last map cancels
     /// pending replica work.
+    ///
+    /// Remote operation copies are prepared before fanout. If this preparation
+    /// panics, no remote call starts and the caller receives
+    /// [`ReplicaError::QuorumFailed`]; the local write remains applied.
     ///
     /// An error or caller cancellation does not roll back an applied local
     /// write or any remote write. Ordinary `insert`, `remove`, and reads remain

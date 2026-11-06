@@ -8,10 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - Keep previous-generation entries reachable if key cloning, destination hashing, or growth panics during single-key or transaction promotion. Prepare growth in a temporary destination before detaching the source.
 - Publish actual length and snapshot-epoch changes on unwinding from single-key insertion/removal, conditional operations, CAS, and transaction mutations, extending the existing batch accounting guard. A panicking transaction does not roll back already executed operations.
+- Clone all replication fanout inputs before spawning remote tasks, preventing a later Clone panic from leaving a partially dispatched operation behind a released ordering lock.
 
 ### Tests
 
-- Add regression coverage for promotion Hash/Clone failures, destination growth failure, and key/value destructor failures.
+- Add regression coverage for promotion Hash/Clone failures, destination growth failure, key/value destructor failures, and fanout preparation failure.
 
 ## [2.4.0] - 2026-10-02
 
