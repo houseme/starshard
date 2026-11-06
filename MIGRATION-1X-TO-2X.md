@@ -112,13 +112,21 @@ Existing CRUD and Entry signatures remain available. New APIs include `shared_sn
 
 Run the feature combinations you deploy and remeasure workload-specific latency, throughput, and memory. Allocation/hash reductions are not a universal throughput or p99 guarantee.
 
+### 4.6 Upgrading from 2.4.0 to 2.4.1
+
+This patch preserves existing public API signatures and error variants. It closes entry-loss windows when user hashing/cloning fails during promotion, extends unwind-safe length/cache accounting to single-key and transaction mutations, and prepares all replica operation copies before dispatch. Async memory statistics include both shard generations, and rebalance status is captured coherently.
+
+User code panicking during a transaction does not roll back earlier operations. Replica preparation failure leaves an applied local write in place and returns `QuorumFailed` without partial remote fanout. These are recovery boundaries, not an unconditional guarantee for reentrant callbacks, double panics, or non-cooperative tasks.
+
+The release also refreshes dependencies, including Tokio 1.54.1. Existing limitations remain: no autonomous TTL/eviction scheduler, no measured lock profiling, no enforced migration time budget, and no consensus or quorum reads. Workload-specific throughput/p99 and live replica fault behavior still require deployment validation.
+
 ## 5. Feature Flag Reminder
 
 If migrating from early 1.x, re-check `Cargo.toml` feature selection:
 
 ```toml
 [dependencies]
-starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. Migration Checklist

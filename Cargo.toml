@@ -1,6 +1,6 @@
 [package]
 name = "starshard"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2024"
 description = "A sharded concurrent HashMap with sync/async APIs, lazy shards, atomic per-key operations, consistent snapshots, batch operations, and shard rebalancing."
 authors = ["houseme <housemecn@gmail.com>"]

@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-11-07
+
+### Upgrade notes
+
+- Existing public API signatures and error variants are retained. See the [2.4.0 patch upgrade notes](MIGRATION-1X-TO-2X.md#46-upgrading-from-240-to-241) for panic-recovery and local-first replication boundaries.
+- Refresh dependencies, including Tokio 1.54.1, and retain the documented limits for lifecycle scheduling, lock profiling, migration budgets, and workload-specific validation.
+
 ### Fixed
 
 - Keep previous-generation entries reachable if key cloning, destination hashing, or growth panics during single-key or transaction promotion. Prepare growth in a temporary destination before detaching the source.

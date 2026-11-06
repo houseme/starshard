@@ -18,7 +18,9 @@ It is designed for real production workloads where you need:
 
 ## Status
 
-Current crate version: `2.4.0`. Release changes are listed in [CHANGELOG.md](CHANGELOG.md#240---2026-10-02).
+Current crate version: `2.4.1`. Release changes are listed in [CHANGELOG.md](CHANGELOG.md#241---2026-11-07).
+
+`2.4.1` fixes additional panic-recovery boundaries in migration, mutations, and replica fanout, plus migration statistics. See the [2.4.0 patch upgrade notes](MIGRATION-1X-TO-2X.md#46-upgrading-from-240-to-241).
 
 Roadmap capabilities shipped through `v2.4.0`:
 - Adaptive shard expansion and rebalance (stop-the-world + online incremental).
@@ -35,9 +37,9 @@ Upgrading from 2.3.x: snapshot versions now identify committed data, and invalid
 
 ```toml
 [dependencies]
-starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # minimal:
-# starshard = "2.4.0"
+# starshard = "2.4.1"
 ```
 
 ## 5-Minute Path

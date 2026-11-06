@@ -17,7 +17,9 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ## 当前状态
 
-当前 crate 版本为 `2.4.0`。发布变更记录在 [CHANGELOG.md](CHANGELOG.md#240---2026-10-02)。
+当前 crate 版本为 `2.4.1`。发布变更记录在 [CHANGELOG.md](CHANGELOG.md#241---2026-11-07)。
+
+`2.4.1` 补齐迁移、修改操作和复制 fanout 的 panic 恢复边界，并修正迁移统计。详见 [2.4.0 补丁升级说明](MIGRATION-1X-TO-2X_CN.md#46-从-240-升级到-241)。
 
 截至 `v2.4.0` 已交付的 Roadmap 主能力：
 - 自适应分片扩容与重平衡（停顿式 + 在线渐进）。
@@ -34,9 +36,9 @@ Starshard 是一个高性能、延迟初始化分片的并发 `HashMap`。
 
 ```toml
 [dependencies]
-starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 # 最小依赖：
-# starshard = "2.4.0"
+# starshard = "2.4.1"
 ```
 
 ## 5 分钟上手路径

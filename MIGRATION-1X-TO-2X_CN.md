@@ -112,13 +112,21 @@ let map: ShardedHashMap<String, i32> =
 
 升级后应验证实际使用的 feature 组合，并重新测量业务延迟、吞吐和内存。分配与哈希次数减少不代表所有负载的吞吐或 p99 都会改善。
 
+### 4.6 从 2.4.0 升级到 2.4.1
+
+本补丁保留现有公开 API 签名和错误枚举变体。它修复提升条目时用户 Hash/Clone 失败导致的数据丢失窗口，将长度和缓存的 unwind 安全结算扩展到单键及事务修改，并在分发前完成全部副本操作复制。异步内存统计包含两代分片，迁移状态也改为一致捕获。
+
+事务中的用户代码发生 panic 时，不会回滚此前已执行的操作。复制准备失败会保留已应用的本地写入，返回 `QuorumFailed`，且不会分发部分远端操作。这些是明确的恢复边界，不是对重入回调、双重 panic 或非协作任务的无条件保证。
+
+本版本也刷新了依赖，包括 Tokio 1.54.1。现有边界保持不变：没有自动 TTL/淘汰调度器、真实锁耗时采样、强制迁移时间预算，也不提供共识或 quorum 读取。业务吞吐/p99 和真实副本故障行为仍需部署环境验证。
+
 ## 5. Feature Flag 提醒
 
 从早期 1.x 升级时，建议重新确认 `Cargo.toml` 的 feature 组合：
 
 ```toml
 [dependencies]
-starshard = { version = "2.4.0", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
+starshard = { version = "2.4.1", features = ["async", "rayon", "serde", "lifecycle", "advanced"] }
 ```
 
 ## 6. 迁移清单
