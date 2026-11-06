@@ -22,6 +22,10 @@ All notable changes to this project will be documented in this file.
 
 - Add regression coverage for promotion Hash/Clone failures, destination growth failure, key/value destructor failures, migration statistics, concurrent status reads, and fanout preparation failure.
 
+### CI
+
+- Remove unused system-package installation from the Rust documentation workflow, retain locked all-feature documentation builds, and bound the job runtime.
+
 ## [2.4.0] - 2026-10-02
 
 ### Upgrade notes
