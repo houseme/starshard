@@ -6,12 +6,12 @@
 //! - [`RebalanceReport`] — summary produced after a stop-the-world rebalance.
 //! - [`RebalanceStatus`] — live progress snapshot during online migration.
 //!
-//! It also contains the internal [`RebalanceTracker`], an atomic state machine
+//! It also contains the internal [`RebalanceTracker`], a synchronized state machine
 //! that coordinates migration progress between `start_rebalance_online`,
 //! `advance_rebalance`, and read/write paths that need to consult previous
 //! shards during migration.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Rebalance execution options.
 #[derive(Clone, Debug)]
@@ -60,10 +60,7 @@ pub struct RebalanceStatus {
     pub total_shards: usize,
 }
 
-pub(crate) const REBALANCE_STATE_IDLE: usize = 0;
-pub(crate) const REBALANCE_STATE_MIGRATING: usize = 1;
-
-/// Atomic state machine tracking online rebalance progress.
+/// State machine tracking online rebalance progress.
 ///
 /// The tracker has two states: **idle** and **migrating**.  During migration
 /// it records how many source shards have been drained so far.  Read and write
@@ -71,65 +68,121 @@ pub(crate) const REBALANCE_STATE_MIGRATING: usize = 1;
 /// `previous_shards` for keys that have not yet been moved.
 #[derive(Debug)]
 pub(crate) struct RebalanceTracker {
-    state: AtomicUsize,
-    moved_shards: AtomicUsize,
-    total_shards: AtomicUsize,
+    // Publish the generation and its counters together. The guard never
+    // escapes a tracker method or overlaps acquisition of another map lock.
+    state: Mutex<Progress>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Progress {
+    migrating: bool,
+    moved_shards: usize,
+    total_shards: usize,
 }
 
 impl RebalanceTracker {
     /// Creates a new tracker in the idle state.
     pub(crate) fn new() -> Self {
         Self {
-            state: AtomicUsize::new(REBALANCE_STATE_IDLE),
-            moved_shards: AtomicUsize::new(0),
-            total_shards: AtomicUsize::new(0),
+            state: Mutex::new(Progress::default()),
         }
     }
 
     /// Transitions to the migrating state and records the number of source shards.
     pub(crate) fn begin(&self, total_shards: usize) {
-        self.total_shards.store(total_shards, Ordering::Relaxed);
-        self.moved_shards.store(0, Ordering::Relaxed);
-        self.state
-            .store(REBALANCE_STATE_MIGRATING, Ordering::Relaxed);
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Progress {
+            migrating: true,
+            moved_shards: 0,
+            total_shards,
+        };
     }
 
     /// Increments the completed-shard counter (called after each shard drain).
     pub(crate) fn step(&self) {
-        self.moved_shards.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .moved_shards += 1;
     }
 
     /// Returns `true` if an online rebalance is currently in progress.
     pub(crate) fn is_migrating(&self) -> bool {
-        self.state.load(Ordering::Relaxed) == REBALANCE_STATE_MIGRATING
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .migrating
     }
 
     /// Transitions back to idle and resets all counters.
     pub(crate) fn finish(&self) {
-        self.state.store(REBALANCE_STATE_IDLE, Ordering::Relaxed);
-        self.total_shards.store(0, Ordering::Relaxed);
-        self.moved_shards.store(0, Ordering::Relaxed);
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Progress::default();
     }
 
     /// Returns a point-in-time snapshot of the current rebalance progress.
     pub(crate) fn snapshot(&self) -> RebalanceStatus {
-        let state_num = self.state.load(Ordering::Relaxed);
-        let moved = self.moved_shards.load(Ordering::Relaxed);
-        let total = self.total_shards.load(Ordering::Relaxed);
+        let state = *self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let moved = state.moved_shards;
+        let total = state.total_shards;
         let progress = if total == 0 {
             0.0
         } else {
             moved as f64 / total as f64
         };
         RebalanceStatus {
-            state: if state_num == REBALANCE_STATE_MIGRATING {
-                "migrating"
-            } else {
-                "idle"
-            },
+            state: if state.migrating { "migrating" } else { "idle" },
             progress,
             moved_shards: moved,
             total_shards: total,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_status_reads_never_mix_migration_generations() {
+        let tracker = RebalanceTracker::new();
+        let start = Barrier::new(5);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..2000 {
+                    for total in [64, 1] {
+                        tracker.begin(total);
+                        for _ in 0..total {
+                            tracker.step();
+                        }
+                        tracker.finish();
+                    }
+                }
+            });
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..40_000 {
+                        let status = tracker.snapshot();
+                        assert!(status.moved_shards <= status.total_shards, "{status:?}");
+                        assert!((0.0..=1.0).contains(&status.progress), "{status:?}");
+                        if status.state == "idle" {
+                            assert_eq!(status.moved_shards, 0);
+                            assert_eq!(status.total_shards, 0);
+                            assert_eq!(status.progress, 0.0);
+                        } else {
+                            assert_eq!(status.state, "migrating");
+                            assert!([1, 64].contains(&status.total_shards));
+                            assert_eq!(
+                                status.progress,
+                                status.moved_shards as f64 / status.total_shards as f64
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        assert!(!tracker.is_migrating());
+        assert_eq!(tracker.snapshot().total_shards, 0);
     }
 }

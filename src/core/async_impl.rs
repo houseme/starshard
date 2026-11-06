@@ -1281,7 +1281,8 @@ where
         self.collect_with(|_, value| value.clone()).await
     }
 
-    /// Returns statistics about shard distribution and utilization (async).
+    /// Returns active shard distribution statistics. During migration, entries
+    /// still in the previous generation are excluded from active utilization.
     ///
     /// # Returns
     /// - `ShardStats`: structure containing shard metrics
@@ -1328,7 +1329,7 @@ where
         stats.utilization_percent()
     }
 
-    /// Returns load statistics for each initialized shard (async).
+    /// Returns active shard lengths and capacities.
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn per_shard_load(&self) -> Vec<PerShardLoad> {
@@ -1350,18 +1351,19 @@ where
         stats
     }
 
-    /// Returns current memory-oriented shard statistics (async).
+    /// Returns allocation statistics including previous-generation shards.
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn memory_stats(&self) -> MemoryStats {
         let _routing = self.routing_lock.read().await;
-        let slots = self.shards.read().await;
-        let mut shards_allocated = 0;
+        let mut shards: Vec<_> = self.shards.read().await.iter().flatten().cloned().collect();
+        if let Some(previous) = self.previous_shards.read().await.as_ref() {
+            shards.extend(previous.iter().flatten().cloned());
+        }
         let mut total_capacity = 0usize;
         let mut total_entries = 0usize;
 
-        for shard in slots.iter().flatten() {
-            shards_allocated += 1;
+        for shard in &shards {
             let guard = shard.read().await;
             total_capacity += guard.capacity();
             total_entries += guard.len();
@@ -1374,7 +1376,7 @@ where
         };
 
         MemoryStats {
-            shards_allocated,
+            shards_allocated: shards.len(),
             total_capacity,
             load_factor,
         }
