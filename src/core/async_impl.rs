@@ -215,9 +215,7 @@ where
         let mut active = shard.write_owned().await;
         if let Some(previous) = self.previous_shard(key).await {
             let mut previous = previous.write().await;
-            if let Some((key, value)) = previous.remove_entry(key) {
-                active.entry(key).or_insert(value);
-            }
+            promote_entry(&mut active, &mut previous, key);
         }
         active
     }
@@ -653,12 +651,8 @@ where
 
     async fn insert_inner(&self, key: K, value: V) -> Option<V> {
         let mut guard = self.lock_key(&key).await;
-        let old = guard.insert(key, value);
-        if old.is_none() {
-            self.total_len.fetch_add(1, Ordering::Relaxed);
-        }
-        self.on_structural_write();
-        old
+        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+        mutation.insert(key, value)
     }
 
     /// Get a cloned value for an owned-key reference.
@@ -753,12 +747,8 @@ where
         Q: Eq + Hash + ?Sized,
     {
         let mut guard = self.lock_key(key).await;
-        let old = guard.remove(key);
-        if old.is_some() {
-            self.total_len.fetch_sub(1, Ordering::Relaxed);
-            self.on_structural_write();
-        }
-        old
+        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+        mutation.remove(key)
     }
 
     /// Length (atomic).
@@ -976,12 +966,14 @@ where
         let old = guard.get(key).cloned()?;
         let result = f(old);
         if let Some(value) = result.as_ref() {
-            guard.insert(key.clone(), value.clone());
+            let stored_key = key.clone();
+            let stored_value = value.clone();
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            mutation.insert(stored_key, stored_value);
         } else {
-            guard.remove(key);
-            self.total_len.fetch_sub(1, Ordering::Relaxed);
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            mutation.remove(key);
         }
-        self.on_structural_write();
         result
     }
 
@@ -1015,9 +1007,9 @@ where
             return value.clone();
         }
         let value = f();
-        guard.insert(key, value.clone());
-        self.total_len.fetch_add(1, Ordering::Relaxed);
-        self.on_structural_write();
+        let stored_value = value.clone();
+        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+        mutation.insert(key, stored_value);
         value
     }
 
@@ -1140,24 +1132,21 @@ where
                 if let Some((_, previous)) = previous_guards
                     .iter_mut()
                     .find(|(index, _)| *index == previous_index)
-                    && let Some((key, value)) = previous.remove_entry(key)
                 {
-                    active.entry(key).or_insert(value);
+                    promote_entry(active, previous, key);
                 }
             }
             match op {
                 TxnOp::Read(_) => {}
                 TxnOp::Write(key, value) => {
-                    if active.insert(key, value).is_none() {
-                        self.total_len.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.on_structural_write();
+                    let mut mutation =
+                        ShardMutation::new(active, &self.total_len, &self.write_epoch);
+                    mutation.insert(key, value);
                 }
                 TxnOp::Remove(key) => {
-                    if active.remove(&key).is_some() {
-                        self.total_len.fetch_sub(1, Ordering::Relaxed);
-                        self.on_structural_write();
-                    }
+                    let mut mutation =
+                        ShardMutation::new(active, &self.total_len, &self.write_epoch);
+                    mutation.remove(&key);
                 }
             }
         }
@@ -1183,8 +1172,11 @@ where
         let mut guard = self.lock_key(key).await;
         match guard.get(key) {
             Some(current) if current == expected => {
-                guard.insert(key.clone(), new.clone());
-                self.on_structural_write();
+                let stored_key = key.clone();
+                let stored_value = new.clone();
+                let mut mutation =
+                    ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                mutation.insert(stored_key, stored_value);
                 CasResult::Success(new)
             }
             Some(current) => CasResult::Failure(current.clone()),
@@ -1209,9 +1201,8 @@ where
         let _routing = self.routing_lock.read().await;
         let mut guard = self.lock_key(key).await;
         if guard.get(key).is_some_and(|current| current == expected) {
-            guard.remove(key);
-            self.total_len.fetch_sub(1, Ordering::Relaxed);
-            self.on_structural_write();
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            mutation.remove(key);
             true
         } else {
             false

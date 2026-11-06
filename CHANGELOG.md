@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep previous-generation entries reachable if key cloning, destination hashing, or growth panics during single-key or transaction promotion. Prepare growth in a temporary destination before detaching the source.
+- Publish actual length and snapshot-epoch changes on unwinding from single-key insertion/removal, conditional operations, CAS, and transaction mutations, extending the existing batch accounting guard. A panicking transaction does not roll back already executed operations.
+
+### Tests
+
+- Add regression coverage for promotion Hash/Clone failures, destination growth failure, and key/value destructor failures.
+
 ## [2.4.0] - 2026-10-02
 
 ### Upgrade notes

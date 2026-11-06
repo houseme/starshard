@@ -212,6 +212,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - Snapshot rebuilding retains directory and ordered shard read locks, producing a stable view of both active and previous shards once all guards are held. Ordinary reads can proceed subject to lock fairness; queued writers or cold-shard initialization can still delay later readers. A matching immutable cache is returned without routing access; its data and epoch are captured together.
 - During online rebalance, active-first + previous-fallback keeps key reachability.
 - Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks must not reenter the same map while its locks are held.
+- If user code panics during a transaction, already-applied operations are not rolled back; length and cached-snapshot metadata track the actual stored contents.
 
 ## Performance Notes
 

@@ -22,7 +22,7 @@ pub(crate) mod async_impl;
 pub(crate) use helpers::{
     capped_shard_count, normalized_shard_count, std_read_guard, std_write_guard, strict_shard_count,
 };
-pub(crate) use mutation::ShardMutation;
+pub(crate) use mutation::{ShardMutation, promote_entry};
 pub(crate) use types::{StdShard, StdShardVec, StdShardVecArc};
 
 #[cfg(feature = "async")]

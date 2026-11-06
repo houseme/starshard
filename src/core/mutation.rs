@@ -1,10 +1,60 @@
-//! Publish batch mutation metadata once per shard, including during unwinding.
+//! Publish mutation metadata before shard unlock, including during unwinding.
 
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
+
+/// Prepare the destination before detaching a previous-generation entry.
+/// Both maps must be write-locked in active-before-previous order by the caller.
+pub(crate) fn promote_entry<K, V, S, Q>(
+    active: &mut HashMap<K, V, S>,
+    previous: &mut HashMap<K, V, S>,
+    key: &Q,
+) where
+    K: Eq + Hash + Clone + Borrow<Q>,
+    V: Clone,
+    S: BuildHasher + Clone,
+    Q: Eq + Hash + ?Sized,
+{
+    let Some((stored_key, _)) = previous.get_key_value(key) else {
+        return;
+    };
+    let destination_key = stored_key.clone();
+    // Growth can hash existing keys and panic. Stage that work when necessary
+    // so neither live generation is altered before destination preparation.
+    let mut staged = if active.len() == active.capacity() {
+        let mut map = active.clone();
+        map.reserve(1);
+        Some(map)
+    } else {
+        None
+    };
+    let destination = staged
+        .as_mut()
+        .unwrap_or(&mut *active)
+        .entry(destination_key);
+    // With one spare slot, VacantEntry insertion does not grow or rehash.
+    let Some((retired_key, value)) = previous.remove_entry(key) else {
+        return;
+    };
+    let retired_value = match destination {
+        hashbrown::hash_map::Entry::Vacant(entry) => {
+            entry.insert(value);
+            None
+        }
+        hashbrown::hash_map::Entry::Occupied(_) => Some(value),
+    };
+    // Publish before dropping any user-owned retired key/value/map. A panic
+    // during destruction therefore leaves the promoted value reachable.
+    if let Some(staged) = staged {
+        let retired_map = std::mem::replace(active, staged);
+        drop(retired_map);
+    }
+    drop(retired_key);
+    drop(retired_value);
+}
 
 /// Accounts for changes while borrowing a map protected by its caller's write guard.
 ///
