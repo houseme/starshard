@@ -11,8 +11,10 @@
 //! - Replication support (`with_replication`, `insert_replicated`,
 //!   `remove_replicated`) behind the `advanced` feature flag.
 
+use super::types::ShardData;
 use super::*;
-use std::time::Instant;
+
+mod rebalance_impl;
 
 #[cfg(feature = "async")]
 impl<K, V> AsyncShardedHashMap<K, V, FxBuildHasher>
@@ -173,12 +175,6 @@ where
             .count()
     }
 
-    /// Current rebalance status snapshot.
-    #[tracing::instrument(skip(self), level = "trace")]
-    pub fn rebalance_status(&self) -> RebalanceStatus {
-        self.rebalance_tracker.snapshot()
-    }
-
     /// Resolve a previous-generation shard while the caller pins routing.
     async fn previous_shard<Q>(&self, key: &Q) -> Option<AsyncShard<K, V, S>>
     where
@@ -206,7 +202,7 @@ where
 
     /// Lock active before previous, then promote the key without an await point.
     /// The caller holds routing and must finish its mutation before awaiting again.
-    async fn lock_key<Q>(&self, key: &Q) -> tokio::sync::OwnedRwLockWriteGuard<HashMap<K, V, S>>
+    async fn lock_key<Q>(&self, key: &Q) -> tokio::sync::OwnedRwLockWriteGuard<ShardData<K, V, S>>
     where
         K: std::borrow::Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -215,7 +211,9 @@ where
         let mut active = shard.write_owned().await;
         if let Some(previous) = self.previous_shard(key).await {
             let mut previous = previous.write().await;
-            promote_entry(&mut active, &mut previous, key);
+            if previous.contains_key(key) {
+                promote_entry(&mut active, &mut previous, key);
+            }
         }
         active
     }
@@ -250,6 +248,49 @@ where
             drop(slots);
             result
         }
+    }
+
+    async fn capture_view_data(&self, shards: &mut Vec<Arc<HashMap<K, V, S>>>) -> (u64, usize) {
+        let _routing = self.routing_lock.read().await;
+        // Keep empty slots stable too: a cold-shard insertion must wait until
+        // this snapshot has captured both its data and mutation version.
+        let active = self.shards.read().await;
+        let previous = self.previous_shards.read().await;
+        let initialized = active.iter().flatten().count()
+            + previous
+                .as_ref()
+                .map_or(0, |slots| slots.iter().flatten().count());
+        let mut guards = Vec::with_capacity(initialized);
+        // Transactions and promotion acquire active shards before previous
+        // shards. Matching that order prevents cycles with their write locks.
+        for shard in active.iter().flatten() {
+            guards.push(shard.read().await);
+        }
+        if let Some(previous) = previous.as_ref() {
+            for shard in previous.iter().flatten() {
+                guards.push(shard.read().await);
+            }
+        }
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        let shard_count = active.len();
+        shards.reserve_exact(guards.len());
+        for guard in &guards {
+            shards.push(guard.snapshot());
+        }
+        (epoch, shard_count)
+    }
+
+    /// Capture an immutable view with a coherent mutation version and shard count.
+    ///
+    /// Cow mode shares shard storage without cloning keys or values. Other modes
+    /// clone each initialized shard. Iteration borrows data without map locks;
+    /// retaining a Cow view makes subsequent writes copy its touched shards.
+    pub async fn snapshot_view(&self) -> SnapshotView<K, V, S> {
+        let mut shards = Vec::new();
+        let builder = self.snapshot_build_lock.lock().await;
+        let (epoch, shard_count) = self.capture_view_data(&mut shards).await;
+        drop(builder);
+        SnapshotView::new(shards, epoch, shard_count)
     }
 
     /// Freeze all existing shards while allowing concurrent reads. The caller
@@ -293,7 +334,13 @@ where
         epoch
     }
 
-    async fn collect_with<T>(&self, project: impl FnMut(&K, &V) -> T) -> Vec<T> {
+    async fn collect_with<T>(&self, mut project: impl FnMut(&K, &V) -> T) -> Vec<T> {
+        if self.snapshot_mode == SnapshotMode::Cow {
+            let view = self.snapshot_view().await;
+            let mut output = Vec::with_capacity(view.len());
+            output.extend(view.iter().map(|(key, value)| project(key, value)));
+            return output;
+        }
         let mut output = Vec::new();
         let _builder = self.snapshot_build_lock.lock().await;
         self.collect_into(&mut output, project).await;
@@ -320,6 +367,7 @@ where
         // Declare owned data before the gate so Clone panics release the gate
         // before destroying any successfully collected entries.
         let mut output = Vec::new();
+        let mut source_shards = Vec::new();
         let _builder = self.snapshot_build_lock.lock().await;
         // Recheck after locking: another snapshot may already have rebuilt
         // the cache, or a writer may have advanced the epoch while we waited.
@@ -332,9 +380,21 @@ where
                 return (epoch, entries.clone());
             }
         }
-        let epoch = self
-            .collect_into(&mut output, |key, value| (key.clone(), value.clone()))
-            .await;
+        let epoch = if self.snapshot_mode == SnapshotMode::Cow {
+            let (epoch, _) = self.capture_view_data(&mut source_shards).await;
+            output.reserve_exact(source_shards.iter().map(|shard| shard.len()).sum());
+            // Source Arcs preserve the cut while user Clone runs without map locks.
+            output.extend(
+                source_shards
+                    .iter()
+                    .flat_map(|shard| shard.iter())
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            epoch
+        } else {
+            self.collect_into(&mut output, |key, value| (key.clone(), value.clone()))
+                .await
+        };
         let entries = Arc::new(output);
         let retired = if self.cache_enabled() {
             std_write_guard(&self.snapshot_cache, "async_snapshot_cache")
@@ -347,115 +407,6 @@ where
         drop(_builder);
         drop(retired);
         (epoch, entries)
-    }
-
-    /// Start an online incremental rebalance.
-    ///
-    /// Writes route to the new active shard epoch immediately; reads fallback to previous
-    /// shards until migration is fully advanced via `advance_rebalance`.
-    #[tracing::instrument(skip(self), level = "trace")]
-    pub async fn start_rebalance_online(
-        &self,
-        new_shard_count: usize,
-    ) -> Result<(), ShardCountError> {
-        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
-        let _rebalance = self.rebalance_lock.lock().await;
-        let _routing = self.routing_lock.write().await;
-        if self.rebalance_tracker.is_migrating() || target == self.shard_count() {
-            return Ok(());
-        }
-        let mut active = self.shards.write().await;
-        let mut previous = self.previous_shards.write().await;
-        let current = active.len();
-        // All potentially suspending locks precede the directory swap.
-        *previous = Some(std::mem::replace(&mut *active, vec![None; target]));
-        self.previous_shard_count.store(current, Ordering::Relaxed);
-        self.shard_count.store(target, Ordering::Relaxed);
-        self.rebalance_tracker.begin(current);
-        Ok(())
-    }
-
-    /// Advance online rebalance by up to `max_shards` source shards.
-    ///
-    /// Returns the number of source shards processed. Each complete source shard
-    /// is moved under exclusive routing, so a large shard can cause a long pause.
-    #[tracing::instrument(skip(self), level = "trace")]
-    pub async fn advance_rebalance(&self, max_shards: usize) -> usize {
-        if max_shards == 0 {
-            return 0;
-        }
-        // Declare retired storage before lock guards so cancellation or unwinding
-        // also releases all locks before invoking retired values' destructors.
-        let mut retired = Vec::new();
-        let _rebalance = self.rebalance_lock.lock().await;
-        let _routing = self.routing_lock.write().await;
-        let mut active = self.shards.write().await;
-        let mut previous = self.previous_shards.write().await;
-        let Some(previous_slots) = previous.as_mut() else {
-            return 0;
-        };
-        let mut processed = 0;
-        for _ in 0..max_shards {
-            let status = self.rebalance_tracker.snapshot();
-            let index = status.moved_shards;
-            if !self.rebalance_tracker.is_migrating() || index >= previous_slots.len() {
-                break;
-            }
-            if let Some(source) = previous_slots[index].clone() {
-                let source = source.read_owned().await;
-                let mut target_indices: Vec<_> =
-                    source.keys().map(|key| self.shard_index(key)).collect();
-                target_indices.sort_unstable();
-                target_indices.dedup();
-                let mut replacements = Vec::with_capacity(target_indices.len());
-                for &target_index in &target_indices {
-                    let staged = match active[target_index].as_ref() {
-                        Some(target) => target.read().await.clone(),
-                        None => HashMap::with_hasher(self.hasher.clone()),
-                    };
-                    replacements.push(staged);
-                }
-                // User Hash/Clone/Eq can panic. Stage every replacement while
-                // source and target maps remain untouched and reachable.
-                for (key, value) in source.iter() {
-                    let target_index = self.shard_index(key);
-                    if let Ok(position) = target_indices.binary_search(&target_index) {
-                        replacements[position]
-                            .entry(key.clone())
-                            .or_insert_with(|| value.clone());
-                    }
-                }
-                let replacements: Vec<_> = replacements
-                    .into_iter()
-                    .map(|map| Arc::new(TokioRwLock::new(map)))
-                    .collect();
-                retired.reserve(replacements.len() + 1);
-                // Publication calls no user code and contains no await points.
-                // Retain replaced maps until progress is committed and locks
-                // are released, so user destructors cannot interrupt it.
-                for (target_index, replacement) in target_indices.into_iter().zip(replacements) {
-                    if let Some(old) = active[target_index].replace(replacement) {
-                        retired.push(old);
-                    }
-                }
-            }
-            if let Some(source) = previous_slots[index].take() {
-                retired.push(source);
-            }
-            self.rebalance_tracker.step();
-            processed += 1;
-        }
-        if self.rebalance_tracker.snapshot().moved_shards >= previous_slots.len() {
-            *previous = None;
-            self.previous_shard_count.store(0, Ordering::Relaxed);
-            self.rebalance_tracker.finish();
-        }
-        drop(previous);
-        drop(active);
-        drop(_routing);
-        drop(_rebalance);
-        drop(retired);
-        processed
     }
 
     /// Returns the shard index for `key` under the current shard count.
@@ -478,7 +429,10 @@ where
         let mut slots = self.shards.write().await;
         slots[index]
             .get_or_insert_with(|| {
-                Arc::new(TokioRwLock::new(HashMap::with_hasher(self.hasher.clone())))
+                Arc::new(TokioRwLock::new(ShardData::new(
+                    HashMap::with_hasher(self.hasher.clone()),
+                    self.snapshot_mode,
+                )))
             })
             .clone()
     }
@@ -537,86 +491,6 @@ where
             buckets.entry(shard_idx).or_default().push((idx, key));
         }
         buckets
-    }
-
-    /// Rebalance to a new shard count using stop-the-world full migration.
-    ///
-    /// Routing is pinned exclusively until all entries have been moved.
-    #[tracing::instrument(skip(self, options), level = "trace")]
-    pub async fn rebalance_to(
-        &self,
-        new_shard_count: usize,
-        options: RebalanceOptions,
-    ) -> Result<RebalanceReport, ShardCountError> {
-        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
-        let _rebalance = self.rebalance_lock.lock().await;
-        let _routing = self.routing_lock.write().await;
-        let current = self.shard_count();
-        if target == current && !self.rebalance_tracker.is_migrating() {
-            return Ok(RebalanceReport {
-                from_shards: current,
-                to_shards: target,
-                moved_entries: 0,
-                elapsed_ms: 0,
-            });
-        }
-        let started = Instant::now();
-        let mut active = self.shards.write().await;
-        let mut previous = self.previous_shards.write().await;
-        let mut guards = Vec::new();
-        if let Some(slots) = previous.as_ref() {
-            for shard in slots.iter().flatten() {
-                guards.push(shard.clone().read_owned().await);
-            }
-        }
-        for shard in active.iter().flatten() {
-            guards.push(shard.clone().read_owned().await);
-        }
-        let mut destinations: Vec<Option<HashMap<K, V, S>>> = (0..target).map(|_| None).collect();
-        // Stage the entire new generation before replacing either directory.
-        // Hash/Clone/Eq panics or cancellation leave both old generations intact.
-        // Previous values are copied first so active values win any ties.
-        for source in &guards {
-            for (key, value) in source.iter() {
-                let index = (self.hasher.hash_one(key) % target as u64) as usize;
-                destinations[index]
-                    .get_or_insert_with(|| HashMap::with_hasher(self.hasher.clone()))
-                    .insert(key.clone(), value.clone());
-            }
-        }
-        let moved_entries = destinations.iter().flatten().map(HashMap::len).sum();
-        let replacements = destinations
-            .into_iter()
-            .map(|map| map.map(|map| Arc::new(TokioRwLock::new(map))))
-            .collect();
-        let retired_active = std::mem::replace(&mut *active, replacements);
-        let retired_previous = previous.take();
-        self.previous_shard_count.store(0, Ordering::Relaxed);
-        self.shard_count.store(target, Ordering::Relaxed);
-        self.total_len.store(moved_entries, Ordering::Relaxed);
-        self.rebalance_tracker.finish();
-        drop(guards);
-        drop(previous);
-        drop(active);
-        drop(_routing);
-        drop(_rebalance);
-        drop(retired_previous);
-        drop(retired_active);
-        tracing::info!(
-            from_shards = current,
-            to_shards = target,
-            moved_entries,
-            background = options.background,
-            batch_size = options.batch_size,
-            max_pause_ns = options.max_pause_ns,
-            "async stop-the-world rebalance completed"
-        );
-        Ok(RebalanceReport {
-            from_shards: current,
-            to_shards: target,
-            moved_entries,
-            elapsed_ms: started.elapsed().as_millis(),
-        })
     }
 
     /// Returns an entry handle for in-place style operations on a key.
@@ -747,6 +621,10 @@ where
         Q: Eq + Hash + ?Sized,
     {
         let mut guard = self.lock_key(key).await;
+        // An absent key must not copy a retained Cow shard or invoke its Clone.
+        if self.snapshot_mode == SnapshotMode::Cow && !guard.contains_key(key) {
+            return None;
+        }
         let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
         mutation.remove(key)
     }
@@ -793,9 +671,14 @@ where
             }
         }
         let mut removed = Vec::with_capacity(self.total_len.load(Ordering::Relaxed));
-        for guard in &mut guards {
-            removed.extend(guard.drain());
+        // Detach every retained Cow shard before committing any drain. A Clone
+        // panic on a later shard must leave data and metadata unchanged.
+        let mut maps: Vec<&mut HashMap<K, V, S>> =
+            guards.iter_mut().map(|guard| &mut ***guard).collect();
+        for map in &mut maps {
+            removed.extend(map.drain());
         }
+        drop(maps);
         let changed = !removed.is_empty();
         *previous = None;
         self.previous_shard_count.store(0, Ordering::Relaxed);
@@ -905,6 +788,11 @@ where
                 continue;
             };
             let mut guard = shard.write().await;
+            if self.snapshot_mode == SnapshotMode::Cow
+                && !keys.iter().any(|key| guard.contains_key(key))
+            {
+                continue;
+            }
             let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for key in keys {
                 count += usize::from(mutation.remove(&key).is_some());
@@ -1132,6 +1020,7 @@ where
                 if let Some((_, previous)) = previous_guards
                     .iter_mut()
                     .find(|(index, _)| *index == previous_index)
+                    && previous.contains_key(key)
                 {
                     promote_entry(active, previous, key);
                 }
@@ -1144,6 +1033,9 @@ where
                     mutation.insert(key, value);
                 }
                 TxnOp::Remove(key) => {
+                    if self.snapshot_mode == SnapshotMode::Cow && !active.contains_key(&key) {
+                        continue;
+                    }
                     let mut mutation =
                         ShardMutation::new(active, &self.total_len, &self.write_epoch);
                     mutation.remove(&key);
@@ -1401,9 +1293,13 @@ where
             guards.push(shard.clone().write_owned().await);
         }
         let mut entries = Vec::with_capacity(self.total_len.load(Ordering::Relaxed));
-        for guard in &mut guards {
-            entries.extend(guard.drain());
+        // Prepare all Cow copies before the first committed removal.
+        let mut maps: Vec<&mut HashMap<K, V, S>> =
+            guards.iter_mut().map(|guard| &mut ***guard).collect();
+        for map in &mut maps {
+            entries.extend(map.drain());
         }
+        drop(maps);
         *previous = None;
         self.previous_shard_count.store(0, Ordering::Relaxed);
         self.rebalance_tracker.finish();

@@ -177,17 +177,40 @@ Semantics:
 - migration is finalized when `advance_rebalance(...)` drains all source shards,
 - each advance call pauses map operations while moving up to the requested number of source shards; large source shards can still cause long pauses. This is not a time or entry-count budget.
 
+### Budgeted batches and supervised workers
+
+`advance_rebalance_with_options(&options)` limits entries moved per batch using `batch_size`, and checks `max_pause_ns` at safe commit boundaries. User Hash/Clone, shard copying, and lock waits can exceed that budget. `rebalance_telemetry()` reports measured intervals and overruns.
+
+```rust
+use starshard::{RebalanceOptions, ShardedHashMap};
+
+let map = ShardedHashMap::<u64, u64>::new(8);
+map.batch_insert((0..1_000).map(|key| (key, key)));
+let worker = map.spawn_rebalance(32, RebalanceOptions {
+    background: true,
+    batch_size: 64,
+    max_pause_ns: 100_000,
+}).unwrap();
+assert!(worker.join().unwrap().completed);
+```
+
+`pause_rebalance()` pauses at a batch boundary, and `resume_rebalance()` resumes. Worker handles support `cancel()` and `join()`, and request cancellation when dropped. Already moved entries remain reachable. Resume with manual advancement or a new worker. Async counterparts use `.await`, and dropping an async handle also aborts pending awaits.
+
+`rebalance_to()` returns after completion. Setting `background = true` selects cooperative entry batches. Use `spawn_rebalance()` to obtain a supervised worker handle. Workers reduce subsequent batch sizes after budget overruns. Load-triggered automatic scaling remains in roadmap G.
+
 ## Snapshot Modes (`v2.2.1`)
 
 `SnapshotMode` lets you pick snapshot behavior per workload:
 
 - `Clone`: rebuild snapshot entries on each request (default).
 - `Cached`: reuse a versioned, shared whole-map snapshot until the next write.
-- `Cow`: currently uses the same lazy shared snapshot cache as `Cached`. Writes invalidate the cache without cloning an entire shard; the next snapshot request rebuilds it.
+- `Cow`: stores immutable shard allocations behind shared handles. `snapshot_view()` captures shard handles without cloning keys or values. A write copies a touched shard while a view still retains it.
 
-Valid `Cached`/`Cow` hits validate the data epoch under a short cache lock, without acquiring routing. Missing or stale snapshots use a separate builder gate and ordered shard read locks. This coalesces concurrent rebuilds while allowing ordinary reads; writers and topology changes wait. Cached reads can finish during topology-only migration; they are not lock-free. Async cache reads preserve Tokio's cooperative task budget.
+Valid `shared_snapshot()` cache hits validate the data epoch under a short cache lock. Missing snapshots use a builder gate and ordered shard read locks to capture a consistent view. Cow materializes owned entries after releasing map locks. Clone/Cached materialize entries while holding shard read locks. Async cache reads preserve Tokio's cooperative task budget.
 
-`iter()` returns owned entries and therefore still clones entries from a shared cache, after releasing routing. Replaced cached data is also destroyed outside routing. Use `shared_snapshot()` to obtain an `Arc<Vec<(K, V)>>` and read repeated snapshots without copying their entries. Existing snapshot handles remain immutable after later writes. With `advanced`, `cow_snapshot()` also exposes a shared view and its data version.
+`snapshot_view()` returns a `SnapshotView` with borrowed iteration, a data version, and the active shard count captured together. Cow views retain shard allocations, so memory usage depends on retained versions and subsequent writes. Releasing a view allows its old allocations to be reclaimed. In Clone/Cached modes, this API copies initialized shards when capturing a view.
+
+`iter()` returns owned entries. `shared_snapshot()` returns a materialized `Arc<Vec<(K, V)>>` and caches it in Cached/Cow modes. With `advanced`, `cow_snapshot()` wraps that materialized representation and its version. These APIs copy entries when materializing a fresh snapshot. Use `snapshot_view()` with Cow for capture and traversal that borrow the shard entries.
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -206,7 +229,8 @@ let cow_map: ShardedHashMap<String, i32> =
 |---|---|
 | high write + low snapshot frequency | `Clone` |
 | medium write + medium snapshot frequency | `Cached` |
-| low write + high snapshot frequency | `Cow` or `Cached` |
+| frequent borrowed snapshots or serialization | `Cow` with `snapshot_view()` |
+| repeated materialized snapshots between writes | `Cached` with `shared_snapshot()` |
 
 ## Consistency Model
 
@@ -229,7 +253,7 @@ let cow_map: ShardedHashMap<String, i32> =
 
 - Sync map supports direct `Serialize` / `Deserialize`.
 - Hasher state is not persisted; rebuild uses `S::default()`.
-- Async map uses `async_snapshot_serializable().await` helper for serialization.
+- Async map uses `async_snapshot_serializable().await` for serialization. Sync serialization and the async wrapper stream borrowed entries from a captured view. Cow capture and serialization avoid cloning keys and values. The existing object/array formats are retained.
 
 ## Examples and Benchmarks
 
@@ -270,10 +294,10 @@ cargo check --all-features
 ## Current Limits
 
 - Not lock-free; hot-shard writer pressure can still serialize.
-- Snapshot cache misses materialize a whole-map `Vec<(K, V)>` while holding shard read locks. Rebuilds do not require exclusive routing, but still delay writers and topology changes; `shared_snapshot()` amortizes copying only while no write invalidates the cache.
+- Snapshot capture acquires routing and ordered shard read locks. Cow views release map locks before traversal, and keep old shard allocations alive. Writes to retained shards incur shard-level copy costs, including user-defined Clone work. Materialized snapshots additionally allocate a whole-map vector.
 - `EvictionConfig`, eviction policies, and `AtomicMetrics` are standalone types. Maps do not run an autonomous TTL/LRU/LFU scheduler or automatically increment those operation counters. `memory_stats()` and `per_shard_load()` report map state.
 - Lock timing instrumentation is not implemented; `lock_profiles()` does not provide measured contention data.
-- `RebalanceOptions` fields `background`, `batch_size`, `max_pause_ns` are forward-compatible placeholders in `v2.x`; they do not start a background task or enforce a pause budget.
+- Migration time budgets are checked at safe entry boundaries. User Hash/Clone/Drop and lock waits can cause overruns. Tune batches using measured `budget_overruns` and `max_pause_ns`. Background workers migrate to caller-selected targets.
 
 ## License
 

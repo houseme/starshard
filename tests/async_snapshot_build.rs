@@ -152,7 +152,7 @@ impl Clone for ControlledValue {
 }
 
 #[tokio::test]
-async fn snapshot_build_allows_reads_and_freezes_existing_and_cold_shard_writes() {
+async fn snapshot_build_preserves_contents_with_mode_specific_write_locking() {
     for mode in [SnapshotMode::Clone, SnapshotMode::Cached, SnapshotMode::Cow] {
         let map = map(mode);
         let clones = Arc::new(AtomicUsize::new(0));
@@ -184,9 +184,11 @@ async fn snapshot_build_allows_reads_and_freezes_existing_and_cold_shard_writes(
         drop(contains);
 
         let mut write = Box::pin(map.insert(0, ControlledValue::plain(30, &clones)));
-        assert!(poll_once(write.as_mut()).is_pending());
+        let write_result = poll_once(write.as_mut());
         let mut cold_write = Box::pin(map.insert(2, ControlledValue::plain(40, &clones)));
-        assert!(poll_once(cold_write.as_mut()).is_pending());
+        let cold_write_result = poll_once(cold_write.as_mut());
+        assert_eq!(write_result.is_ready(), mode == SnapshotMode::Cow);
+        assert_eq!(cold_write_result.is_ready(), mode == SnapshotMode::Cow);
         let snapshot = worker.finish();
         assert_eq!(snapshot.len(), 2);
         assert!(
@@ -194,8 +196,12 @@ async fn snapshot_build_allows_reads_and_freezes_existing_and_cold_shard_writes(
                 .iter()
                 .any(|(key, value)| *key == 0 && value.value == 10)
         );
-        write.await;
-        cold_write.await;
+        if write_result.is_pending() {
+            write.await;
+        }
+        if cold_write_result.is_pending() {
+            cold_write.await;
+        }
         let current = map.shared_snapshot().await;
         assert_eq!(current.len(), 3);
         assert!(
@@ -360,7 +366,7 @@ async fn retired_snapshot_destruction_does_not_hold_the_builder_gate() {
 
 #[cfg(feature = "advanced")]
 #[tokio::test]
-async fn transaction_promotion_waits_for_a_complete_snapshot_of_both_generations() {
+async fn transaction_promotion_preserves_a_complete_snapshot_of_both_generations() {
     use starshard::{Transaction, TransactionResult};
 
     for mode in [SnapshotMode::Clone, SnapshotMode::Cached, SnapshotMode::Cow] {
@@ -399,14 +405,16 @@ async fn transaction_promotion_waits_for_a_complete_snapshot_of_both_generations
         transaction.write(0, ControlledValue::plain(20, &clones));
         transaction.write(1, ControlledValue::plain(20, &clones));
         let mut transaction = Box::pin(map.execute_transaction(transaction));
-        assert!(poll_once(transaction.as_mut()).is_pending());
+        let transaction_result = poll_once(transaction.as_mut());
+        assert_eq!(transaction_result.is_ready(), mode == SnapshotMode::Cow);
         let snapshot = worker.finish();
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.iter().all(|(_, value)| value.value == 10));
-        assert!(matches!(
-            transaction.await,
-            TransactionResult::Committed(())
-        ));
+        let outcome = match transaction_result {
+            std::task::Poll::Ready(outcome) => outcome,
+            std::task::Poll::Pending => transaction.await,
+        };
+        assert!(matches!(outcome, TransactionResult::Committed(())));
         let current = map.shared_snapshot().await;
         assert_eq!(current.len(), 2);
         assert!(current.iter().all(|(_, value)| value.value == 20));

@@ -75,7 +75,7 @@ impl Clone for Value {
 }
 
 #[test]
-fn rebuilding_allows_ordinary_reads_and_freezes_existing_and_cold_writes() {
+fn rebuilding_preserves_the_snapshot_with_mode_specific_write_locking() {
     for mode in [SnapshotMode::Clone, SnapshotMode::Cached, SnapshotMode::Cow] {
         let map =
             ShardedHashMap::<usize, Value, Identity>::with_shards_and_hasher_and_snapshot_mode(
@@ -136,10 +136,18 @@ fn rebuilding_allows_ordinary_reads_and_freezes_existing_and_cold_writes() {
                 })
             })
             .collect();
-        assert!(matches!(
-            writes.recv_timeout(Duration::from_millis(30)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
+        if mode == SnapshotMode::Cow {
+            // The immutable shard view was captured before payload cloning.
+            // Both an existing shard and a cold shard can now accept writes.
+            let first = writes.recv_timeout(WAIT).unwrap();
+            let second = writes.recv_timeout(WAIT).unwrap();
+            assert_ne!(first, second);
+        } else {
+            assert!(matches!(
+                writes.recv_timeout(Duration::from_millis(30)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+        }
         drop(release);
         let snapshot = builder.join().unwrap();
         for worker in workers {

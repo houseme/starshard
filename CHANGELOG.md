@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add `SnapshotView` and sync/async `snapshot_view()` with borrowed iteration, a coherent data version, and captured active shard count. Cow views share immutable shard allocations without cloning keys or values.
+- Add `advance_rebalance_with_options()` with per-batch entry limits and a cooperative time budget checked at safe commit boundaries.
+- Add supervised sync/async `spawn_rebalance()` handles with cancellation and join, plus pause/resume operations. Cancelled work leaves both shard generations reachable for subsequent advancement.
+- Add migration telemetry for generation, entries, completed source shards, batch count, elapsed time, measured pauses, and budget overruns, with tracing events and adaptive worker batch reduction after overruns.
+
+### Changed
+
+- Implement shard-level copy-on-write storage for `SnapshotMode::Cow`. A write copies a shard retained by a snapshot view. Retained versions can increase memory use and write costs, so workload-specific mode selection remains important.
+- Capture Cow views under ordered shard read locks, then materialize owned snapshots and projections after releasing map locks. Existing `shared_snapshot()` and advanced `cow_snapshot()` APIs continue to provide materialized shared entry vectors.
+- Serialize sync maps and async snapshot wrappers by borrowing entries from a captured view. Cow serialization avoids key/value cloning and retains the established object/array formats.
+- Reserve expected destination capacity before the first entry moves into an empty migration shard. Uniform migrations avoid repeated growth copies, while occupied or skewed destinations retain panic-safe staging.
+- Apply entry/time budgets to cooperative `rebalance_to(background = true)`, which returns after completion. `spawn_rebalance()` returns a supervised worker handle. User Hash/Clone/Drop work and lock waits can exceed the requested time budget, and observed overruns are reported.
+
+### Tests and benchmarks
+
+- Cover retained Cow views across ordinary, conditional, transaction, batch, clear/drain and migration paths, including Clone panics, missing-key removals and serializer failures.
+- Cover migration budgets, pause/resume, worker cancellation and restart, generation replacement, worker panics, hasher Clone failures, and cancellation of async join while routing is blocked.
+- Add a sync/async A/B diagnostic driver with separate throughput, latency and allocation/clone-count passes, baseline adapters, and explicitly labelled migration work units.
+- Extend rebalance and Cow examples and the English/Chinese usage guidance.
+
 ## [2.4.1] - 2026-11-07
 
 ### Upgrade notes

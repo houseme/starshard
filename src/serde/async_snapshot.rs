@@ -5,7 +5,7 @@
 //! to obtain an [`AsyncShardedHashMapSnapshot`] that implements `Serialize`.
 
 use super::*;
-use ::serde::{Serialize, Serializer, ser::SerializeSeq};
+use ::serde::{Serialize, Serializer};
 
 #[cfg(all(feature = "async", feature = "serde"))]
 impl<K, V> AsyncShardedHashMap<K, V>
@@ -14,15 +14,18 @@ where
     V: Clone + Send + Sync + Serialize + 'static,
 {
     /// Obtain a serializable snapshot wrapper (for `serde`).
+    ///
+    /// The serialized form remains an array of key/value pairs. In `Cow` mode,
+    /// capture shares shard storage; serialization borrows entries from it.
     pub async fn async_snapshot_serializable(&self) -> AsyncShardedHashMapSnapshot<K, V> {
-        AsyncShardedHashMapSnapshot(self.iter().await)
+        AsyncShardedHashMapSnapshot(self.snapshot_view().await)
     }
 }
 
 /* -------- Serializable Snapshot Wrapper for Async Map -------- */
 /// A serializable snapshot of an `AsyncShardedHashMap`.
 #[cfg(all(feature = "async", feature = "serde"))]
-pub struct AsyncShardedHashMapSnapshot<K, V>(Vec<(K, V)>);
+pub struct AsyncShardedHashMapSnapshot<K, V>(SnapshotView<K, V>);
 
 #[cfg(all(feature = "async", feature = "serde"))]
 impl<K, V> Serialize for AsyncShardedHashMapSnapshot<K, V>
@@ -34,10 +37,6 @@ where
     where
         S: Serializer,
     {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for kv in &self.0 {
-            seq.serialize_element(kv)?;
-        }
-        seq.end()
+        self.0.serialize(serializer)
     }
 }

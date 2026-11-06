@@ -7,10 +7,19 @@ fn main() {
         map.insert(format!("key_{i}"), i);
     }
 
-    let before = map.iter().count();
+    let before = map.snapshot_view();
     map.remove(&"key_1".to_string());
     map.insert("key_10_001".into(), 10_001);
-    let after = map.iter().count();
+    let after = map.snapshot_view();
+    assert!(before.iter().any(|(key, _)| key == "key_1"));
+    assert!(after.iter().all(|(key, _)| key != "key_1"));
+    assert!(after.iter().any(|(key, _)| key == "key_10_001"));
+    assert!(after.version() > before.version());
 
-    println!("cow mode before={before}, after={after}");
+    println!(
+        "cow views before={}, after={}, version={}",
+        before.len(),
+        after.len(),
+        after.version()
+    );
 }

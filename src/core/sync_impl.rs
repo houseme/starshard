@@ -6,9 +6,11 @@
 //! builders sort indices within each generation.
 //! Snapshot caches are immutable and rebuilt lazily by committed write epoch.
 
+use super::types::ShardData;
 use super::*;
+
+mod rebalance_impl;
 use std::borrow::Borrow;
-use std::time::Instant;
 
 impl<K, V> ShardedHashMap<K, V, FxBuildHasher>
 where
@@ -163,11 +165,6 @@ where
             .count()
     }
 
-    /// Current rebalance progress.
-    pub fn rebalance_status(&self) -> RebalanceStatus {
-        self.rebalance_tracker.snapshot()
-    }
-
     // Every caller must pin routing before calculating an index or using a shard.
     fn shard_index<Q: Hash + ?Sized>(&self, key: &Q) -> usize {
         (self.hasher.hash_one(key) % self.shard_count() as u64) as usize
@@ -180,7 +177,10 @@ where
         let mut slots = std_write_guard(&self.shards, "shards_init");
         slots[index]
             .get_or_insert_with(|| {
-                Arc::new(StdRwLock::new(HashMap::with_hasher(self.hasher.clone())))
+                Arc::new(StdRwLock::new(ShardData::new(
+                    HashMap::with_hasher(self.hasher.clone()),
+                    self.snapshot_mode,
+                )))
             })
             .clone()
     }
@@ -197,14 +197,16 @@ where
     }
 
     // Active shard is locked first. Promotion is a physical move, not a new key.
-    fn promote_previous<Q>(&self, key: &Q, active: &mut HashMap<K, V, S>)
+    fn promote_previous<Q>(&self, key: &Q, active: &mut ShardData<K, V, S>)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         if let Some(shard) = self.previous_shard(key) {
             let mut previous = std_write_guard(&shard, "previous_shard");
-            promote_entry(active, &mut previous, key);
+            if previous.contains_key(key) {
+                promote_entry(active, &mut previous, key);
+            }
         }
     }
 
@@ -340,6 +342,10 @@ where
         };
         let mut guard = std_write_guard(&shard, "remove");
         self.promote_previous(key, &mut guard);
+        // An absent key must not copy a retained Cow shard or invoke its Clone.
+        if self.snapshot_mode == SnapshotMode::Cow && !guard.contains_key(key) {
+            return None;
+        }
         let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
         mutation.remove(key)
     }
@@ -466,6 +472,11 @@ where
                 continue;
             };
             let mut guard = std_write_guard(&shard, "batch_remove");
+            if self.snapshot_mode == SnapshotMode::Cow
+                && !keys.iter().any(|key| guard.contains_key(key))
+            {
+                continue;
+            }
             let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
             for key in keys {
                 removed += usize::from(mutation.remove(&key).is_some());
@@ -520,8 +531,10 @@ where
 
     /// Clears both generations, retaining allocated active shards.
     pub fn clear(&self) {
+        // Partial removals must retire outside routing if a later Cow detach panics.
+        let mut removed = Vec::new();
         let routing = std_write_guard(&self.routing_lock, "routing_clear");
-        let mut removed = Vec::with_capacity(self.len());
+        removed.reserve(self.len());
         for shard in self.all_shards() {
             let mut guard = std_write_guard(&shard, "clear");
             let count = guard.len();
@@ -535,6 +548,54 @@ where
         self.rebalance_tracker.finish();
         drop(routing);
         drop(removed);
+    }
+
+    fn capture_view_data(&self, shards: &mut Vec<Arc<HashMap<K, V, S>>>) -> (u64, usize) {
+        let _routing = std_read_guard(&self.routing_lock, "snapshot_routing");
+        let active = std_read_guard(&self.shards, "snapshot_directory");
+        let previous = std_read_guard(&self.previous_shards, "snapshot_previous_directory");
+        let initialized = active.iter().flatten().count()
+            + previous
+                .as_ref()
+                .map_or(0, |slots| slots.iter().flatten().count());
+        let mut guards = Vec::with_capacity(initialized);
+        guards.extend(
+            active
+                .iter()
+                .flatten()
+                .map(|shard| std_read_guard(shard, "snapshot_shard")),
+        );
+        if let Some(previous) = previous.as_ref() {
+            guards.extend(
+                previous
+                    .iter()
+                    .flatten()
+                    .map(|shard| std_read_guard(shard, "snapshot_previous_shard")),
+            );
+        }
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        let shard_count = active.len();
+        shards.reserve_exact(guards.len());
+        for guard in &guards {
+            shards.push(guard.snapshot());
+        }
+        (epoch, shard_count)
+    }
+
+    /// Capture an immutable view with a coherent mutation version and shard count.
+    ///
+    /// Cow mode shares shard storage without cloning keys or values. Other modes
+    /// clone each initialized shard. Iteration borrows data without map locks;
+    /// retaining a Cow view makes subsequent writes copy its touched shards.
+    pub fn snapshot_view(&self) -> SnapshotView<K, V, S> {
+        let mut shards = Vec::new();
+        let builder = self
+            .snapshot_build_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (epoch, shard_count) = self.capture_view_data(&mut shards);
+        drop(builder);
+        SnapshotView::new(shards, epoch, shard_count)
     }
 
     // Callers serialize builders before entering this method. Holding the
@@ -593,6 +654,12 @@ where
         T: Send,
         F: Fn(&K, &V) -> T + Send + Sync,
     {
+        if self.snapshot_mode == SnapshotMode::Cow {
+            let view = self.snapshot_view();
+            let mut items = Vec::with_capacity(view.len());
+            items.extend(view.iter().map(|(key, value)| project(key, value)));
+            return items;
+        }
         // Declare user-owned output before the gate so serial collection unwind
         // drops its partial values only after releasing the builder.
         let mut items = Vec::new();
@@ -624,6 +691,7 @@ where
             return snapshot;
         }
         let mut items = Vec::new();
+        let mut source_shards = Vec::new();
         // Coalesce expensive cache misses independently of routing. Acquiring
         // this before routing also prevents queued builders from pinning it.
         let builder = self
@@ -633,7 +701,20 @@ where
         if let Some(snapshot) = self.cached_snapshot() {
             return snapshot;
         }
-        let epoch = self.collect_into(&mut items, |key, value| (key.clone(), value.clone()));
+        let epoch = if self.snapshot_mode == SnapshotMode::Cow {
+            let (epoch, _) = self.capture_view_data(&mut source_shards);
+            items.reserve_exact(source_shards.iter().map(|shard| shard.len()).sum());
+            // Source Arcs preserve the cut while user Clone runs without map locks.
+            items.extend(
+                source_shards
+                    .iter()
+                    .flat_map(|shard| shard.iter())
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            epoch
+        } else {
+            self.collect_into(&mut items, |key, value| (key.clone(), value.clone()))
+        };
         let items = Arc::new(items);
         let retired = if self.snapshot_mode != SnapshotMode::Clone {
             std_write_guard(&self.snapshot_cache, "snapshot_cache").replace((epoch, items.clone()))
@@ -672,146 +753,6 @@ where
     /// Returns value copies without cloning keys.
     pub fn values(&self) -> impl Iterator<Item = V> {
         self.collect_with(|_, value| value.clone()).into_iter()
-    }
-
-    /// Starts incremental migration. Normal operations can access both
-    /// generations; every advance call pauses them for its bounded shard batch.
-    pub fn start_rebalance_online(&self, new_shard_count: usize) -> Result<(), ShardCountError> {
-        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
-        let _routing = std_write_guard(&self.routing_lock, "routing_rebalance");
-        if self.rebalance_tracker.is_migrating() || target == self.shard_count() {
-            return Ok(());
-        }
-        let current = self.shard_count();
-        let old = std::mem::replace(
-            &mut *std_write_guard(&self.shards, "shards"),
-            vec![None; target],
-        );
-        *std_write_guard(&self.previous_shards, "previous_shards") = Some(old);
-        self.previous_shard_count.store(current, Ordering::Relaxed);
-        self.shard_count.store(target, Ordering::Relaxed);
-        self.rebalance_tracker.begin(current);
-        Ok(())
-    }
-
-    /// Migrates up to `max_shards` source slots. Source data remains published
-    /// until a replacement directory is ready; concurrent advances serialize.
-    pub fn advance_rebalance(&self, max_shards: usize) -> usize {
-        if max_shards == 0 {
-            return 0;
-        }
-        // On unwind too, routing must unlock before retired values are dropped.
-        let mut retired = Vec::new();
-        let _routing = std_write_guard(&self.routing_lock, "routing_rebalance");
-        let mut processed = 0;
-        while processed < max_shards && self.rebalance_tracker.is_migrating() {
-            let index = self.rebalance_tracker.snapshot().moved_shards;
-            let source = std_read_guard(&self.previous_shards, "previous_shards")
-                .as_ref()
-                .and_then(|s| s[index].clone());
-            if let Some(source) = source {
-                // Build replacements off to the side: a panicking user Clone/Hash
-                // leaves the source and destination generations untouched.
-                let source = std_read_guard(&source, "migration_source");
-                let mut replacements: HashMap<usize, HashMap<K, V, S>, FxBuildHasher> =
-                    HashMap::with_hasher(FxBuildHasher);
-                for (key, value) in source.iter() {
-                    let index = self.shard_index(key);
-                    let target = replacements.entry(index).or_insert_with(|| {
-                        let existing = std_read_guard(&self.shards, "shards")[index].clone();
-                        existing.map_or_else(
-                            || HashMap::with_hasher(self.hasher.clone()),
-                            |s| std_read_guard(&s, "migration_target").clone(),
-                        )
-                    });
-                    target.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-                let replacements: Vec<_> = replacements
-                    .into_iter()
-                    .map(|(index, map)| (index, Arc::new(StdRwLock::new(map))))
-                    .collect();
-                retired.reserve(replacements.len() + 1);
-                let mut active = std_write_guard(&self.shards, "migration_publish");
-                for (index, replacement) in replacements {
-                    if let Some(old) = active[index].replace(replacement) {
-                        retired.push(old);
-                    }
-                }
-            }
-            if let Some(source) = std_write_guard(&self.previous_shards, "migration_remove")
-                .as_mut()
-                .expect("routing pins migration")[index]
-                .take()
-            {
-                retired.push(source);
-            }
-            self.rebalance_tracker.step();
-            processed += 1;
-            let status = self.rebalance_tracker.snapshot();
-            if status.moved_shards == status.total_shards {
-                *std_write_guard(&self.previous_shards, "migration_finish") = None;
-                self.previous_shard_count.store(0, Ordering::Relaxed);
-                self.rebalance_tracker.finish();
-            }
-        }
-        drop(_routing);
-        drop(retired);
-        processed
-    }
-
-    /// Rebuilds the shard layout while pausing all map operations. The options
-    /// remain reserved; no background worker or pause budget is implied.
-    pub fn rebalance_to(
-        &self,
-        new_shard_count: usize,
-        _options: RebalanceOptions,
-    ) -> Result<RebalanceReport, ShardCountError> {
-        let target = strict_shard_count(new_shard_count, MAX_SHARDS)?;
-        let _routing = std_write_guard(&self.routing_lock, "routing_rebalance");
-        let current = self.shard_count();
-        let started = Instant::now();
-        if target == current && !self.rebalance_tracker.is_migrating() {
-            return Ok(RebalanceReport {
-                from_shards: current,
-                to_shards: target,
-                moved_entries: 0,
-                elapsed_ms: 0,
-            });
-        }
-        let mut maps: Vec<Option<HashMap<K, V, S>>> = (0..target).map(|_| None).collect();
-        let mut moved = 0;
-        for shard in self.all_shards() {
-            for (key, value) in std_read_guard(&shard, "rebalance_source").iter() {
-                let index = (self.hasher.hash_one(key) % target as u64) as usize;
-                let map =
-                    maps[index].get_or_insert_with(|| HashMap::with_hasher(self.hasher.clone()));
-                if let hashbrown::hash_map::Entry::Vacant(entry) = map.entry(key.clone()) {
-                    entry.insert(value.clone());
-                    moved += 1;
-                }
-            }
-        }
-        let slots = maps
-            .into_iter()
-            .map(|map| map.map(|m| Arc::new(StdRwLock::new(m))))
-            .collect();
-        let old_active = std::mem::replace(
-            &mut *std_write_guard(&self.shards, "rebalance_publish"),
-            slots,
-        );
-        let old_previous = std_write_guard(&self.previous_shards, "rebalance_previous").take();
-        self.previous_shard_count.store(0, Ordering::Relaxed);
-        self.shard_count.store(target, Ordering::Relaxed);
-        self.rebalance_tracker.finish();
-        drop(_routing);
-        drop(old_active);
-        drop(old_previous);
-        Ok(RebalanceReport {
-            from_shards: current,
-            to_shards: target,
-            moved_entries: moved,
-            elapsed_ms: started.elapsed().as_millis(),
-        })
     }
 
     /// Executes a pessimistic transaction by locking affected active shards,
@@ -875,6 +816,7 @@ where
                 if let Some((_, previous)) = previous_guards
                     .iter_mut()
                     .find(|(i, _)| *i == previous_index)
+                    && previous.contains_key(key)
                 {
                     promote_entry(active, previous, key);
                 }
@@ -887,6 +829,9 @@ where
                     mutation.insert(key, value);
                 }
                 TxnOp::Remove(key) => {
+                    if self.snapshot_mode == SnapshotMode::Cow && !active.contains_key(&key) {
+                        continue;
+                    }
                     let mut mutation =
                         ShardMutation::new(active, &self.total_len, &self.write_epoch);
                     mutation.remove(&key);
@@ -1051,8 +996,9 @@ where
     /// Drains both generations while excluding concurrent map operations.
     #[cfg(feature = "lifecycle")]
     pub fn drain(&self) -> DrainIterator<K, V> {
+        let mut items = Vec::new();
         let _routing = std_write_guard(&self.routing_lock, "routing_drain");
-        let mut items = Vec::with_capacity(self.len());
+        items.reserve(self.len());
         for shard in self.all_shards() {
             let mut guard = std_write_guard(&shard, "drain");
             let len = guard.len();

@@ -176,17 +176,40 @@ assert_eq!(m.rebalance_status().state, "idle");
 - 所有源分片迁移完成后，状态回到 `idle`。
 - 每次推进会暂停 map 操作，最多搬迁指定数量的源分片；单个源分片较大时仍可能出现长暂停。该数量不代表时间预算或条目数预算。
 
+### 有预算的批次与后台任务
+
+`advance_rebalance_with_options(&options)` 按 `batch_size` 限制每批搬迁条目数，并在安全提交边界检查 `max_pause_ns`。单次 Hash/Clone、分片复制和锁等待可能超出该预算，`rebalance_telemetry()` 会报告实测耗时与超时次数。
+
+```rust
+use starshard::{RebalanceOptions, ShardedHashMap};
+
+let map = ShardedHashMap::<u64, u64>::new(8);
+map.batch_insert((0..1_000).map(|key| (key, key)));
+let worker = map.spawn_rebalance(32, RebalanceOptions {
+    background: true,
+    batch_size: 64,
+    max_pause_ns: 100_000,
+}).unwrap();
+assert!(worker.join().unwrap().completed);
+```
+
+`pause_rebalance()` 在批次边界暂停，`resume_rebalance()` 恢复。后台句柄支持 `cancel()` 和 `join()`，丢弃句柄会请求停止。取消后已经搬迁的数据保持可达，可通过手动推进或新 worker 继续完成。异步对应方法使用 `.await`，异步句柄丢弃还会中止待处理的 await。
+
+`rebalance_to()` 在迁移完成后返回。`background = true` 时采用协作式条目批次，`spawn_rebalance()` 用于返回可监督的后台句柄。worker 根据预算超时降低后续批次大小。负载阈值驱动的自动扩缩容仍列在 G 线计划中。
+
 ## 快照模式（`v2.2.1`）
 
 `SnapshotMode` 支持按负载选择：
 
 - `Clone`：每次请求都重建快照（默认模式）。
 - `Cached`：复用带版本的全 map 共享快照，写入后失效。
-- `Cow`：目前与 `Cached` 共用惰性共享快照缓存。写入只使缓存失效，不再复制整个分片；下次请求快照时重建。
+- `Cow` 以共享句柄持有不可变分片。`snapshot_view()` 捕获分片句柄时零键值复制。视图仍持有某个分片时，对该分片的写入会触发分片级复制。
 
-有效的 `Cached`/`Cow` 缓存命中只在短暂的缓存锁下校验数据版本，不获取路由锁；缓存缺失或过期时使用独立构建锁，并按固定顺序取得分片读锁。这会合并并发重建请求并允许普通读取，写入和拓扑切换则需要等待。因此有效缓存可在仅调整拓扑的迁移期间返回，但该路径并非无锁。异步缓存读取保留 Tokio 的协作式任务预算。
+`shared_snapshot()` 的有效缓存命中只需短暂校验数据版本。缓存缺失时，构建锁合并重建请求，并通过有序分片读锁捕获一致视图。Cow 在释放 map 锁后复制输出条目，Clone/Cached 在分片读锁保护下复制。异步缓存读取保留 Tokio 协作式调度预算。
 
-`iter()` 返回拥有所有权的条目，因此命中共享缓存后仍会复制条目，但复制发生在释放路由锁之后；旧缓存的析构也移到路由锁外。使用 `shared_snapshot()` 获取 `Arc<Vec<(K, V)>>`，可重复读取快照而不复制条目。后续写入不会改变已有快照句柄的数据。启用 `advanced` 后，`cow_snapshot()` 还提供共享视图及其数据版本。
+`snapshot_view()` 返回支持借用迭代的 `SnapshotView`，同时捕获数据版本和 active 分片数。Cow 视图持有分片分配，保留多个视图并继续写入会增加内存占用。释放视图后，旧分片可随最后一个引用释放而回收。Clone/Cached 下调用该接口会复制已初始化分片。
+
+`iter()` 输出拥有所有权的条目。`shared_snapshot()` 将条目物化为 `Arc<Vec<(K,V)>>`，并在 Cached/Cow 模式缓存。advanced 下的 `cow_snapshot()` 包装该物化结果及数据版本。这些接口创建新物化快照时会复制条目。需要低拷贝捕获和借用遍历时，使用 Cow 模式的 `snapshot_view()`。
 
 ```rust
 use starshard::{ShardedHashMap, SnapshotMode};
@@ -205,7 +228,8 @@ let cow_map: ShardedHashMap<String, i32> =
 |---|---|
 | 高写入 + 低快照频率 | `Clone` |
 | 中写入 + 中快照频率 | `Cached` |
-| 低写入 + 高频快照读取 | `Cow` 或 `Cached` |
+| 高频借用快照或序列化 | `Cow` 配合 `snapshot_view()` |
+| 多次读取物化快照且中间写入较少 | `Cached` 配合 `shared_snapshot()` |
 
 ## 一致性模型
 
@@ -228,7 +252,7 @@ let cow_map: ShardedHashMap<String, i32> =
 
 - 同步 map 支持直接 `Serialize` / `Deserialize`。
 - 不持久化 hasher 内部状态；反序列化时使用 `S::default()`。
-- 异步 map 使用 `async_snapshot_serializable().await` 进行序列化。
+- 异步 map 使用 `async_snapshot_serializable().await` 进行序列化。同步序列化和异步包装器从已捕获视图借用条目并逐条输出。Cow 捕获及序列化避免键值 Clone，现有对象/数组格式继续兼容。
 
 ## 示例与基准
 
@@ -269,10 +293,10 @@ cargo check --all-features
 ## 当前边界
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
-- 快照缓存未命中时，会持有分片读锁并物化全 map 的 `Vec<(K, V)>`。重建无需独占路由，但仍会延迟写入和拓扑切换；只有后续写入未使缓存失效时，`shared_snapshot()` 才能摊薄复制成本。
+- 捕获快照需要路由及有序分片读锁。Cow 视图在释放 map 锁后遍历，并持有旧分片分配。写入这些分片会产生复制成本，包含用户自定义 Clone 的工作量。物化快照还会分配全 map 的条目向量。
 - `EvictionConfig`、淘汰策略和 `AtomicMetrics` 是独立类型。map 不会自动运行 TTL/LRU/LFU 调度器，也不会自动累加这些操作计数；`memory_stats()` 与 `per_shard_load()` 用于查询 map 状态。
 - 尚未实现锁耗时采集；`lock_profiles()` 不提供实测的锁竞争数据。
-- `RebalanceOptions` 的 `background`、`batch_size`、`max_pause_ns` 在 `v2.x` 中为前向兼容预留参数，不会启动后台任务或强制执行暂停预算。
+- 迁移时间预算在安全条目边界检查。用户 Hash/Clone/Drop 和锁等待可能造成超时，请结合 `budget_overruns` 与 `max_pause_ns` 实测值选择批次大小。后台 worker 由调用者指定目标分片数。
 
 ## License
 

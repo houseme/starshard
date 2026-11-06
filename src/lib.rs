@@ -38,6 +38,13 @@ Consistency Model
   routing, and acquire all shard read locks in order. This preserves a global view
   across both generations while permitting ordinary reads subject to lock fairness.
   Writers and topology changes wait for the corresponding snapshot locks.
+- Cow `snapshot_view()` shares immutable shard allocations at that capture point.
+  Borrowed traversal and later materialization run after map locks are released.
+  Writes copy a shard while an external view still retains its allocation.
+- Supervised rebalance workers migrate caller-selected shard layouts in bounded
+  entry batches. Time budgets are checked at safe commit boundaries, and telemetry
+  records user-operation or lock-wait overruns. Cancellation retains reachable data
+  in both generations so another worker or manual caller can resume.
 - `len()` reflects committed length changes. In-flight mutations may not yet be reflected;
   after all operations complete it matches the number of stored logical keys.
 
@@ -84,7 +91,7 @@ Future Extension Ideas
 - Built-in configurable eviction scheduler integration (LRU per shard / clock / segmented queue).
 - Metrics hooks (pre/post op).
 - Entry/time-bounded migration and snapshot construction with shorter pauses.
-- Cached and Cow modes currently share lazy immutable snapshots, not per-shard COW storage.
+- Cow snapshots share immutable shard storage; retained views copy touched shards on writes.
 
 Examples
 ---------
@@ -197,11 +204,18 @@ pub(crate) use crate::core::ReplicaList;
 
 mod error;
 mod rebalance;
+mod snapshot;
 mod types;
 
 pub use error::ShardCountError;
+#[cfg(feature = "async")]
+pub use rebalance::AsyncRebalanceHandle;
 pub(crate) use rebalance::RebalanceTracker;
-pub use rebalance::{RebalanceOptions, RebalanceReport, RebalanceStatus};
+pub use rebalance::{
+    RebalanceBatchReport, RebalanceError, RebalanceHandle, RebalanceOptions, RebalanceOutcome,
+    RebalanceReport, RebalanceStatus, RebalanceTelemetry,
+};
+pub use snapshot::SnapshotView;
 pub use types::{DEFAULT_SHARDS, MAX_SHARDS, ShardStats, SnapshotMode};
 
 /* ============================== Sync Map =============================== */

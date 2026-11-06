@@ -26,7 +26,7 @@ pub enum SnapshotMode {
     Clone,
     /// Reuse snapshot cache while no writes happen.
     Cached,
-    /// Lazily build shared immutable snapshots; writes only invalidate their version.
+    /// Share immutable shards with snapshot views; writes copy retained shards on demand.
     Cow,
 }
 
