@@ -14,6 +14,24 @@
 use super::types::ShardData;
 use super::*;
 
+#[cfg(feature = "lifecycle")]
+mod eviction_impl;
+#[cfg(feature = "lifecycle")]
+fn defer_retired_value<V>(retired: &mut Vec<V>, old: Option<V>, tracking: bool) -> bool {
+    if let Some(value) = old {
+        if tracking {
+            retired.push(value);
+        } else {
+            // Metrics-only hooks cannot call user Hash/Eq/Clone. Preserve the
+            // original payload-drop point and avoid allocating retirement storage.
+            drop(value);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 mod rebalance_impl;
 
 #[cfg(feature = "async")]
@@ -61,6 +79,10 @@ where
             routing_lock: Arc::new(TokioRwLock::new(())),
             rebalance_lock: Arc::new(TokioMutex::new(())),
             rebalance_tracker: Arc::new(RebalanceTracker::new()),
+            #[cfg(feature = "lifecycle")]
+            lifecycle: Arc::new(crate::eviction::LifecycleState::new()),
+            #[cfg(feature = "lifecycle")]
+            lifecycle_owner: None,
             #[cfg(feature = "advanced")]
             profiling_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "advanced")]
@@ -69,6 +91,38 @@ where
             quorum_config: Arc::new(StdRwLock::new(None)),
             #[cfg(feature = "advanced")]
             replication_state: Arc::new(crate::core::replication::ReplicationState::default()),
+        }
+    }
+
+    /// Internal workers retain map storage without retaining the external-owner
+    /// token that supervises automatic eviction scheduling.
+    pub(crate) fn clone_for_worker(&self) -> Self {
+        Self {
+            snapshot_mode: self.snapshot_mode,
+            shards: self.shards.clone(),
+            previous_shards: self.previous_shards.clone(),
+            hasher: self.hasher.clone(),
+            shard_count: self.shard_count.clone(),
+            previous_shard_count: self.previous_shard_count.clone(),
+            total_len: self.total_len.clone(),
+            write_epoch: self.write_epoch.clone(),
+            snapshot_cache: self.snapshot_cache.clone(),
+            snapshot_build_lock: self.snapshot_build_lock.clone(),
+            routing_lock: self.routing_lock.clone(),
+            rebalance_lock: self.rebalance_lock.clone(),
+            rebalance_tracker: self.rebalance_tracker.clone(),
+            #[cfg(feature = "lifecycle")]
+            lifecycle: self.lifecycle.clone(),
+            #[cfg(feature = "lifecycle")]
+            lifecycle_owner: None,
+            #[cfg(feature = "advanced")]
+            profiling_enabled: self.profiling_enabled.clone(),
+            #[cfg(feature = "advanced")]
+            replicas: self.replicas.clone(),
+            #[cfg(feature = "advanced")]
+            quorum_config: self.quorum_config.clone(),
+            #[cfg(feature = "advanced")]
+            replication_state: self.replication_state.clone(),
         }
     }
 
@@ -226,24 +280,29 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
+        let observe = |value: Option<&V>| {
+            #[cfg(feature = "lifecycle")]
+            self.lifecycle.record_read(key, value.is_some());
+            f(value)
+        };
         let slots = self.shards.read().await;
         if let Some(shard) = slots[self.shard_index(key)].clone() {
             drop(slots);
             let active = shard.read().await;
             if let Some(value) = active.get(key) {
-                return f(Some(value));
+                return observe(Some(value));
             }
             if let Some(previous) = self.previous_shard(key).await {
                 let previous = previous.read().await;
-                return f(previous.get(key));
+                return observe(previous.get(key));
             }
-            f(None)
+            observe(None)
         } else {
             let result = if let Some(previous) = self.previous_shard(key).await {
                 let previous = previous.read().await;
-                f(previous.get(key))
+                observe(previous.get(key))
             } else {
-                f(None)
+                observe(None)
             };
             drop(slots);
             result
@@ -519,14 +578,54 @@ where
     ///
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub async fn insert(&self, key: K, value: V) -> Option<V> {
-        let _routing = self.routing_lock.read().await;
-        self.insert_inner(key, value).await
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
+        let old = {
+            let _routing = self.routing_lock.read().await;
+            #[cfg(feature = "lifecycle")]
+            let old = self.insert_inner(key, value, &mut retired).await;
+            #[cfg(not(feature = "lifecycle"))]
+            let old = self.insert_inner(key, value).await;
+            old
+        };
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        old
     }
 
-    async fn insert_inner(&self, key: K, value: V) -> Option<V> {
+    async fn insert_inner(
+        &self,
+        key: K,
+        value: V,
+        #[cfg(feature = "lifecycle")] retired: &mut Vec<V>,
+    ) -> Option<V> {
         let mut guard = self.lock_key(&key).await;
-        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-        mutation.insert(key, value)
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let prepared = self.lifecycle.prepare_insert(&key, &value);
+        let old = {
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            mutation.insert(key, value)
+        };
+        #[cfg(feature = "lifecycle")]
+        {
+            if !self.lifecycle.enabled() {
+                self.lifecycle.record_insert(prepared, old.is_some());
+                ticket.finish();
+                return old;
+            }
+            let replaced = defer_retired_value(retired, old, true);
+            self.lifecycle.record_insert(prepared, replaced);
+            ticket.finish();
+            if replaced { retired.pop() } else { None }
+        }
+        #[cfg(not(feature = "lifecycle"))]
+        old
     }
 
     /// Get a cloned value for an owned-key reference.
@@ -611,22 +710,62 @@ where
         K: std::borrow::Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let _routing = self.routing_lock.read().await;
-        self.remove_inner(key).await
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
+        let old = {
+            let _routing = self.routing_lock.read().await;
+            #[cfg(feature = "lifecycle")]
+            let old = self.remove_inner(key, &mut retired).await;
+            #[cfg(not(feature = "lifecycle"))]
+            let old = self.remove_inner(key).await;
+            old
+        };
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        old
     }
 
-    async fn remove_inner<Q>(&self, key: &Q) -> Option<V>
+    async fn remove_inner<Q>(
+        &self,
+        key: &Q,
+        #[cfg(feature = "lifecycle")] retired: &mut Vec<V>,
+    ) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let mut guard = self.lock_key(key).await;
-        // An absent key must not copy a retained Cow shard or invoke its Clone.
         if self.snapshot_mode == SnapshotMode::Cow && !guard.contains_key(key) {
             return None;
         }
-        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-        mutation.remove(key)
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
+        let old = {
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            mutation.remove(key)
+        };
+        #[cfg(feature = "lifecycle")]
+        {
+            if !self.lifecycle.enabled() {
+                if old.is_some() {
+                    self.lifecycle.record_remove(key);
+                }
+                ticket.finish();
+                return old;
+            }
+            let removed = defer_retired_value(retired, old, true);
+            if removed {
+                self.lifecycle.record_remove(key);
+            }
+            ticket.finish();
+            if removed { retired.pop() } else { None }
+        }
+        #[cfg(not(feature = "lifecycle"))]
+        old
     }
 
     /// Length (atomic).
@@ -658,6 +797,9 @@ where
     ///
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn clear(&self) {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        let mut removed = Vec::new();
         let _routing = self.routing_lock.write().await;
         let slots = self.shards.read().await;
         let mut previous = self.previous_shards.write().await;
@@ -670,11 +812,13 @@ where
                 guards.push(shard.clone().write_owned().await);
             }
         }
-        let mut removed = Vec::with_capacity(self.total_len.load(Ordering::Relaxed));
+        removed.reserve(self.total_len.load(Ordering::Relaxed));
         // Detach every retained Cow shard before committing any drain. A Clone
         // panic on a later shard must leave data and metadata unchanged.
         let mut maps: Vec<&mut HashMap<K, V, S>> =
             guards.iter_mut().map(|guard| &mut ***guard).collect();
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
         for map in &mut maps {
             removed.extend(map.drain());
         }
@@ -687,11 +831,22 @@ where
         if changed {
             self.on_structural_write();
         }
+        #[cfg(feature = "lifecycle")]
+        {
+            for (key, _) in &removed {
+                self.lifecycle.record_remove(key);
+            }
+            ticket.finish();
+        }
         drop(guards);
         drop(previous);
         drop(slots);
         drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
         drop(removed);
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
     }
 
     /// Materialize a consistent snapshot across active and previous shards.
@@ -734,27 +889,57 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        // User-provided iterators may consult this map while producing items.
-        // Consume them before taking any routing or shard lock.
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let entries: Vec<_> = entries.into_iter().collect();
-        let _routing = self.routing_lock.read().await;
-        if self.rebalance_tracker.is_migrating() {
-            let mut inserted = 0;
-            for (key, value) in entries {
-                inserted += usize::from(self.insert_inner(key, value).await.is_none());
+        let inserted = {
+            let _routing = self.routing_lock.read().await;
+            let mut count = 0;
+            if self.rebalance_tracker.is_migrating() {
+                for (key, value) in entries {
+                    #[cfg(feature = "lifecycle")]
+                    let old = self.insert_inner(key, value, &mut retired).await;
+                    #[cfg(not(feature = "lifecycle"))]
+                    let old = self.insert_inner(key, value).await;
+                    count += usize::from(old.is_none());
+                    #[cfg(feature = "lifecycle")]
+                    defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                }
+            } else {
+                for (index, pairs) in self.bucketize_entries(entries) {
+                    let shard = self.get_or_init_shard(index).await;
+                    let mut guard = shard.write().await;
+                    let mut mutation =
+                        ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                    for (key, value) in pairs {
+                        #[cfg(feature = "lifecycle")]
+                        let ticket = self.lifecycle.mutation();
+                        #[cfg(feature = "lifecycle")]
+                        let prepared = self.lifecycle.prepare_insert(&key, &value);
+                        let old = mutation.insert(key, value);
+                        let replaced = old.is_some();
+                        #[cfg(feature = "lifecycle")]
+                        defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                        count += usize::from(!replaced);
+                        #[cfg(feature = "lifecycle")]
+                        {
+                            self.lifecycle.record_insert(prepared, replaced);
+                            ticket.finish();
+                        }
+                        #[cfg(not(feature = "lifecycle"))]
+                        drop(old);
+                    }
+                }
             }
-            return inserted;
-        }
-        let mut count = 0;
-        for (index, pairs) in self.bucketize_entries(entries) {
-            let shard = self.get_or_init_shard(index).await;
-            let mut guard = shard.write().await;
-            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-            for (key, value) in pairs {
-                count += usize::from(mutation.insert(key, value).is_none());
-            }
-        }
-        count
+            count
+        };
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        inserted
     }
 
     /// Batch remove multiple keys asynchronously.
@@ -770,35 +955,62 @@ where
     where
         I: IntoIterator<Item = K>,
     {
-        // User-provided iterators may consult this map while producing items.
-        // Consume them before taking any routing or shard lock.
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let keys: Vec<_> = keys.into_iter().collect();
-        let _routing = self.routing_lock.read().await;
-        if self.rebalance_tracker.is_migrating() {
-            let mut removed = 0;
-            for key in keys {
-                removed += usize::from(self.remove_inner(&key).await.is_some());
+        let removed = {
+            let _routing = self.routing_lock.read().await;
+            let mut count = 0;
+            if self.rebalance_tracker.is_migrating() {
+                for key in keys {
+                    #[cfg(feature = "lifecycle")]
+                    let old = self.remove_inner(&key, &mut retired).await;
+                    #[cfg(not(feature = "lifecycle"))]
+                    let old = self.remove_inner(&key).await;
+                    count += usize::from(old.is_some());
+                    #[cfg(feature = "lifecycle")]
+                    defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                }
+            } else {
+                for (index, keys) in self.bucketize_keys(keys) {
+                    let shard = self.shards.read().await[index].clone();
+                    let Some(shard) = shard else {
+                        continue;
+                    };
+                    let mut guard = shard.write().await;
+                    if self.snapshot_mode == SnapshotMode::Cow
+                        && !keys.iter().any(|key| guard.contains_key(key))
+                    {
+                        continue;
+                    }
+                    let mut mutation =
+                        ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                    for key in keys {
+                        #[cfg(feature = "lifecycle")]
+                        let ticket = self.lifecycle.mutation();
+                        let old = mutation.remove(&key);
+                        let removed = old.is_some();
+                        #[cfg(feature = "lifecycle")]
+                        defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                        if removed {
+                            count += 1;
+                            #[cfg(feature = "lifecycle")]
+                            self.lifecycle.record_remove(&key);
+                        }
+                        #[cfg(feature = "lifecycle")]
+                        ticket.finish();
+                    }
+                }
             }
-            return removed;
-        }
-        let mut count = 0;
-        for (index, keys) in self.bucketize_keys(keys) {
-            let shard = self.shards.read().await[index].clone();
-            let Some(shard) = shard else {
-                continue;
-            };
-            let mut guard = shard.write().await;
-            if self.snapshot_mode == SnapshotMode::Cow
-                && !keys.iter().any(|key| guard.contains_key(key))
-            {
-                continue;
-            }
-            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-            for key in keys {
-                count += usize::from(mutation.remove(&key).is_some());
-            }
-        }
-        count
+            count
+        };
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        removed
     }
 
     /// Batch get multiple keys asynchronously.
@@ -811,23 +1023,29 @@ where
     ///
     #[tracing::instrument(skip(self, keys), level = "trace")]
     pub async fn batch_get(&self, keys: &[K]) -> Vec<Option<V>> {
+        let mut results = vec![None; keys.len()];
         let _routing = self.routing_lock.read().await;
         if self.rebalance_tracker.is_migrating() {
-            let mut values = Vec::with_capacity(keys.len());
-            for key in keys {
-                values.push(self.read_key(key, |value| value.cloned()).await);
+            for (position, key) in keys.iter().enumerate() {
+                results[position] = self.read_key(key, |value| value.cloned()).await;
             }
-            return values;
+            return results;
         }
-        let mut results = vec![None; keys.len()];
         for (index, items) in self.bucketize_key_refs(keys) {
             let shard = self.shards.read().await[index].clone();
             let Some(shard) = shard else {
+                #[cfg(feature = "lifecycle")]
+                for (_, key) in items {
+                    self.lifecycle.record_read(key, false);
+                }
                 continue;
             };
             let guard = shard.read().await;
             for (position, key) in items {
-                results[position] = guard.get(key).cloned();
+                let value = guard.get(key);
+                #[cfg(feature = "lifecycle")]
+                self.lifecycle.record_read(key, value.is_some());
+                results[position] = value.cloned();
             }
         }
         results
@@ -849,19 +1067,68 @@ where
     where
         F: FnOnce(V) -> Option<V>,
     {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        let result = self.compute_if_present_inner(key, f).await;
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        result
+    }
+
+    async fn compute_if_present_inner<F>(&self, key: &K, f: F) -> Option<V>
+    where
+        F: FnOnce(V) -> Option<V>,
+    {
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
+        let result;
         let _routing = self.routing_lock.read().await;
         let mut guard = self.lock_key(key).await;
-        let old = guard.get(key).cloned()?;
-        let result = f(old);
+        let old = guard.get(key);
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.record_read(key, old.is_some());
+        result = f(old.cloned()?);
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
         if let Some(value) = result.as_ref() {
             let stored_key = key.clone();
             let stored_value = value.clone();
-            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-            mutation.insert(stored_key, stored_value);
+            #[cfg(feature = "lifecycle")]
+            let prepared = self.lifecycle.prepare_insert(&stored_key, &stored_value);
+            let _replaced = {
+                let mut mutation =
+                    ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                {
+                    let old = mutation.insert(stored_key, stored_value);
+                    #[cfg(feature = "lifecycle")]
+                    {
+                        defer_retired_value(&mut retired, old, self.lifecycle.enabled())
+                    }
+                    #[cfg(not(feature = "lifecycle"))]
+                    {
+                        old.is_some()
+                    }
+                }
+            };
+            #[cfg(feature = "lifecycle")]
+            self.lifecycle.record_insert(prepared, _replaced);
         } else {
-            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-            mutation.remove(key);
+            {
+                let mut mutation =
+                    ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                let old = mutation.remove(key);
+                #[cfg(feature = "lifecycle")]
+                defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                #[cfg(not(feature = "lifecycle"))]
+                drop(old);
+            }
+            #[cfg(feature = "lifecycle")]
+            self.lifecycle.record_remove(key);
         }
+        #[cfg(feature = "lifecycle")]
+        ticket.finish();
         result
     }
 
@@ -881,7 +1148,14 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.get_or_insert_with_inner(key, f).await
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        let value = self.get_or_insert_with_inner(key, f).await;
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        value
     }
 
     #[inline]
@@ -889,15 +1163,43 @@ where
     where
         F: FnOnce() -> V,
     {
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
+        let value;
         let _routing = self.routing_lock.read().await;
         let mut guard = self.lock_key(&key).await;
         if let Some(value) = guard.get(&key) {
+            #[cfg(feature = "lifecycle")]
+            self.lifecycle.record_read(&key, true);
             return value.clone();
         }
-        let value = f();
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.record_read(&key, false);
+        value = f();
         let stored_value = value.clone();
-        let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-        mutation.insert(key, stored_value);
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let prepared = self.lifecycle.prepare_insert(&key, &stored_value);
+        let _replaced = {
+            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+            {
+                let old = mutation.insert(key, stored_value);
+                #[cfg(feature = "lifecycle")]
+                {
+                    defer_retired_value(&mut retired, old, self.lifecycle.enabled())
+                }
+                #[cfg(not(feature = "lifecycle"))]
+                {
+                    old.is_some()
+                }
+            }
+        };
+        #[cfg(feature = "lifecycle")]
+        {
+            self.lifecycle.record_insert(prepared, _replaced);
+            ticket.finish();
+        }
         value
     }
 
@@ -913,7 +1215,14 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.get_or_insert_with_inner(key, f).await
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        let value = self.get_or_insert_with_inner(key, f).await;
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        value
     }
 
     /// Remove entries where predicate returns false (async).
@@ -931,11 +1240,17 @@ where
     where
         F: Fn(&K, &V) -> bool,
     {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let _routing = self.routing_lock.write().await;
         let mut shards: Vec<_> = self.shards.read().await.iter().flatten().cloned().collect();
         if let Some(previous) = self.previous_shards.read().await.as_ref() {
             shards.extend(previous.iter().flatten().cloned());
         }
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
         for shard in shards {
             let mut guard = shard.write().await;
             for removed in guard.extract_if(|key, value| !predicate(key, value)) {
@@ -943,9 +1258,28 @@ where
                 // can panic; cancellation between shards also preserves metadata.
                 self.total_len.fetch_sub(1, Ordering::Relaxed);
                 self.on_structural_write();
+                #[cfg(feature = "lifecycle")]
+                {
+                    if self.lifecycle.enabled() {
+                        retired.push(removed);
+                        self.lifecycle
+                            .record_remove(&retired.last().expect("removed pair was retained").0);
+                    } else {
+                        self.lifecycle.record_remove(&removed.0);
+                        drop(removed);
+                    }
+                }
+                #[cfg(not(feature = "lifecycle"))]
                 drop(removed);
             }
         }
+        #[cfg(feature = "lifecycle")]
+        ticket.finish();
+        drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
     }
 
     /// Execute a transaction (basic implementation, async).
@@ -961,6 +1295,10 @@ where
     #[cfg(feature = "advanced")]
     #[tracing::instrument(skip(self, txn), level = "trace")]
     pub async fn execute_transaction(&self, txn: Transaction<K, V>) -> TransactionResult<()> {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let _routing = self.routing_lock.read().await;
         let mut active_indices = Vec::new();
         let previous_count = self.previous_shard_count.load(Ordering::Relaxed);
@@ -1026,22 +1364,58 @@ where
                 }
             }
             match op {
-                TxnOp::Read(_) => {}
+                TxnOp::Read(key) => {
+                    #[cfg(feature = "lifecycle")]
+                    self.lifecycle.record_read(&key, active.contains_key(&key));
+                    #[cfg(not(feature = "lifecycle"))]
+                    let _ = key;
+                }
                 TxnOp::Write(key, value) => {
+                    #[cfg(feature = "lifecycle")]
+                    let ticket = self.lifecycle.mutation();
+                    #[cfg(feature = "lifecycle")]
+                    let prepared = self.lifecycle.prepare_insert(&key, &value);
                     let mut mutation =
                         ShardMutation::new(active, &self.total_len, &self.write_epoch);
-                    mutation.insert(key, value);
+                    let old = mutation.insert(key, value);
+                    #[cfg(feature = "lifecycle")]
+                    {
+                        let replaced =
+                            defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                        self.lifecycle.record_insert(prepared, replaced);
+                        ticket.finish();
+                    }
+                    #[cfg(not(feature = "lifecycle"))]
+                    drop(old);
                 }
                 TxnOp::Remove(key) => {
                     if self.snapshot_mode == SnapshotMode::Cow && !active.contains_key(&key) {
                         continue;
                     }
+                    #[cfg(feature = "lifecycle")]
+                    let ticket = self.lifecycle.mutation();
                     let mut mutation =
                         ShardMutation::new(active, &self.total_len, &self.write_epoch);
-                    mutation.remove(&key);
+                    let old = mutation.remove(&key);
+                    #[cfg(feature = "lifecycle")]
+                    {
+                        if defer_retired_value(&mut retired, old, self.lifecycle.enabled()) {
+                            self.lifecycle.record_remove(&key);
+                        }
+                        ticket.finish();
+                    }
+                    #[cfg(not(feature = "lifecycle"))]
+                    drop(old);
                 }
             }
         }
+        drop(previous_guards);
+        drop(active_guards);
+        drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
         TransactionResult::Committed(())
     }
 
@@ -1060,20 +1434,54 @@ where
     where
         V: PartialEq,
     {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let _routing = self.routing_lock.read().await;
         let mut guard = self.lock_key(key).await;
-        match guard.get(key) {
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.record_read(key, guard.contains_key(key));
+        let result = match guard.get(key) {
             Some(current) if current == expected => {
                 let stored_key = key.clone();
                 let stored_value = new.clone();
-                let mut mutation =
-                    ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-                mutation.insert(stored_key, stored_value);
+                #[cfg(feature = "lifecycle")]
+                let ticket = self.lifecycle.mutation();
+                #[cfg(feature = "lifecycle")]
+                let prepared = self.lifecycle.prepare_insert(&stored_key, &stored_value);
+                let _replaced = {
+                    let mut mutation =
+                        ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                    {
+                        let old = mutation.insert(stored_key, stored_value);
+                        #[cfg(feature = "lifecycle")]
+                        {
+                            defer_retired_value(&mut retired, old, self.lifecycle.enabled())
+                        }
+                        #[cfg(not(feature = "lifecycle"))]
+                        {
+                            old.is_some()
+                        }
+                    }
+                };
+                #[cfg(feature = "lifecycle")]
+                {
+                    self.lifecycle.record_insert(prepared, _replaced);
+                    ticket.finish();
+                }
                 CasResult::Success(new)
             }
             Some(current) => CasResult::Failure(current.clone()),
             None => CasResult::Failure(new),
-        }
+        };
+        drop(guard);
+        drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        result
     }
 
     /// Compare and remove: atomically remove entry if value matches expected (async).
@@ -1090,15 +1498,42 @@ where
     where
         V: PartialEq,
     {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        #[cfg(feature = "lifecycle")]
+        let mut retired = Vec::new();
         let _routing = self.routing_lock.read().await;
         let mut guard = self.lock_key(key).await;
-        if guard.get(key).is_some_and(|current| current == expected) {
-            let mut mutation = ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
-            mutation.remove(key);
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.record_read(key, guard.contains_key(key));
+        let removed = if guard.get(key).is_some_and(|current| current == expected) {
+            #[cfg(feature = "lifecycle")]
+            let ticket = self.lifecycle.mutation();
+            {
+                let mut mutation =
+                    ShardMutation::new(&mut guard, &self.total_len, &self.write_epoch);
+                let old = mutation.remove(key);
+                #[cfg(feature = "lifecycle")]
+                defer_retired_value(&mut retired, old, self.lifecycle.enabled());
+                #[cfg(not(feature = "lifecycle"))]
+                drop(old);
+            }
+            #[cfg(feature = "lifecycle")]
+            {
+                self.lifecycle.record_remove(key);
+                ticket.finish();
+            }
             true
         } else {
             false
-        }
+        };
+        drop(guard);
+        drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
+        removed
     }
 
     /// Create a copy-on-write snapshot for minimal-locking reads (async).
@@ -1280,6 +1715,9 @@ where
     #[cfg(feature = "lifecycle")]
     #[tracing::instrument(skip(self), level = "trace")]
     pub async fn drain(&self) -> DrainIterator<K, V> {
+        #[cfg(feature = "lifecycle")]
+        let operation = self.lifecycle.mutation();
+        let mut entries = Vec::new();
         let _routing = self.routing_lock.write().await;
         let slots = self.shards.read().await;
         let mut previous = self.previous_shards.write().await;
@@ -1292,10 +1730,12 @@ where
         for shard in slots.iter().flatten() {
             guards.push(shard.clone().write_owned().await);
         }
-        let mut entries = Vec::with_capacity(self.total_len.load(Ordering::Relaxed));
+        entries.reserve(self.total_len.load(Ordering::Relaxed));
         // Prepare all Cow copies before the first committed removal.
         let mut maps: Vec<&mut HashMap<K, V, S>> =
             guards.iter_mut().map(|guard| &mut ***guard).collect();
+        #[cfg(feature = "lifecycle")]
+        let ticket = self.lifecycle.mutation();
         for map in &mut maps {
             entries.extend(map.drain());
         }
@@ -1307,6 +1747,21 @@ where
         if !entries.is_empty() {
             self.on_structural_write();
         }
+        #[cfg(feature = "lifecycle")]
+        {
+            for (key, _) in &entries {
+                self.lifecycle.record_remove(key);
+            }
+            ticket.finish();
+        }
+        drop(guards);
+        drop(previous);
+        drop(slots);
+        drop(_routing);
+        #[cfg(feature = "lifecycle")]
+        self.enforce_eviction_limits().await;
+        #[cfg(feature = "lifecycle")]
+        operation.finish();
         DrainIterator {
             items: entries,
             index: 0,

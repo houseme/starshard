@@ -168,7 +168,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 /* ======================== Module Declarations ======================== */
 
-/// Version 0.9.0 features: TTL, eviction, metrics, and advanced iteration.
+/// Capacity eviction, maintenance workers, operation metrics, and iteration utilities.
 #[cfg(feature = "lifecycle")]
 pub mod eviction;
 
@@ -177,10 +177,13 @@ pub mod eviction;
 pub mod advanced;
 
 // Re-export key v0.9.0 types
+#[cfg(all(feature = "lifecycle", feature = "async"))]
+pub use eviction::AsyncEvictionHandle;
 #[cfg(feature = "lifecycle")]
 pub use eviction::{
-    AtomicMetrics, DrainIterator, EvictionConfig, EvictionPolicy, IterBuilder, MemoryStats,
-    MetricsStats, PerShardLoad,
+    AtomicMetrics, CapacityPolicy, DrainIterator, EvictionConfig, EvictionError, EvictionHandle,
+    EvictionOptions, EvictionPolicy, EvictionRuntimeStats, EvictionSchedulerError,
+    EvictionWorkerStatus, EvictionWorkerStop, IterBuilder, MemoryStats, MetricsStats, PerShardLoad,
 };
 
 // Re-export key v1.0.0 types
@@ -242,6 +245,10 @@ where
     write_epoch: Arc<AtomicU64>,
     snapshot_cache: SnapshotCache<K, V>,
     rebalance_tracker: Arc<RebalanceTracker>,
+    #[cfg(feature = "lifecycle")]
+    lifecycle: Arc<crate::eviction::LifecycleState<K, V>>,
+    #[cfg(feature = "lifecycle")]
+    lifecycle_owner: Option<Arc<crate::eviction::scheduler::SchedulerOwner>>,
     #[cfg(feature = "advanced")]
     profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -281,6 +288,10 @@ where
     snapshot_cache: SnapshotCache<K, V>,
     rebalance_lock: Arc<TokioMutex<()>>,
     rebalance_tracker: Arc<RebalanceTracker>,
+    #[cfg(feature = "lifecycle")]
+    lifecycle: Arc<crate::eviction::LifecycleState<K, V>>,
+    #[cfg(feature = "lifecycle")]
+    lifecycle_owner: Option<Arc<crate::eviction::scheduler::SchedulerOwner>>,
     #[cfg(feature = "advanced")]
     profiling_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "advanced")]

@@ -1,8 +1,17 @@
 //! Version 0.9.0: Eviction, Metrics, and Advanced Iteration Support
 //!
-//! Eviction configuration and metrics counters are standalone building blocks;
-//! maps do not automatically schedule eviction or update these counters.
-//! Iterator builders and drain iterators are integrated with the map APIs.
+//! Capacity policies, logical entry budgets, operation metrics, and maintenance.
+//! Time-based expiration is deliberately separate from capacity eviction.
+
+mod engine;
+pub(crate) mod scheduler;
+
+pub(crate) use engine::LifecycleState;
+#[cfg(feature = "async")]
+pub use scheduler::AsyncEvictionHandle;
+pub use scheduler::{
+    EvictionHandle, EvictionSchedulerError, EvictionWorkerStatus, EvictionWorkerStop,
+};
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -19,9 +28,9 @@ pub enum EvictionPolicy {
     Lru,
     /// Least Frequently Used: removes least frequently accessed entries
     Lfu,
-    /// Time-To-Live: removes entries after specified duration
+    /// Reserved expiry policy. Capacity constructors return [`EvictionError::UnsupportedTtl`].
     TimeToLive(std::time::Duration),
-    /// Custom predicate: removes entries matching predicate
+    /// Legacy custom predicate. Capacity constructors return [`EvictionError::UnsupportedCustomPolicy`].
     Custom(std::sync::Arc<dyn Fn() -> bool + Send + Sync>),
 }
 
@@ -39,7 +48,11 @@ impl std::fmt::Debug for EvictionPolicy {
     }
 }
 
-/// Configuration for eviction behavior.
+/// Configuration for capacity eviction behavior.
+///
+/// Successful mutations enforce limits after committing. Concurrent, cancelled,
+/// or panicking operations can leave pending maintenance for a later mutation,
+/// an explicit `enforce_eviction_limits` call, or a periodic worker.
 #[derive(Debug, Clone)]
 pub struct EvictionConfig {
     /// The eviction policy to apply
@@ -48,7 +61,7 @@ pub struct EvictionConfig {
     pub max_entries: Option<usize>,
     /// Maximum items per shard; None = unlimited
     pub max_items_per_shard: Option<usize>,
-    /// Time-To-Live for entries; None = unlimited
+    /// Reserved expiry setting. Capacity constructors require `None`.
     pub ttl: Option<std::time::Duration>,
     /// How often to check for eviction candidates
     pub check_interval: std::time::Duration,
@@ -68,6 +81,208 @@ impl Default for EvictionConfig {
             background_enabled: true,
         }
     }
+}
+
+impl EvictionConfig {
+    /// Configure automatic LRU maintenance with a global entry limit.
+    ///
+    /// Worker startup validates the interval and, for async maps, the runtime.
+    pub fn auto_lru(max_entries: usize, check_interval: std::time::Duration) -> Self {
+        Self {
+            max_entries: Some(max_entries),
+            check_interval,
+            ..Self::default()
+        }
+    }
+}
+
+/// Ordering used when capacity maintenance selects entries to remove.
+///
+/// This separate enum leaves exhaustive matches on [`EvictionPolicy`] compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityPolicy {
+    /// Least recently accessed entry first; successful writes also count as access.
+    Lru,
+    /// Least frequently accessed entry first, breaking ties by recency then insertion.
+    Lfu,
+    /// Oldest inserted entry first. Replacing an existing value preserves its age.
+    Fifo,
+}
+
+/// A configuration or maintenance worker could not be installed.
+#[derive(Debug)]
+pub enum EvictionError {
+    /// TTL policy or the TTL option requires the separate expiry implementation.
+    UnsupportedTtl,
+    /// The legacy zero-argument custom predicate has no entry selection contract.
+    UnsupportedCustomPolicy,
+    /// Global and per-shard entry limits cannot both be configured.
+    ConflictingEntryLimits,
+    /// A manual-only constructor was passed background_enabled=true.
+    BackgroundNotAllowed,
+    /// A lifecycle state can only be configured once, before sharing its map.
+    AlreadyConfigured,
+    /// Capacity tracking was not installed on this map.
+    NotConfigured,
+    /// Maintenance scheduling failed or the worker could not complete.
+    Scheduler(EvictionSchedulerError),
+}
+
+impl std::fmt::Display for EvictionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedTtl => {
+                f.write_str("TTL expiration is not supported by capacity eviction")
+            }
+            Self::UnsupportedCustomPolicy => {
+                f.write_str("custom eviction predicates are not supported")
+            }
+            Self::ConflictingEntryLimits => {
+                f.write_str("global and per-shard entry limits are mutually exclusive")
+            }
+            Self::BackgroundNotAllowed => {
+                f.write_str("manual eviction requires background_enabled=false")
+            }
+            Self::AlreadyConfigured => f.write_str("eviction is already configured"),
+            Self::NotConfigured => f.write_str("eviction is not configured"),
+            Self::Scheduler(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for EvictionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Scheduler(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<EvictionSchedulerError> for EvictionError {
+    fn from(error: EvictionSchedulerError) -> Self {
+        Self::Scheduler(error)
+    }
+}
+
+type EntryWeigher<K, V> = std::sync::Arc<dyn Fn(&K, &V) -> usize + Send + Sync>;
+
+/// Additional capacity options without changing existing configuration literals.
+///
+/// Estimated weight includes only live entries as defined by the supplied
+/// estimator. It does not measure allocator overhead or retained Cow snapshots.
+pub struct EvictionOptions<K, V> {
+    config: EvictionConfig,
+    policy: Option<CapacityPolicy>,
+    memory_budget: Option<usize>,
+    weigher: Option<EntryWeigher<K, V>>,
+}
+
+impl<K, V> EvictionOptions<K, V> {
+    /// Extend a legacy eviction configuration with optional capacity features.
+    pub fn new(config: EvictionConfig) -> Self {
+        Self {
+            config,
+            policy: None,
+            memory_budget: None,
+            weigher: None,
+        }
+    }
+
+    /// Override LRU/LFU ordering, or opt into FIFO ordering.
+    ///
+    /// Unsupported TTL/custom legacy policies remain errors even with an override.
+    pub fn with_policy(mut self, policy: CapacityPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Limit the sum of estimator-reported weights of live entries.
+    ///
+    /// The estimator runs before inserting a value, and may run during recovery.
+    /// It must return a stable weight for unchanged values and must not reenter
+    /// this map. Zero is a valid budget and zero-weight entries consume no budget.
+    pub fn with_memory_budget(
+        mut self,
+        bytes: usize,
+        weigher: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.memory_budget = Some(bytes);
+        self.weigher = Some(std::sync::Arc::new(weigher));
+        self
+    }
+
+    /// Validate supported policies and mutually exclusive entry limits.
+    /// Scheduler-specific interval/runtime checks occur when a worker starts.
+    pub fn validate(&self) -> Result<(), EvictionError> {
+        if self.config.ttl.is_some() || matches!(self.config.policy, EvictionPolicy::TimeToLive(_))
+        {
+            return Err(EvictionError::UnsupportedTtl);
+        }
+        if matches!(self.config.policy, EvictionPolicy::Custom(_)) {
+            return Err(EvictionError::UnsupportedCustomPolicy);
+        }
+        if self.config.max_entries.is_some() && self.config.max_items_per_shard.is_some() {
+            return Err(EvictionError::ConflictingEntryLimits);
+        }
+        Ok(())
+    }
+
+    /// The legacy scheduling and entry-limit configuration.
+    pub fn config(&self) -> &EvictionConfig {
+        &self.config
+    }
+
+    /// Capacity ordering selected by these options.
+    pub fn policy(&self) -> CapacityPolicy {
+        self.policy.unwrap_or(match self.config.policy {
+            EvictionPolicy::Lfu => CapacityPolicy::Lfu,
+            _ => CapacityPolicy::Lru,
+        })
+    }
+
+    /// Optional maximum sum of estimator-reported live-entry weights.
+    pub fn memory_budget(&self) -> Option<usize> {
+        self.memory_budget
+    }
+}
+
+impl<K, V> Clone for EvictionOptions<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            policy: self.policy,
+            memory_budget: self.memory_budget,
+            weigher: self.weigher.clone(),
+        }
+    }
+}
+
+/// Additional lifecycle observations, sampled independently of map snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct EvictionRuntimeStats {
+    /// Whether capacity tracking was installed at construction.
+    pub enabled: bool,
+    /// Whether mutation/pending work remains after the latest completed pass.
+    pub pending: bool,
+    /// Whether interrupted metadata synchronization requires reconciliation.
+    pub dirty: bool,
+    /// Number of currently tracked logical entries.
+    pub tracked_entries: usize,
+    /// Saturating sum of estimator weights; excludes old Cow views and allocator overhead.
+    pub estimated_weight: usize,
+    /// Whether the exact weight sum exceeds usize::MAX.
+    pub weight_overflow: bool,
+    /// Number of successful metadata repair passes.
+    pub reconciliations: u64,
+    /// Number of callbacks whose panic was isolated after committed eviction.
+    pub callback_panics: u64,
+    /// Callbacks suppressed to prevent synchronous reentrant callback recursion.
+    pub suppressed_callbacks: u64,
+    /// Most recent committed eviction time.
+    pub last_evict_time: Option<std::time::Instant>,
+    /// Latest maintenance duration before callback dispatch and retired-data destruction.
+    pub last_eviction_duration: std::time::Duration,
 }
 
 /// Per-shard eviction statistics.

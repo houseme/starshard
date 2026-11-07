@@ -108,6 +108,17 @@ where
     {
         self.map.remove(key)
     }
+
+    /// Detach the stored pair so eviction callbacks and destructors run after unlock.
+    #[cfg(all(feature = "lifecycle", feature = "async"))]
+    #[inline]
+    pub(crate) fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.map.remove_entry(key)
+    }
 }
 
 impl<K, V, S> Drop for ShardMutation<'_, K, V, S> {

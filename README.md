@@ -59,7 +59,7 @@ Migration guide:
 | `async` | `AsyncShardedHashMap` (Tokio `RwLock`) | async services and workers |
 | `rayon` | large sync snapshots; parallel `IterBuilder` filtering with `lifecycle` | large scans and expensive predicates |
 | `serde` | sync serialize/deserialize + async serializable snapshot helper | persistence/export |
-| `lifecycle` | `per_shard_load`, `memory_stats`, `drain`, lifecycle structs | observability and maintenance |
+| `lifecycle` | capacity policies/workers, operation metrics, `drain`, introspection | bounded caches and maintenance |
 | `advanced` | transaction/CAS/replication/diagnostic APIs | advanced concurrency and control planes |
 
 ## Quick Start (Sync)
@@ -127,6 +127,66 @@ let map: ShardedHashMap<String, Vec<u64>> = ShardedHashMap::new(16);
 let lane = map.get_or_insert_with("read-version".to_string(), Vec::new);
 assert!(lane.is_empty());
 ```
+
+## Capacity Eviction (Unreleased)
+
+`lifecycle` provides the new capacity maintenance and operation metrics. Functional regression checks have passed, and workload performance acceptance remains open.
+
+Configure LRU/LFU with `EvictionConfig`, or select FIFO through the separate `CapacityPolicy` and `EvictionOptions` selector. Global `max_entries` and per-shard `max_items_per_shard` are mutually exclusive, and zero is a valid limit. Configuration is installed at construction and shared by map clones.
+
+This example uses manual scheduling with post-mutation capacity enforcement and an estimator-based budget for live entries.
+
+```rust
+use std::collections::hash_map::RandomState;
+use starshard::{CapacityPolicy, EvictionConfig, EvictionOptions, ShardedHashMap, SnapshotMode};
+
+let options = EvictionOptions::new(EvictionConfig {
+    max_entries: Some(2),
+    background_enabled: false,
+    ..EvictionConfig::default()
+})
+.with_policy(CapacityPolicy::Fifo)
+.with_memory_budget(1024, |key: &String, value: &Vec<u8>| key.len() + value.len());
+let map = ShardedHashMap::try_with_manual_eviction(
+    4, RandomState::new(), SnapshotMode::Clone, options,
+).unwrap();
+map.insert("first".into(), vec![1]);
+map.insert("second".into(), vec![2]);
+map.insert("third".into(), vec![3]);
+assert_eq!(map.len(), 2);
+assert_eq!(map.get_borrowed("first"), None);
+```
+
+The weight budget sums the estimator's per-entry values. The estimator runs inside the mutation's lock scope and must return stable weights for stable entry state. Cow view retention and allocator overhead require separate memory measurement. FIFO preserves insertion age across replacement, while LRU/LFU record logical accesses. Snapshot scans and physical migration preserve policy ranking.
+
+`background_enabled = true` starts a periodic worker in `try_with_eviction` / `try_with_eviction_options`. Sync maps use a thread. Async maps require an entered Tokio runtime with its time driver enabled. This example uses `async` + `lifecycle` and a direct Tokio dependency with `rt` and `time`.
+
+```rust
+use std::time::Duration;
+use starshard::{AsyncShardedHashMap, EvictionConfig};
+
+let runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap();
+runtime.block_on(async {
+    let map = AsyncShardedHashMap::<u64, u64>::try_with_eviction(
+        4, EvictionConfig::auto_lru(2, Duration::from_secs(60)),
+    ).unwrap();
+    map.batch_insert([(1, 10), (2, 20), (3, 30)]).await;
+    assert!(map.len().await <= 2);
+});
+```
+
+`try_with_manual_eviction` accepts `background_enabled=false` and borrowed sync keys/values. Worker-capable constructors require `'static` data. `with_eviction` panics on invalid configuration or startup failure, and the `try_*` constructors expose typed errors. `spawn_eviction_task()` explicitly starts one worker and returns a handle with `cancel()` and `join()` (`join().await` for async). Automatic constructors retain their handle in external ownership. Dropping the last external map clone stops periodic work. Cancellation preserves committed removals. `eviction_worker_status()` exposes progress and termination reasons.
+
+Completed mutations, explicit `enforce_eviction_limits()` calls and periodic ticks enforce the limits. Concurrent, cancelled, panicking or topology-changing operations can leave `pending` / `dirty` maintenance for a subsequent mutation or pass. The argument to `evict(target_count)` / `evict_lru(target_count)` specifies the desired remaining count, and the return value reports removals. Unconfigured maps return zero. Per-shard limits use active routing across both generations. Maintenance can wait on routing and data locks.
+
+`set_evict_callback` runs synchronously after removal, length/version updates, eviction counters and release of map/metadata locks. Callback panics are isolated. Nested callback dispatch on the same thread is suppressed and counted, while nested mutations still enforce capacity. A callback that continually reinserts entries can leave pending maintenance. `clear_evict_callback` removes the shared callback.
+
+Enabling `lifecycle` activates per-element operation counters on ordinary maps too, with atomic-counter overhead. `metrics_snapshot()` / `reset_metrics()` cover logical queries and mutations, with a separate capacity-eviction counter. Concurrent snapshots and resets sample counters independently, so exact accounting checks require quiescence. `eviction_runtime_stats()` also exposes pending repair, estimated weight, maintenance duration and callback diagnostics.
+
+Capacity constructors return typed errors for `TimeToLive`, `Custom` and a populated `ttl`. Expiry remains tracked under roadmap F. Configured capacity maps return `ReplicaError::Rejected` from `insert_replicated` / `remove_replicated`. Ordinary local mutations are available for cache writes.
 
 ## Constructor Strategy
 
@@ -237,7 +297,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - Per-shard operations are linearizable for that shard.
 - Snapshot rebuilding retains directory and ordered shard read locks, producing a stable view of both active and previous shards once all guards are held. Ordinary reads can proceed subject to lock fairness; queued writers or cold-shard initialization can still delay later readers. A matching immutable cache is returned without routing access; its data and epoch are captured together.
 - During online rebalance, active-first + previous-fallback keeps key reachability.
-- Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks must not reenter the same map while its locks are held.
+- Transactions acquire participating shard write locks in a fixed order. They are pessimistic transactions; read/write sets are not an MVCC conflict detector. Callbacks invoked by locked operations must not reenter the same map. Eviction notifications run after lock release and follow the separate reentrancy rules above.
 - If user code panics during a transaction, already-applied operations are not rolled back; length and cached-snapshot metadata track the actual stored contents.
 
 ## Performance Notes
@@ -295,7 +355,7 @@ cargo check --all-features
 
 - Not lock-free; hot-shard writer pressure can still serialize.
 - Snapshot capture acquires routing and ordered shard read locks. Cow views release map locks before traversal, and keep old shard allocations alive. Writes to retained shards incur shard-level copy costs, including user-defined Clone work. Materialized snapshots additionally allocate a whole-map vector.
-- `EvictionConfig`, eviction policies, and `AtomicMetrics` are standalone types. Maps do not run an autonomous TTL/LRU/LFU scheduler or automatically increment those operation counters. `memory_stats()` and `per_shard_load()` report map state.
+- Capacity eviction requires explicit configuration and converges at maintenance boundaries. Estimated entry weights exclude allocator overhead and retained Cow versions. TTL/custom policy execution remains unsupported; see [capacity eviction](#capacity-eviction-unreleased).
 - Lock timing instrumentation is not implemented; `lock_profiles()` does not provide measured contention data.
 - Migration time budgets are checked at safe entry boundaries. User Hash/Clone/Drop and lock waits can cause overruns. Tune batches using measured `budget_overruns` and `max_pause_ns`. Background workers migrate to caller-selected targets.
 

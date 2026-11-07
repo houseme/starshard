@@ -58,7 +58,7 @@ starshard = { version = "2.4.1", features = ["async", "rayon", "serde", "lifecyc
 | `async` | `AsyncShardedHashMap`（Tokio `RwLock`） | 异步服务与任务系统 |
 | `rayon` | 大型同步快照；启用 `lifecycle` 时支持 `IterBuilder` 并行过滤 | 大规模扫描和较重的过滤计算 |
 | `serde` | 同步版序列化/反序列化 + 异步快照序列化辅助 | 持久化与数据导出 |
-| `lifecycle` | `per_shard_load`、`memory_stats`、`drain` 等 | 运维观测与维护 |
+| `lifecycle` | 容量策略/worker、操作计数、`drain` 与状态查询 | 有限容量缓存与维护 |
 | `advanced` | 事务/CAS/复制/诊断 API | 高级并发控制与控制面 |
 
 ## 快速上手（同步）
@@ -126,6 +126,66 @@ let map: ShardedHashMap<String, Vec<u64>> = ShardedHashMap::new(16);
 let lane = map.get_or_insert_with("read-version".to_string(), Vec::new);
 assert!(lane.is_empty());
 ```
+
+## 容量淘汰（未发布）
+
+`lifecycle` 提供本轮新增的容量维护和操作指标。功能回归已通过，性能目标继续单独验收。
+
+`EvictionConfig` 配置 LRU/LFU，FIFO 通过独立的 `CapacityPolicy` 和 `EvictionOptions` 选择。全局 `max_entries` 与分片 `max_items_per_shard` 互斥，零是有效上限。配置在构造时安装，各 map clone 共享状态。
+
+下面使用手动调度，成功完成的修改仍会执行限额维护，同时使用估算权重限制存活条目。
+
+```rust
+use std::collections::hash_map::RandomState;
+use starshard::{CapacityPolicy, EvictionConfig, EvictionOptions, ShardedHashMap, SnapshotMode};
+
+let options = EvictionOptions::new(EvictionConfig {
+    max_entries: Some(2),
+    background_enabled: false,
+    ..EvictionConfig::default()
+})
+.with_policy(CapacityPolicy::Fifo)
+.with_memory_budget(1024, |key: &String, value: &Vec<u8>| key.len() + value.len());
+let map = ShardedHashMap::try_with_manual_eviction(
+    4, RandomState::new(), SnapshotMode::Clone, options,
+).unwrap();
+map.insert("first".into(), vec![1]);
+map.insert("second".into(), vec![2]);
+map.insert("third".into(), vec![3]);
+assert_eq!(map.len(), 2);
+assert_eq!(map.get_borrowed("first"), None);
+```
+
+权重预算累计用户估算函数返回的条目权重。估算函数在修改的锁作用域内执行，对同一条目状态应返回稳定结果。旧 Cow 视图保留的分配和分配器开销需要单独测量。FIFO 替换值时保留插入年龄，LRU/LFU 记录逻辑访问，快照扫描和物理迁移保留既有排名。
+
+`background_enabled = true` 会让 `try_with_eviction` / `try_with_eviction_options` 启动周期 worker。同步版本使用线程，异步版本需要当前 Tokio runtime 启用 time driver。下面的示例使用 `async` + `lifecycle`，并直接依赖启用 `rt`、`time` 的 Tokio。
+
+```rust
+use std::time::Duration;
+use starshard::{AsyncShardedHashMap, EvictionConfig};
+
+let runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap();
+runtime.block_on(async {
+    let map = AsyncShardedHashMap::<u64, u64>::try_with_eviction(
+        4, EvictionConfig::auto_lru(2, Duration::from_secs(60)),
+    ).unwrap();
+    map.batch_insert([(1, 10), (2, 20), (3, 30)]).await;
+    assert!(map.len().await <= 2);
+});
+```
+
+`try_with_manual_eviction` 接受 `background_enabled=false`，并支持同步借用键值。worker 构造要求数据满足 `'static`。`with_eviction` 会在配置或启动失败时 panic，需要处理错误时使用 `try_*` 构造。`spawn_eviction_task()` 可显式启动单个 worker，返回支持 `cancel()`、`join()` 的监督句柄，异步等待为 `join().await`。自动构造把句柄保存在外部所有权对象中，最后一个外部 map clone 释放时终止周期任务。取消保留已提交删除，`eviction_worker_status()` 提供状态和退出原因。
+
+成功修改、显式 `enforce_eviction_limits()` 和后台 tick 负责限额收敛。并发、取消、panic 或拓扑变更期间可以留下 `pending` / `dirty`，后续修改或维护负责修复。`evict(target_count)` / `evict_lru(target_count)` 的参数指定最终剩余条目目标，返回本次删除数。未配置策略时返回零。分片预算按照 active 路由计算两代数据，维护可能等待路由和分片锁。
+
+`set_evict_callback` 在删除、长度/版本和计数提交并释放 map/metadata 锁后同步执行。回调 panic 被隔离，同线程内的嵌套回调派发会被抑制并计数，嵌套修改仍执行容量维护。持续重插数据的回调可能留下后续维护工作。`clear_evict_callback` 移除共享回调。
+
+启用 `lifecycle` 后，普通 map 也通过 `metrics_snapshot()` / `reset_metrics()` 记录逐元素操作，因此会有原子计数开销。逻辑查询和修改进入操作计数，容量淘汰使用独立计数。并发读取和 reset 分别采样各计数，精确核对需要在操作静止后进行。`eviction_runtime_stats()` 还提供待修复状态、估算权重、维护耗时及回调诊断。
+
+容量构造器对 `TimeToLive`、`Custom` 和非空 `ttl` 返回明确错误，过期语义继续在 F 系列跟踪。配置容量的 map 调用 `insert_replicated` / `remove_replicated` 时返回 `ReplicaError::Rejected`，普通本地修改用于缓存写入。
 
 ## 构造器选型
 
@@ -236,7 +296,7 @@ let cow_map: ShardedHashMap<String, i32> =
 - 分片内操作是线性化可见的。
 - 快照重建保留目录读锁并按顺序获取分片读锁，在全部锁取得后形成覆盖 active 与 previous 分片的稳定视图。普通读取可继续，但遵守锁公平性；排队的写入或冷分片初始化仍可能延迟后续读取。有效的不可变缓存无需访问路由，数据与版本成对捕获。
 - 在线迁移期间，通过 active-first + previous-fallback 保证 key 可达性。
-- 事务按固定顺序获取涉及分片的写锁，采用悲观锁；读写集合不构成 MVCC 冲突检测。持锁期间的回调不得重入同一个 map。
+- 事务按固定顺序获取涉及分片的写锁，采用悲观锁；读写集合不构成 MVCC 冲突检测。持锁操作中的回调不得重入同一个 map；淘汰通知在释放锁后执行，遵循上文单独说明的重入规则。
 - 事务中的用户代码发生 panic 时，已经执行的操作不会回滚；长度和快照缓存元数据会与实际存储内容保持一致。
 
 ## 性能建议
@@ -294,7 +354,7 @@ cargo check --all-features
 
 - 不是 lock-free；热点分片写压力仍可能串行化。
 - 捕获快照需要路由及有序分片读锁。Cow 视图在释放 map 锁后遍历，并持有旧分片分配。写入这些分片会产生复制成本，包含用户自定义 Clone 的工作量。物化快照还会分配全 map 的条目向量。
-- `EvictionConfig`、淘汰策略和 `AtomicMetrics` 是独立类型。map 不会自动运行 TTL/LRU/LFU 调度器，也不会自动累加这些操作计数；`memory_stats()` 与 `per_shard_load()` 用于查询 map 状态。
+- 容量淘汰须显式配置，在维护边界收敛；估算权重不含分配器开销和 Cow 旧版本。TTL/Custom 执行仍不支持，详见[容量淘汰](#容量淘汰未发布)。
 - 尚未实现锁耗时采集；`lock_profiles()` 不提供实测的锁竞争数据。
 - 迁移时间预算在安全条目边界检查。用户 Hash/Clone/Drop 和锁等待可能造成超时，请结合 `budget_overruns` 与 `max_pause_ns` 实测值选择批次大小。后台 worker 由调用者指定目标分片数。
 

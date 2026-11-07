@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `lifecycle` capacity tracking for LRU/LFU and FIFO through `CapacityPolicy`/`EvictionOptions`, with mutually exclusive global/per-shard entry limits and optional estimator-based live-entry weight budgets.
+- Add fallible/manual configured constructors, `evict`, `evict_lru`, `enforce_eviction_limits`, and sync/async periodic eviction handles with duplicate-start protection, cancellation/join, typed startup errors, and shutdown after the last external map clone is dropped.
+- Add shared eviction callbacks and runtime diagnostics for pending/dirty repair, estimated weight, maintenance timing, callback panics, and suppressed recursive dispatch. Integrate completed per-element operation metrics on maps built with `lifecycle`, including maps without a configured capacity policy.
 - Add `SnapshotView` and sync/async `snapshot_view()` with borrowed iteration, a coherent data version, and captured active shard count. Cow views share immutable shard allocations without cloning keys or values.
 - Add `advance_rebalance_with_options()` with per-batch entry limits and a cooperative time budget checked at safe commit boundaries.
 - Add supervised sync/async `spawn_rebalance()` handles with cancellation and join, plus pause/resume operations. Cancelled work leaves both shard generations reachable for subsequent advancement.
@@ -13,6 +16,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Enforce configured capacity after completed mutations and periodic maintenance. Interrupted operations retain visible pending/dirty state for a later mutation, explicit maintenance, or worker tick; in-flight operations do not have a hard capacity guarantee.
+- Use linear single-victim selection for global one-entry excess, shard-local candidate queries for per-shard maintenance, and bounded weight checks after deletions. Allocate metadata stripes on configuration, start collision buckets with one slot, and drain only populated retirement stripes.
+- Commit eviction data, length/version metadata and counters before invoking callbacks outside map/metadata locks. Isolate callback panics and suppress nested callback dispatch while allowing reentrant mutations to enforce limits.
+- Preserve existing `EvictionConfig` literals and `EvictionPolicy` variants; FIFO and weight budgets use the new options wrapper. Reject global/per-shard limit conflicts and unsupported TTL/custom configurations explicitly. Estimated weight excludes allocator overhead and retained Cow snapshots.
+- Reject replicated insert/remove on capacity-configured maps before any local commit or fanout. Background-enabled constructors now start a real worker; async startup requires an entered Tokio runtime with time enabled. Worker-capable new constructors require `'static` data, while the manual sync constructor permits borrowed types.
 - Implement shard-level copy-on-write storage for `SnapshotMode::Cow`. A write copies a shard retained by a snapshot view. Retained versions can increase memory use and write costs, so workload-specific mode selection remains important.
 - Capture Cow views under ordered shard read locks, then materialize owned snapshots and projections after releasing map locks. Existing `shared_snapshot()` and advanced `cow_snapshot()` APIs continue to provide materialized shared entry vectors.
 - Serialize sync maps and async snapshot wrappers by borrowing entries from a captured view. Cow serialization avoids key/value cloning and retains the established object/array formats.
@@ -21,6 +29,7 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and benchmarks
 
+- Add C-series policy, maintenance, callback, recovery and scheduler regression coverage, an eight-lane feature matrix, and a serial capacity-policy benchmark. Local correctness checks pass, while the 20% overhead target remains open for workload-specific validation.
 - Cover retained Cow views across ordinary, conditional, transaction, batch, clear/drain and migration paths, including Clone panics, missing-key removals and serializer failures.
 - Cover migration budgets, pause/resume, worker cancellation and restart, generation replacement, worker panics, hasher Clone failures, and cancellation of async join while routing is blocked.
 - Add a sync/async A/B diagnostic driver with separate throughput, latency and allocation/clone-count passes, baseline adapters, and explicitly labelled migration work units.

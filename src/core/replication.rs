@@ -195,11 +195,19 @@ where
     /// An error or caller cancellation does not roll back an applied local
     /// write or any remote write. Ordinary `insert`, `remove`, and reads remain
     /// local and do not participate in this ordering or quorum protocol. This
-    /// API does not provide consensus, failover, or quorum reads.
+    /// API does not provide consensus, failover, or quorum reads. Configured
+    /// capacity eviction is rejected before any local or remote write.
     /// Configured replication requires a Tokio runtime with its time driver
     /// enabled, and replica futures must yield cooperatively.
     #[tracing::instrument(skip(self, key, value), level = "trace")]
     pub async fn insert_replicated(&self, key: K, value: V) -> Result<Option<V>, ReplicaError> {
+        #[cfg(feature = "lifecycle")]
+        if self.lifecycle.enabled() {
+            return Err(ReplicaError::Rejected(
+                "replicated mutations are incompatible with configured capacity eviction".into(),
+            ));
+        }
+
         let config = std_read_guard(&self.quorum_config, "insert_replicated_quorum").clone();
         let Some(config) = config else {
             return Ok(self.insert(key, value).await);
@@ -233,6 +241,13 @@ where
     /// local removal or completed remote removals.
     #[tracing::instrument(skip(self, key), level = "trace")]
     pub async fn remove_replicated(&self, key: &K) -> Result<Option<V>, ReplicaError> {
+        #[cfg(feature = "lifecycle")]
+        if self.lifecycle.enabled() {
+            return Err(ReplicaError::Rejected(
+                "replicated mutations are incompatible with configured capacity eviction".into(),
+            ));
+        }
+
         let config = std_read_guard(&self.quorum_config, "remove_replicated_quorum").clone();
         let Some(config) = config else {
             return Ok(self.remove(key).await);

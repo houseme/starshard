@@ -43,6 +43,8 @@ where
         *previous = Some(std::mem::replace(&mut *active, vec![None; target]));
         self.previous_shard_count.store(current, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.mark_pending();
         self.rebalance_tracker.begin_with_counts(
             current,
             target,
@@ -232,7 +234,7 @@ where
             .map_err(|_| RebalanceError::RuntimeUnavailable)?;
         let target = strict_shard_count(target, MAX_SHARDS)?;
         // Clone user-provided hasher state before reserving worker ownership.
-        let map = self.clone();
+        let map = self.clone_for_worker();
         // Starting and reserving a generation share routing exclusion. A
         // concurrent manual rebalance cannot change the target between them.
         let (telemetry, already_complete, from_shards) = {
@@ -256,6 +258,8 @@ where
                 *previous = Some(std::mem::replace(&mut *active, vec![None; target]));
                 self.previous_shard_count.store(current, Ordering::Relaxed);
                 self.shard_count.store(target, Ordering::Relaxed);
+                #[cfg(feature = "lifecycle")]
+                self.lifecycle.mark_pending();
                 self.rebalance_tracker.begin_with_counts(
                     current,
                     target,
@@ -366,6 +370,8 @@ where
                         *previous = Some(std::mem::replace(&mut *active, vec![None; target]));
                         self.previous_shard_count.store(current, Ordering::Relaxed);
                         self.shard_count.store(target, Ordering::Relaxed);
+                        #[cfg(feature = "lifecycle")]
+                        self.lifecycle.mark_pending();
                         self.rebalance_tracker.begin_with_counts(
                             current,
                             target,
@@ -437,6 +443,8 @@ where
         let retired_previous = previous.take();
         self.previous_shard_count.store(0, Ordering::Relaxed);
         self.shard_count.store(target, Ordering::Relaxed);
+        #[cfg(feature = "lifecycle")]
+        self.lifecycle.mark_pending();
         self.total_len.store(moved_entries, Ordering::Relaxed);
         self.rebalance_tracker
             .finish_staged(current, target, moved_entries, started);
